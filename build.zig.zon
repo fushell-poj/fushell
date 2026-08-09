@@ -1,0 +1,33 @@
+.{
+    .name = .fushell,
+    .fingerprint = 0xad557f33385e0b22,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .@"flutter-embedder" = .{
+            .url = "https://storage.googleapis.com/flutter_infra_release/flutter/42d3d75a56efe1a2e9902f52dc8006099c45d937/linux-x64/linux-x64-embedder.zip",
+            .hash = "N-V-__8AAL54uQXWug4lO7AF95z4QCj_ebYcohluWqWYGmfb",
+        },
+        .@"wlr-protocols" = .{
+            .url = "git+https://gitlab.freedesktop.org/wlroots/wlr-protocols#bf4fc79abc359eea5a0edec0ac6d4a2b2955f82a",
+            .hash = "N-V-__8AAMq4AQASESNUzI38keQUB1Pz9OXa_YoUwXAgWQQl",
+        },
+        .@"wayland-protocols" = .{
+            .url = "git+https://gitlab.freedesktop.org/wayland/wayland-protocols#02e63e74a807afed95bc25a386173110afef24e3",
+            .hash = "N-V-__8AAMCWEADA0AS-1LfBEtixZLJAb_XQKQpgSmR2uxAO",
+        },
+        .wayland = .{
+            .url = "git+https://codeberg.org/ifreund/zig-wayland#4a150a04f76f7329e80280661355c04328369d1f",
+            .hash = "wayland-0.6.0-dev-lQa1krD8AQBlMqwuhAMJjPQKXvpRByZBxxqMVAZ7yzbG",
+        },
+        .xkbcommon = .{
+            .url = "git+https://codeberg.org/ifreund/zig-xkbcommon#6c2f41e269adde0d2cd58d20c02c4f8803d83eb1",
+            .hash = "xkbcommon-0.5.0-dev-VDqIe0y2AgA1RzA2ICMdGhaAgSXdhtRTbYybQQu7WfOa",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

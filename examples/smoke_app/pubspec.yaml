@@ -1,0 +1,21 @@
+name: fushell_flutter_smoke_app
+description: Minimal Flutter page for testing fushell raw embedder first-frame rendering.
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ">=3.8.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  fushell:
+    path: vendor/fushell
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

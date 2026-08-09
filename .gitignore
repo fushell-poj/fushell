@@ -1,0 +1,13 @@
+.pi
+openspec
+.pi-lens
+.vscode
+.envrc
+.direnv
+.zig-cache
+zig-out
+zig-pkg
+
+# Local Flutter raw engine artifacts (user-managed, not vendored)
+flutter_engine_dir
+.dart_tool
