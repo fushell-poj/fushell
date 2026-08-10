@@ -107,12 +107,16 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
     const wlr_protocols = b.dependency("wlr-protocols", .{});
     scanner.addCustomProtocol(wlr_protocols.path("unstable/wlr-layer-shell-unstable-v1.xml"));
+    scanner.addCustomProtocol(wlr_protocols.path("unstable/wlr-data-control-unstable-v1.xml"));
+    scanner.addCustomProtocol(wayland_protocols.path("unstable/text-input/text-input-unstable-v3.xml"));
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_output", 4);
     scanner.generate("wl_seat", 8);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("zwlr_layer_shell_v1", 4);
+    scanner.generate("zwlr_data_control_manager_v1", 2);
+    scanner.generate("zwp_text_input_manager_v3", 2);
     // xdg_surface/xdg_toplevel are created from xdg_wm_base, not globals.
     scanner.generate("xdg_wm_base", 6);
     const wayland_mod = b.createModule(.{

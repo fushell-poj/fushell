@@ -17,10 +17,13 @@ fn lockMutex(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
 const wayland = @import("wayland");
+const data_control = @import("data_control.zig");
+const ime_v3 = @import("ime_v3.zig");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 const wp = wayland.client.wp;
 const zwlr = wayland.client.zwlr;
+const zwp = wayland.client.zwp;
 const c = @import("c");
 
 pub const max_outputs = 16;
@@ -43,6 +46,13 @@ pub const DisplayState = struct {
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
     seat: ?*wl.Seat = null,
     pointer: ?*wl.Pointer = null,
+    keyboard: ?*wl.Keyboard = null,
+    data_control: ?*data_control.DataControl = null,
+    ime: ?*ime_v3.ImeV3 = null,
+    data_control_manager_name: u32 = 0,
+    data_control_manager_version: u32 = 0,
+    ime_manager_name: u32 = 0,
+    ime_manager_version: u32 = 0,
     outputs: [max_outputs]OutputState = [_]OutputState{.{}} ** max_outputs,
 
     egl_display: c.EGLDisplay = null,
@@ -170,9 +180,14 @@ pub const DisplayState = struct {
         for (&self.outputs) |*output_state| {
             if (output_state.output) |output| output.setQueue(queue);
         }
-        if (self.seat) |seat| seat.setQueue(queue);
+        if (self.seat) |seat| {
+            seat.setQueue(queue);
+            if (self.data_control) |dc| dc.bindDevice(seat);
+        }
         if (self.pointer) |pointer| pointer.setQueue(queue);
+        if (self.keyboard) |keyboard| keyboard.setQueue(queue);
         self.ensurePointer();
+        self.ensureKeyboard();
     }
 
     fn ensurePointer(self: *DisplayState) void {
@@ -184,6 +199,17 @@ pub const DisplayState = struct {
         };
         self.pointer.?.setListener(*DisplayState, pointerListener, self);
         if (self.primary_queue) |queue| self.pointer.?.setQueue(queue);
+    }
+
+    fn ensureKeyboard(self: *DisplayState) void {
+        const seat = self.seat orelse return;
+        if (self.keyboard != null) return;
+        self.keyboard = seat.getKeyboard() catch {
+            std.debug.print("wl_seat.get_keyboard failed.\n", .{});
+            return;
+        };
+        self.keyboard.?.setListener(*DisplayState, keyboardListener, self);
+        if (self.primary_queue) |queue| self.keyboard.?.setQueue(queue);
     }
 
     // ── 输出 / scale ──────────────────────────────────
@@ -220,9 +246,18 @@ pub const DisplayState = struct {
     // ── flush (连接级互斥) ────────────────────────────
 
     pub fn flushLocked(self: *DisplayState) void {
-        lockMutex(&self.flush_mutex);
-        defer self.flush_mutex.unlock();
+        self.lockFlush();
+        defer self.unlockFlush();
         if (self.display) |display| _ = display.flush();
+    }
+
+    /// 手动锁/解锁 flush 互斥 (跨多次 marshal 时用, 如 data-control receive)。
+    pub fn lockFlush(self: *DisplayState) void {
+        lockMutex(&self.flush_mutex);
+    }
+
+    pub fn unlockFlush(self: *DisplayState) void {
+        self.flush_mutex.unlock();
     }
 
     // ── GL 库 (共享) ──────────────────────────────────
@@ -253,6 +288,12 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
                 if (self.seat == null) {
                     self.seat = seat;
                     seat.setListener(*DisplayState, seatListener, self);
+                    if (self.data_control) |dc| dc.bindDevice(seat);
+                    if (self.ime) |ime| {
+                        if (self.ime_manager_name != 0) {
+                            if (self.registry) |reg| ime.bindManager(reg, self.ime_manager_name, self.ime_manager_version, seat);
+                        }
+                    }
                 } else {
                     std.debug.print("Ignoring additional Wayland seat {d}; only one seat is supported in this MVP.\n", .{global.name});
                     seat.release();
@@ -263,8 +304,21 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
                 self.fractional_scale_manager = manager;
             } else if (bindGlobal(registry, global, zwlr.LayerShellV1)) |layer_shell| {
                 self.layer_shell = layer_shell;
+            } else if (bindGlobal(registry, global, zwlr.DataControlManagerV1)) |manager| {
+                _ = manager;
+                self.data_control_manager_name = global.name;
+                self.data_control_manager_version = global.version;
+                if (self.data_control) |dc| dc.bindManager(registry, global.name, global.version);
             } else if (bindGlobal(registry, global, xdg.WmBase)) |wm_base| {
                 self.wm_base = wm_base;
+            } else if (std.mem.eql(u8, std.mem.span(global.interface), "zwp_text_input_manager_v3")) {
+                // bindGlobal 会用 generated_version (2), 但 hyprland 只支持 1 —
+                // 手动 bind 并按 compositor 版本 clamp。seat 可能未到, 记录后补绑。
+                self.ime_manager_name = global.name;
+                self.ime_manager_version = global.version;
+                if (self.ime) |ime| {
+                    if (self.seat) |seat| ime.bindManager(registry, global.name, global.version, seat);
+                }
             }
         },
         .global_remove => |global_remove| {
@@ -303,14 +357,87 @@ fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, self: *DisplayS
     }
 }
 
-fn seatListener(_: *wl.Seat, event: wl.Seat.Event, self: *DisplayState) void {
+fn seatListener(_: *wl.Seat, event: wl.Seat.Event, _: *DisplayState) void {
     switch (event) {
-        .capabilities => |capabilities| {
-            if (capabilities.capabilities.pointer) {
-                self.ensurePointer();
-            }
-        },
+        // pointer/keyboard 的绑定延迟到 attachPrimary (此时 primary_queue 已就绪)。
+        // 过早绑定 (capabilities 事件) 会把 keymap 等事件排进 default queue,
+        // setQueue 之后不会转移 → keymap 永久丢失 → xkb 无法翻译按键。
+        .capabilities => {},
         .name => {},
+    }
+}
+
+// ── 键盘事件 ──────────────────────────────────────
+
+/// 键盘事件由主窗口线程 dispatch (keyboard 绑主 queue)。
+/// enter 事件带 surface → 目标窗口由 runner 层路由 (同 pointer)。
+/// keymap 事件的 fd 需要 mmap 读取 (生命周期: 回调内处理完毕即 munmap)。
+pub const KeyboardEvent = union(enum) {
+    keymap: struct { format: wl.Keyboard.KeymapFormat, data: []const u8 },
+    enter: struct { surface: ?*wl.Surface, keys: ?*wl.Array },
+    leave: struct { surface: ?*wl.Surface },
+    key: struct { serial: u32, time: u32, key: u32, state: wl.Keyboard.KeyState },
+    modifiers: struct { depressed: u32, latched: u32, locked: u32, group: u32 },
+    repeat: struct { delay_ms: i32, rate_per_sec: i32 },
+};
+
+pub const KeyboardEventCallback = *const fn (event: KeyboardEvent, surface: ?*wl.Surface) void;
+
+var keyboard_event_callback: ?KeyboardEventCallback = null;
+var keyboard_event_context: ?*anyopaque = null;
+
+pub fn setKeyboardEventCallback(callback: KeyboardEventCallback, context: ?*anyopaque) void {
+    keyboard_event_callback = callback;
+    keyboard_event_context = context;
+}
+
+var current_keyboard_surface: ?*wl.Surface = null;
+fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, _: *DisplayState) void {
+    const surface = switch (event) {
+        .enter => |enter| blk: {
+            current_keyboard_surface = enter.surface;
+            break :blk enter.surface;
+        },
+        .leave => |leave| blk: {
+            current_keyboard_surface = null;
+            break :blk leave.surface;
+        },
+        else => current_keyboard_surface,
+    };
+    if (keyboard_event_callback) |callback| {
+        switch (event) {
+            .keymap => |km| {
+                // fd 是 MAP_PRIVATE 只读映射 (v7+)。读取后立即关闭/解除。
+                const fd = km.fd;
+                if (fd >= 0 and km.size > 0) {
+                    const map = std.posix.mmap(
+                        null,
+                        km.size,
+                        .{ .READ = true },
+                        .{ .TYPE = .PRIVATE },
+                        fd,
+                        0,
+                    ) catch {
+                        _ = std.os.linux.close(fd);
+                        return;
+                    };
+                    callback(.{ .keymap = .{ .format = km.format, .data = map } }, surface);
+                    _ = std.posix.munmap(map);
+                }
+                _ = std.os.linux.close(fd);
+            },
+            .enter => |enter| callback(.{ .enter = .{ .surface = enter.surface, .keys = enter.keys } }, surface),
+            .leave => |leave| callback(.{ .leave = .{ .surface = leave.surface } }, surface),
+            .key => |key| callback(.{
+                .key = .{ .serial = key.serial, .time = key.time, .key = key.key, .state = key.state },
+            }, surface),
+            .modifiers => |mods| callback(.{
+                .modifiers = .{ .depressed = mods.mods_depressed, .latched = mods.mods_latched, .locked = mods.mods_locked, .group = mods.group },
+            }, surface),
+            .repeat_info => |ri| {
+                callback(.{ .repeat = .{ .delay_ms = ri.delay, .rate_per_sec = ri.rate } }, surface);
+            },
+        }
     }
 }
 

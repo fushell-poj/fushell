@@ -524,7 +524,7 @@ pub const Host = struct {
         return @intCast(self.scale * 120);
     }
 
-    fn activeScale(self: *const Host) f64 {
+    pub fn activeScale(self: *const Host) f64 {
         return @as(f64, @floatFromInt(self.activeScale120())) / 120.0;
     }
 

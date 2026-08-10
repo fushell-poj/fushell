@@ -7,6 +7,7 @@ pub const Api = struct {
     shutdown: EngineShutdownFn,
     send_window_metrics: SendWindowMetricsFn,
     send_pointer_event: SendPointerEventFn,
+    send_platform_message: SendPlatformMessageFn,
     send_platform_message_response: SendPlatformMessageResponseFn,
     run_task: RunTaskFn,
     schedule_frame: ScheduleFrameFn,
@@ -20,6 +21,7 @@ pub const Api = struct {
     const EngineShutdownFn = *const fn (c.FlutterEngine) callconv(.c) c.FlutterEngineResult;
     const SendWindowMetricsFn = *const fn (c.FlutterEngine, *const c.FlutterWindowMetricsEvent) callconv(.c) c.FlutterEngineResult;
     const SendPointerEventFn = *const fn (c.FlutterEngine, *const c.FlutterPointerEvent, usize) callconv(.c) c.FlutterEngineResult;
+    const SendPlatformMessageFn = *const fn (c.FlutterEngine, *const c.FlutterPlatformMessage) callconv(.c) c.FlutterEngineResult;
     const SendPlatformMessageResponseFn = *const fn (c.FlutterEngine, ?*const c.FlutterPlatformMessageResponseHandle, [*c]const u8, usize) callconv(.c) c.FlutterEngineResult;
     const RunTaskFn = *const fn (c.FlutterEngine, *const c.FlutterTask) callconv(.c) c.FlutterEngineResult;
     const ScheduleFrameFn = *const fn (c.FlutterEngine) callconv(.c) c.FlutterEngineResult;
@@ -47,6 +49,7 @@ pub const Api = struct {
             .shutdown = try loadSymbol(EngineShutdownFn, handle, "FlutterEngineShutdown"),
             .send_window_metrics = try loadSymbol(SendWindowMetricsFn, handle, "FlutterEngineSendWindowMetricsEvent"),
             .send_pointer_event = try loadSymbol(SendPointerEventFn, handle, "FlutterEngineSendPointerEvent"),
+            .send_platform_message = try loadSymbol(SendPlatformMessageFn, handle, "FlutterEngineSendPlatformMessage"),
             .send_platform_message_response = try loadSymbol(SendPlatformMessageResponseFn, handle, "FlutterEngineSendPlatformMessageResponse"),
             .run_task = try loadSymbol(RunTaskFn, handle, "FlutterEngineRunTask"),
             .schedule_frame = try loadSymbol(ScheduleFrameFn, handle, "FlutterEngineScheduleFrame"),

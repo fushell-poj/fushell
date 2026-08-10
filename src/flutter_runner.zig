@@ -1,9 +1,15 @@
 const std = @import("std");
+// build-verify
 const c = @import("c");
 const egl = @import("wayland_egl_host.zig");
 const flutter = @import("flutter_embedder.zig");
 const surface_channel = @import("surface_channel.zig");
 const display_state = @import("wl_display_state.zig");
+const text_input = @import("text_input.zig");
+const clipboard = @import("clipboard.zig");
+const data_control = @import("data_control.zig");
+const ime_v3 = @import("ime_v3.zig");
+const xkb = @import("xkb.zig");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 
@@ -26,6 +32,8 @@ const SpawnEntry = struct {
     finished: bool = false,
     thread: std.Thread = undefined,
     host: ?*egl.Host = null,
+    /// 键盘事件路由目标 (键盘焦点在 spawn 窗口 surface 时)。
+    runner: ?*Runner = null,
 };
 var spawn_entries: [max_spawned_windows]SpawnEntry = undefined;
 var spawn_mutex: std.atomic.Mutex = .unlocked;
@@ -47,7 +55,94 @@ fn getDisplayState() !*display_state.DisplayState {
 }
 
 /// 主窗口 runner (指针路由的目标之一)。
+/// 进程级 data-control (系统剪贴板): 主窗口 attach 时创建, 绑定到共享 display。
+var global_data_control: ?*data_control.DataControl = null;
+
 var main_runner_host: ?*egl.Host = null;
+var main_runner_ref: ?*Runner = null;
+
+/// 键盘输入事件 (主线程 push, 目标窗口线程 drain)。
+/// keymap 数据在主线程 mmap 后立即拷贝 (生命周期跨线程)。
+const InputEvent = union(enum) {
+    keymap: []u8,
+    key: struct { keycode: u32, pressed: bool },
+    modifiers: struct { depressed: u32, latched: u32, locked: u32, group: u32 },
+    focus: bool,
+};
+
+/// 主线程 dispatch 键盘事件 → 焦点窗口 runner 的输入队列。
+fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surface) void {
+    // keymap 在 enter 之前到达 (surface 未知) — 投给主窗口 runner。
+    const runner = findRunnerBySurface(surface) orelse main_runner_ref orelse return;
+    runner.queueInputEvent(event) catch |err| {
+        std.debug.print("[error] queue keyboard event failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+/// IME 事件路由: 投给键盘焦点窗口 (IME 是全局对象, 事件随焦点窗口)。
+/// text_input.Client 的 send_fn: 发 updateEditingState 到对应 runner 的引擎。
+/// 简单方案: 路由到键盘焦点窗口 (IME 场景) 或 main_runner (普通输入)。
+fn textInputSendCallback(client_id: i64, msg: []const u8) void {
+    _ = client_id;
+    const target = focusRunnerRef() orelse main_runner_ref orelse return;
+    target.sendToEngine("flutter/textinput", msg);
+}
+
+fn focusRunnerRef() ?*Runner {
+    if (main_runner_ref) |runner| {
+        if (runner.keyboard_focused) return runner;
+    }
+    lockSpawnMutex();
+    defer spawn_mutex.unlock();
+    for (&spawn_entries) |*entry| {
+        if (!entry.active) continue;
+        if (entry.runner) |r| {
+            if (r.keyboard_focused) return r;
+        }
+    }
+    return null;
+}
+
+fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
+    _ = ctx;
+    // enter/leave 事件带 surface → 精确路由到对应窗口的 runner。
+    // (不能依赖 keyboard_focused: text_input enter 可能先于 wl_keyboard.enter 到达)
+    var surface: ?*wl.Surface = null;
+    switch (event) {
+        .enter => |e| surface = e.surface,
+        .leave => |e| surface = e.surface,
+        else => {},
+    }
+    if (surface) |s| {
+        if (findRunnerBySurface(s)) |r| {
+            r.handleImeEvent(event);
+            return;
+        }
+    }
+    // 无 surface 或找不到: 回退主 runner。
+    if (main_runner_ref) |runner| {
+        runner.handleImeEvent(event);
+        return;
+    }
+}
+
+fn findRunnerBySurface(surface: ?*wl.Surface) ?*Runner {
+    const s = surface orelse return null;
+    if (main_runner_ref) |runner| {
+        if (main_runner_host) |host| {
+            if (host.surface == s) return runner;
+        }
+    }
+    lockSpawnMutex();
+    defer spawn_mutex.unlock();
+    for (&spawn_entries) |*entry| {
+        if (!entry.active) continue;
+        if (entry.host) |host| {
+            if (host.surface == s) return entry.runner;
+        }
+    }
+    return null;
+}
 
 /// 指针路由: 事件 surface → 目标窗口 host → handlePointerEvent。
 /// 由主窗口线程调用 (pointer 绑主 queue)。spawn 窗口的指针状态跨线程写入,
@@ -190,6 +285,21 @@ const Runner = struct {
     bootstrap_present_logged: bool = false,
     first_present_logged: bool = false,
 
+    // ── 输入 / 文本 / 剪贴板 ──────────────────────
+    text_client: text_input.Client = undefined,
+    clipboard: clipboard.Clipboard = undefined,
+    ime: ?*ime_v3.ImeV3 = null,
+    xkb_state: xkb.Xkb = .{},
+    keyboard_focused: bool = false,
+    // 键盘长按重复 (wl_keyboard.repeat_info): delay 后按 rate 模拟 keydown。
+    repeat_delay_ms: u32 = 500,
+    repeat_rate_per_sec: u32 = 25,
+    repeat_active_key: ?u32 = null,
+    repeat_next_time_ns: u64 = 0,
+    last_modifiers: u32 = 0,
+    input_mutex: std.atomic.Mutex = .unlocked,
+    input_events: std.ArrayListUnmanaged(InputEvent) = .empty,
+
     fn now(self: *Runner) u64 {
         return self.api.get_current_time();
     }
@@ -200,6 +310,299 @@ const Runner = struct {
 
     fn beginRender(self: *Runner) void {
         self.rendering_generation.store(self.metrics_generation.load(.acquire), .release);
+    }
+
+    /// 主线程调用: 投递键盘事件到本窗口线程的输入队列。
+    fn queueInputEvent(self: *Runner, event: display_state.KeyboardEvent) !void {
+        while (!self.input_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.input_mutex.unlock();
+        switch (event) {
+            .keymap => |km| {
+                const copy = try self.allocator.dupe(u8, km.data);
+                try self.input_events.append(self.allocator, .{ .keymap = copy });
+            },
+            .key => |k| try self.input_events.append(self.allocator, .{ .key = .{ .keycode = k.key, .pressed = k.state == .pressed } }),
+            .modifiers => |m| try self.input_events.append(self.allocator, .{ .modifiers = .{ .depressed = m.depressed, .latched = m.latched, .locked = m.locked, .group = m.group } }),
+            .enter => try self.input_events.append(self.allocator, .{ .focus = true }),
+            .leave => try self.input_events.append(self.allocator, .{ .focus = false }),
+            .repeat => |r| {
+                self.repeat_delay_ms = @intCast(@max(r.delay_ms, 0));
+                self.repeat_rate_per_sec = @intCast(@max(r.rate_per_sec, 0));
+            },
+        }
+    }
+
+    /// 窗口线程调用 (事件循环 tick): 处理全部积压的键盘事件。
+    /// 键盘长按重复: 到达 repeat 时间点则模拟一次 keydown。
+    fn checkKeyRepeat(self: *Runner) void {
+        const key = self.repeat_active_key orelse return;
+        const now_ns = nowNs();
+        if (now_ns < self.repeat_next_time_ns) return;
+        // 到达重复点: 间隔 = 1000/rate
+        const interval: u64 = if (self.repeat_rate_per_sec > 0)
+            @as(u64, 1_000_000_000) / self.repeat_rate_per_sec
+        else
+            100 * 1_000_000;
+        self.repeat_next_time_ns = now_ns + interval;
+        if (self.keyboard_focused and self.text_client.active) {
+            _ = self.xkb_state.updateKey(key, true);
+            self.sendKeyboardEvent(key, true);
+            self.handleKey(key);
+        }
+    }
+
+    fn drainInputEvents(self: *Runner) void {
+        while (true) {
+            while (!self.input_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.input_events.items.len == 0) {
+                self.input_mutex.unlock();
+                return;
+            }
+            const event = self.input_events.orderedRemove(0);
+            self.input_mutex.unlock();
+            defer if (event == .keymap) self.allocator.free(event.keymap);
+            self.handleInputEvent(event);
+        }
+    }
+
+    fn handleInputEvent(self: *Runner, event: InputEvent) void {
+        switch (event) {
+            .keymap => |km| {
+                self.xkb_state.deinit();
+                self.xkb_state = xkb.Xkb.init(km) catch |err| {
+                    std.debug.print("[error] xkb keymap init failed: {s}\n", .{@errorName(err)});
+                    self.xkb_state = .{};
+                    return;
+                };
+                {
+                    const path_z: [:0]const u8 = "/tmp/fushell-keymap.xkb";
+                    const rc = std.os.linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+                    const fd: i32 = @intCast(@min(rc, 1 << 30));
+                    if (fd > 0) {
+                        _ = std.os.linux.write(fd, km.ptr, km.len);
+                        _ = std.os.linux.close(fd);
+                    }
+                }
+            },
+            .modifiers => |m| {
+                self.last_modifiers = m.depressed;
+                self.xkb_state.updateModifiers(m.depressed, m.latched, m.locked, m.group, m.group, m.group);
+            },
+            .focus => |focused| self.keyboard_focused = focused,
+            .key => |k| {
+                // 按下/松开都更新 xkb 状态 (修饰键跟踪依赖它)。
+                _ = self.xkb_state.updateKey(k.keycode, k.pressed);
+                // 无论焦点/文本客户端, 都向 Flutter 发送 RawKeyEvent
+                // (EditableText 靠它实现 Ctrl+C/V/A 等快捷键)。
+                self.sendKeyboardEvent(k.keycode, k.pressed);
+                if (!self.keyboard_focused or !self.text_client.active) return;
+                if (k.pressed) {
+                    // 启动长按重复计时 (repeat_info 的 delay 后按 rate 重复)。
+                    self.repeat_active_key = k.keycode;
+                    self.repeat_next_time_ns = nowNs() + @as(u64, self.repeat_delay_ms) * 1_000_000;
+                    self.handleKey(k.keycode);
+                } else {
+                    if (self.repeat_active_key == k.keycode) self.repeat_active_key = null;
+                }
+            },
+        }
+    }
+
+    /// 按键处理: 组合键 / 特殊键 / 可打印字符 → text_client 更新 → 回发引擎。
+    /// 发送 RawKeyEvent 到 flutter/keyevent 通道 (GTK 嵌入器同款格式)。
+    fn sendKeyboardEvent(self: *Runner, keycode: u32, pressed: bool) void {
+        const sym = self.xkb_state.getSym(keycode);
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf,
+            \\{{"type":"{s}","keymap":"linux","keyCode":{d},"modifiers":{d},"unicodeCodePoint":0,"scanCode":{d},"toolkit":"gtk","specifiedLogicalKey":{d},"specifiedPhysicalKey":0}}
+        , .{ if (pressed) "keydown" else "keyup", sym, self.xkb_state.getMods(), keycode, sym }) catch return;
+        self.sendToEngine("flutter/keyevent", msg);
+    }
+
+    /// IME 事件 (text-input-v3): preedit / commit / delete_surrounding。
+    /// 在键盘焦点窗口的 runner 上执行 (主线程或 spawn 线程 — 由路由调用处决定)。
+    fn handleImeEvent(self: *Runner, event: ime_v3.ImeEvent) void {
+        switch (event) {
+            .preedit => |p| {
+                self.text_client.setComposing(p.text, p.cursor_begin, p.cursor_end) catch |err| {
+                    std.debug.print("[error] preedit composing failed: {s}\n", .{@errorName(err)});
+                };
+            },
+            .commit => |text| {
+                self.text_client.insertText(text) catch |err| {
+                    std.debug.print("[error] ime commit insert failed: {s}\n", .{@errorName(err)});
+                };
+            },
+            .delete_surrounding => |d| {
+                self.text_client.deleteSurrounding(d.before, d.after) catch |err| {
+                    std.debug.print("[error] ime delete failed: {s}\n", .{@errorName(err)});
+                };
+            },
+            .enter => |e| {
+                _ = e;
+                // 窗口重新获得 IME 输入焦点。仅当 TextField 已聚焦 (setClient) 才恢复
+                // IME 模式; 否则 fcitx5 会在无输入框时弹候选框 (错误行为)。
+                if (!self.text_client.active) return;
+                if (self.ime) |ime| {
+                    // 优先用最近一次引擎几何 (已聚焦过, 输入框未移动时位置≈正确);
+                    // 无几何时才用指针位置兜底。避免 fcitx5 在 enable 时用默认位置
+                    // 产生"先闪一次再跳正"。
+                    if (self.text_client.has_transform and self.text_client.has_marked_rect) {
+                        const t = self.text_client.transform;
+                        const x = self.text_client.marked_rect_x * t[0] + self.text_client.marked_rect_y * t[4] + t[12];
+                        const y = self.text_client.marked_rect_x * t[1] + self.text_client.marked_rect_y * t[5] + t[13];
+                        std.debug.print("[diag] submit rect (enter-geom) ({d:.0},{d:.0})\n", .{ x, y });
+                        ime.setCursorRect(@intFromFloat(x), @intFromFloat(y), 4, @intFromFloat(@max(self.text_client.marked_rect_h, 16)));
+                    } else {
+                        std.debug.print("[diag] submit rect (enter-pointer) ({d:.0},{d:.0})\n", .{ self.host.pointer_x, self.host.pointer_y });
+                        ime.setCursorRect(
+                            @intFromFloat(@max(self.host.pointer_x, 0)),
+                            @intFromFloat(@max(self.host.pointer_y, 0)),
+                            4,
+                            @intFromFloat(@max(@as(f64, 24) * self.host.activeScale(), 16)),
+                        );
+                    }
+                    const sel: i32 = @intCast(@max(self.text_client.state.selection_base, 0));
+                    ime.setSurrounding(self.text_client.state.text.items, sel, sel);
+                    ime.enable(0, 1);
+                }
+            },
+            .leave => |e| {
+                _ = e;
+                if (self.ime) |ime| ime.disable();
+            },
+        }
+    }
+
+    /// 用引擎提供的 EditableText 几何 (transform + marked rect) 计算光标在
+    /// surface (窗口) 中的逻辑坐标, 更新 IME 候选框位置。仿官方 GTK 嵌入器
+    /// update_im_cursor_position (fl_text_input_handler.cc)。
+    fn updateImeCursorPosition(self: *Runner) void {
+        const client = &self.text_client;
+        if (!client.has_transform) return;
+        if (self.ime == null) return;
+        const composing_active = client.state.composing_start >= 0;
+        const use_caret = client.has_caret_rect and !composing_active;
+        if (!client.has_marked_rect and !use_caret) return;
+        const t = client.transform;
+        // Flutter 坐标系 = 物理像素。text-input-v3 的 set_cursor_rectangle 期望
+        // surface 本地坐标 = buffer 坐标 / buffer_scale; 我们 buffer_scale=1 (viewport),
+        // 所以直接传物理坐标 (同 GTK 嵌入器公式)。
+        // GTK 嵌入器 (fl_text_input_handler.cc): 行主序 storage,
+        // x = rx*T[0][0] + ry*T[1][0] + T[3][0] + w  →  t[0], t[4], t[12]
+        // y = rx*T[0][1] + ry*T[1][1] + T[3][1] + h  →  t[1], t[5], t[13]
+        // 注意: 不 + width/height! GTK 嵌入器加它们是因为 GTK IM 的 cursor location
+        // 语义是"矩形右下角"; 而 text-input-v3 的 set_cursor_rectangle 是整个光标矩形,
+        // hyprland 把 popup 显示在矩形正下方 (offset = rect.height)。加了反而偏移。
+        const rx = if (use_caret) client.caret_rect_x else client.marked_rect_x;
+        const ry = if (use_caret) client.caret_rect_y else client.marked_rect_y;
+        const x = rx * t[0] + ry * t[4] + t[12];
+        const y = rx * t[1] + ry * t[5] + t[13];
+        // 坐标系: setCursorRectangle 的坐标是 surface 本地坐标 = buffer 坐标 / buffer_scale。
+        // 我们 buffer_scale=1 (viewport 方案), 所以传 buffer 物理坐标, 不能除 scale!
+        // (除以 fractional scale 会导致 rect 偏大 1.54x, popup 位置错误/触发翻转)
+        self.ime.?.setCursorRect(
+            @intFromFloat(x),
+            @intFromFloat(y),
+            4,
+            24,
+        );
+    }
+
+    fn handleKey(self: *Runner, keycode: u32) void {
+        const sym = self.xkb_state.updateKey(keycode, true);
+        _ = self.xkb_state.ctrl;
+
+        // 注意: Ctrl 组合键 (Ctrl+C/V/A 等) 不在此处处理 — keyboard 事件已
+        // 发送给 Flutter, 由 EditableText 的快捷键处理 (宿主重复处理会与
+        // Flutter 端双重粘贴/全选冲突)。Flutter 端变化通过 setEditingState
+        // 回同步到宿主 buffer。
+
+        // 特殊键。
+        switch (sym) {
+            xkb.KEY_BackSpace => {
+                self.text_client.backspace() catch {
+                    return;
+                };
+            },
+            xkb.KEY_Delete => self.text_client.deleteForward() catch return,
+            xkb.KEY_Return, xkb.KEY_KP_Enter => {
+                if (self.text_client.multiline) {
+                    self.text_client.insertText("\n") catch return;
+                } else {
+                    const out = self.sendActionMessage() catch return;
+                    _ = out;
+                    return;
+                }
+            },
+            xkb.KEY_Left => self.text_client.moveCursor(.left),
+            xkb.KEY_Right => self.text_client.moveCursor(.right),
+            xkb.KEY_Home => self.text_client.moveCursor(.home),
+            xkb.KEY_End => self.text_client.moveCursor(.end),
+            else => {
+                // 可打印字符 (不含组合/修饰键)。
+                var buf: [64]u8 = undefined;
+                const n = self.xkb_state.getUtf8(keycode, &buf);
+                if (n > 0 and !self.xkb_state.ctrl and !self.xkb_state.alt) {
+                    self.text_client.insertText(buf[0..n]) catch |err| {
+                        std.debug.print("[error] insertText failed: {s}\n", .{@errorName(err)});
+                        return;
+                    };
+                } else {
+                    return;
+                }
+            },
+        }
+        self.sendTextInputUpdate();
+    }
+
+    fn copySelection(self: *Runner) void {
+        // 简化: 复制整个文本内容 (无选区信息时)。
+        const text = self.text_client.state.text.items;
+        if (text.len == 0) return;
+        self.clipboard.setText(text) catch |err| {
+            std.debug.print("[error] clipboard set failed: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    fn pasteClipboard(self: *Runner) void {
+        const text = self.clipboard.getText();
+        if (text.len == 0) return;
+        self.text_client.insertText(text) catch |err| {
+            std.debug.print("[error] paste failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.sendTextInputUpdate();
+    }
+
+    fn sendTextInputUpdate(self: *Runner) void {
+        if (!self.text_client.active) return;
+        var buf: [8192]u8 = undefined;
+        const escaped = text_input.jsonEscape(self.allocator, self.text_client.state.text.items) catch return;
+        defer self.allocator.free(escaped);
+        const msg = self.text_client.buildUpdateMessageEscaped(&buf, escaped) catch return;
+        self.sendToEngine("flutter/textinput", msg);
+    }
+
+    fn sendActionMessage(self: *Runner) !void {
+        var buf: [512]u8 = undefined;
+        const msg = try self.text_client.buildActionMessage(&buf);
+        self.sendToEngine("flutter/textinput", msg);
+    }
+
+    fn sendToEngine(self: *Runner, channel: []const u8, message: []const u8) void {
+        if (self.engine == null) return;
+        var c_message = c.FlutterPlatformMessage{
+            .struct_size = @sizeOf(c.FlutterPlatformMessage),
+            .channel = channel.ptr,
+            .message = message.ptr,
+            .message_size = message.len,
+            .response_handle = null,
+        };
+        const result = self.api.send_platform_message(self.engine, &c_message);
+        if (result != c.kSuccess) {
+            std.debug.print("[error] FlutterEngineSendPlatformMessage failed: {s}\n", .{flutter.resultName(result)});
+        }
     }
 
     fn shouldPresentRenderedFrame(self: *Runner) bool {
@@ -296,11 +699,76 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     if (options.role == .primary) {
         main_runner_host = host;
         display_state.setPointerEventCallback(displayPointerRouter, null);
+        display_state.setKeyboardEventCallback(displayKeyboardRouter, null);
+        // 系统剪贴板 (data-control): 主窗口负责绑定, 共享给所有窗口。
+        if (global_data_control == null) {
+            const dc = std.heap.page_allocator.create(data_control.DataControl) catch null;
+            if (dc) |d| {
+                d.* = data_control.DataControl.init(allocator, state);
+                global_data_control = d;
+                state.data_control = d;
+                // 若 registry 已发现 manager (attachPrimary 前), 补绑定
+                if (state.data_control_manager_name != 0) {
+                    if (state.registry) |reg| d.bindManager(reg, state.data_control_manager_name, state.data_control_manager_version);
+                }
+            }
+        }
+        // IME (text-input-v3): 主窗口创建, 共享 DisplayState; registry 绑定在 attachPrimary 后由 registryListener 完成。
+        if (state.ime == null) {
+            const ime = std.heap.page_allocator.create(ime_v3.ImeV3) catch null;
+            if (ime) |i| {
+                i.* = .{};
+                state.ime = i;
+            }
+        }
+        // registry 事件可能在 ime 创建前已处理 (attachPrimary 先于创建) — 补绑定。
+        if (state.ime) |ime| {
+            ime.primary_queue = state.primary_queue;
+            ime.setCallback(imeEventRouter, null);
+            if (state.ime_manager_name != 0) {
+                if (state.registry) |reg| {
+                    if (state.seat) |seat| ime.bindManager(reg, state.ime_manager_name, state.ime_manager_version, seat);
+                }
+            }
+        }
     }
     try host.initEglBootstrap();
     std.debug.print("Wayland display connected and EGL bootstrap context is ready. Waiting for Dart surface initialization.\n", .{});
 
     var runner: Runner = .{ .allocator = allocator, .host = host, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .engine_library = options.engine_library, .bundle_path = options.bundle_path };
+    runner.ime = state.ime;
+    runner.text_client = text_input.Client.init(allocator);
+    runner.text_client.send_fn = textInputSendCallback;
+    runner.clipboard = clipboard.Clipboard.init(allocator);
+    defer runner.text_client.deinit();
+    defer runner.clipboard.deinit();
+    defer runner.xkb_state.deinit();
+    defer runner.input_events.deinit(allocator);
+    if (options.role == .primary) {
+        main_runner_ref = &runner;
+    } else if (options.external_host) |external| {
+        // 注册 spawn runner (键盘路由目标), 退出时注销。
+        lockSpawnMutex();
+        for (&spawn_entries) |*entry| {
+            if (entry.host == external) {
+                entry.runner = &runner;
+            }
+        }
+        unlockSpawnMutex();
+    }
+    defer {
+        if (options.role == .primary) {
+            main_runner_ref = null;
+        } else if (options.external_host) |external| {
+            lockSpawnMutex();
+            for (&spawn_entries) |*entry| {
+                if (entry.host == external) {
+                    entry.runner = null;
+                }
+            }
+            unlockSpawnMutex();
+        }
+    }
     host.setMetricsCallback(metricsCallback, &runner);
     host.setPointerCallback(pointerCallback, &runner);
 
@@ -728,6 +1196,13 @@ fn deleteTreeBestEffort(path: []const u8) void {
     _ = c.rmdir(path_z.ptr);
 }
 
+/// 单调时钟纳秒 (重复计时用)。
+fn nowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 fn fromUserData(user_data: ?*anyopaque) *Runner {
     return @ptrCast(@alignCast(user_data.?));
 }
@@ -744,6 +1219,8 @@ fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_dat
 
 fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     const runner = fromUserData(user_data);
+    runner.drainInputEvents();
+    runner.checkKeyRepeat();
     try runner.runDueFlutterTasks();
 }
 
@@ -816,12 +1293,301 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
     const channel = if (message.channel == null) "" else std.mem.span(message.channel);
     const payload = if (message.message == null or message.message_size == 0) "" else message.message[0..message.message_size];
 
-    if (!std.mem.eql(u8, channel, surface_channel.channel_name)) {
-        std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
+    if (std.mem.eql(u8, channel, surface_channel.channel_name)) {
+        handleSurfaceChannelMessage(runner, message, payload);
+        return;
+    }
+    if (std.mem.eql(u8, channel, "flutter/textinput")) {
+        handleTextInputMessage(runner, message, payload);
+        return;
+    }
+    if (std.mem.eql(u8, channel, "flutter/platform")) {
+        handlePlatformChannelMessage(runner, message, payload);
+        return;
+    }
+    std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
+    sendEmptyPlatformResponse(runner, message.response_handle);
+}
+
+/// 解析 textinput 消息 (setClient/setEditingState/clearClient/show/hide)。
+fn handleTextInputMessage(runner: *Runner, message: c.FlutterPlatformMessage, payload: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{}) catch {
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |m| m,
+        else => {
+            sendEmptyPlatformResponse(runner, message.response_handle);
+            return;
+        },
+    };
+    const method = switch (root.get("method") orelse return) {
+        .string => |s| s,
+        else => return,
+    };
+    const args = root.get("args");
+
+    if (std.mem.eql(u8, method, "TextInput.setClient")) {
+        if (args == null or args.? != .array or args.?.array.items.len < 2) {
+            sendEmptyPlatformResponse(runner, message.response_handle);
+            return;
+        }
+        const id = switch (args.?.array.items[0]) {
+            .object => |o| switch (o.get("_clientId") orelse return) {
+                .integer => |i| i,
+                else => return,
+            },
+            .integer => |i| i,
+            else => return,
+        };
+        const config = args.?.array.items[1];
+        var multiline = false;
+        var action: []const u8 = "done";
+        if (config == .object) {
+            if (config.object.get("inputAction")) |ia| {
+                if (ia == .string) action = ia.string;
+            }
+            if (config.object.get("inputType")) |it| {
+                if (it == .object) {
+                    if (it.object.get("isMultiline")) |ml| {
+                        if (ml == .bool) multiline = ml.bool;
+                    }
+                }
+            }
+        }
+        runner.text_client.clear();
+        runner.text_client.client_id = id;
+        runner.text_client.active = true;
+        runner.text_client.multiline = multiline;
+        runner.text_client.input_action = action;
+        // TextField 聚焦: 启用 IME + 候选框定位。
+        // 优先用引擎提供的 EditableText 几何 (transform + marked rect → 真实光标),
+        // 避免 popup 先出现在点击处再跳到光标处的闪烁。
+        if (runner.ime) |ime| {
+            if (runner.text_client.has_transform and runner.text_client.has_marked_rect) {
+                runner.updateImeCursorPosition();
+            } else {
+                // fallback: 指针位置 (引擎几何未到)。
+                ime.setCursorRect(
+                    @intFromFloat(@max(runner.host.pointer_x, 0)),
+                    @intFromFloat(@max(runner.host.pointer_y, 0)),
+                    4,
+                    24,
+                );
+            }
+            ime.enable(0, 1);
+        }
         sendEmptyPlatformResponse(runner, message.response_handle);
         return;
     }
+    if (std.mem.eql(u8, method, "TextInput.setEditableSizeAndTransform")) {
+        // EditableText 局部 → Flutter root 变换矩阵 (官方 GTK 嵌入器同款协议)。
+        if (args != null and args.? == .object) {
+            if (args.?.object.get("transform")) |tv| {
+                if (tv == .array and tv.array.items.len == 16) {
+                    var ok = true;
+                    for (tv.array.items, 0..) |item, i| {
+                        runner.text_client.transform[i] = switch (item) {
+                            .float => |f| f,
+                            .integer => |iv| @floatFromInt(iv),
+                            else => {
+                                ok = false;
+                                break;
+                            },
+                        };
+                    }
+                    if (ok) runner.text_client.has_transform = true;
+                }
+            }
+        }
+        // transform 到达不代表 rect 到达; 有 rect 时更新候选框位置。
+        if (runner.text_client.has_marked_rect) runner.updateImeCursorPosition();
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    }
+    if (std.mem.eql(u8, method, "TextInput.setMarkedTextRect")) {
+        // composing 区域 / 光标矩形 (局部坐标, 无 composing 时即光标)。
+        if (args != null and args.? == .object) {
+            const o = args.?.object;
+            const getF = struct {
+                fn getv(m: std.json.ObjectMap, key: []const u8) ?f64 {
+                    const v = m.get(key) orelse return null;
+                    return switch (v) {
+                        .float => |fv| fv,
+                        .integer => |iv| @floatFromInt(iv),
+                        else => null,
+                    };
+                }
+            }.getv;
+            if (getF(o, "x")) |x| {
+                runner.text_client.marked_rect_x = x;
+                runner.text_client.marked_rect_y = getF(o, "y") orelse 0;
+                runner.text_client.marked_rect_w = getF(o, "width") orelse 0;
+                runner.text_client.marked_rect_h = getF(o, "height") orelse 0;
+                runner.text_client.has_marked_rect = true;
+                runner.updateImeCursorPosition();
+            }
+        }
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    }
+    if (std.mem.eql(u8, method, "TextInput.setCaretRect")) {
+        // 光标矩形 (EditableText 光标移动时发送, Flutter 3.41 独立方法)。
+        if (args != null and args.? == .object) {
+            const o = args.?.object;
+            const getF = struct {
+                fn getv(m: std.json.ObjectMap, key: []const u8) ?f64 {
+                    const v = m.get(key) orelse return null;
+                    return switch (v) {
+                        .float => |fv| fv,
+                        .integer => |iv| @floatFromInt(iv),
+                        else => null,
+                    };
+                }
+            }.getv;
+            if (getF(o, "x")) |x| {
+                runner.text_client.caret_rect_x = x;
+                runner.text_client.caret_rect_y = getF(o, "y") orelse 0;
+                runner.text_client.has_caret_rect = true;
+                runner.updateImeCursorPosition();
+            }
+        }
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    }
+    if (std.mem.eql(u8, method, "TextInput.setEditingState")) {
+        // Flutter 端: invokeMethod('TextInput.setEditingState', value.toJSON())
+        // → args 直接是 object (不是 [object] array, 与 setClient 不同)。
+        if (args == null or args.? != .object) {
+            sendEmptyPlatformResponse(runner, message.response_handle);
+            return;
+        }
+        const state = args.?;
+        if (state == .object) {
+            var text: []const u8 = "";
+            var base: i64 = 0;
+            var extent: i64 = 0;
+            if (state.object.get("text")) |t| {
+                if (t == .string) text = t.string;
+            }
+            if (state.object.get("selectionBase")) |b| {
+                if (b == .integer) base = b.integer;
+            }
+            if (state.object.get("selectionExtent")) |e| {
+                if (e == .integer) extent = e.integer;
+            }
+            runner.text_client.applyEditingState(text, base, extent) catch |err| {
+                std.debug.print("[error] apply editing state failed: {s}\n", .{@errorName(err)});
+            };
+        }
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    }
+    if (std.mem.eql(u8, method, "TextInput.clearClient")) {
+        runner.text_client.clear();
+        if (runner.ime) |ime| ime.disable();
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    }
+    // show / hide / setCaretRect / requestAutofill 等: 空响应即可。
+    sendEmptyPlatformResponse(runner, message.response_handle);
+}
 
+/// flutter/platform 通道: Clipboard.setData / getData, 其余空响应。
+fn handlePlatformChannelMessage(runner: *Runner, message: c.FlutterPlatformMessage, payload: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{}) catch {
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |m| m,
+        else => {
+            sendEmptyPlatformResponse(runner, message.response_handle);
+            return;
+        },
+    };
+    const method = switch (root.get("method") orelse return) {
+        .string => |s| s,
+        else => return,
+    };
+    const args = root.get("args");
+
+    if (std.mem.eql(u8, method, "Clipboard.setData")) {
+        // args 形状: Flutter 的 Clipboard.setData 发的是 object {"text": ...}
+        // (部分版本是 [object] array) — 两种都兼容。
+        var text: ?[]const u8 = null;
+        if (args != null) {
+            switch (args.?) {
+                .object => |o| {
+                    if (o.get("text")) |t| {
+                        if (t == .string) text = t.string;
+                    }
+                },
+                .array => |a| {
+                    if (a.items.len >= 1 and a.items[0] == .object) {
+                        if (a.items[0].object.get("text")) |t| {
+                            if (t == .string) text = t.string;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        if (text) |t| {
+            runner.clipboard.setText(t) catch |err| {
+                std.debug.print("[error] clipboard set failed: {s}\n", .{@errorName(err)});
+            };
+            // 发布到系统剪贴板 (data-control), 供其他应用读取。
+            if (global_data_control) |dc| dc.publish(t);
+        } else {
+            std.debug.print("[error] Clipboard.setData: no text in args\n", .{});
+        }
+        sendEmptyPlatformResponse(runner, message.response_handle);
+        return;
+    }
+    if (std.mem.eql(u8, method, "Clipboard.hasStrings")) {
+        // Flutter 3.35+: Ctrl+V 前先查剪贴板是否有内容, 期待 {"value": bool}。
+        const local_has = runner.clipboard.getText().len > 0;
+        const sys_has = if (global_data_control) |dc| dc.hasText() else false;
+        const has = local_has or sys_has;
+        var buf: [64]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "[{{\"value\":{}}}]", .{has}) catch {
+            sendEmptyPlatformResponse(runner, message.response_handle);
+            return;
+        };
+        sendPlatformResponse(runner, message.response_handle, resp);
+        return;
+    }
+    if (std.mem.eql(u8, method, "Clipboard.getData")) {
+        // 系统剪贴板优先 (data-control), 无则回退进程内副本。
+        var sys_text: ?[]const u8 = null;
+        defer if (sys_text) |t| runner.allocator.free(t);
+        if (global_data_control) |dc| sys_text = dc.requestText(runner.allocator);
+        const text = sys_text orelse runner.clipboard.getText();
+        var buf: [4096]u8 = undefined;
+        const escaped = text_input.jsonEscape(runner.allocator, text) catch {
+            sendEmptyPlatformResponse(runner, message.response_handle);
+            return;
+        };
+        defer runner.allocator.free(escaped);
+        const response = if (text.len == 0)
+            "[{\"text\":\"\"}]"
+        else
+            std.fmt.bufPrint(&buf, "[{{\"text\":\"{s}\"}}]", .{escaped}) catch {
+                sendEmptyPlatformResponse(runner, message.response_handle);
+                return;
+            };
+        sendPlatformResponse(runner, message.response_handle, response);
+        return;
+    }
+    // SystemSound / HapticFeedback / SystemChrome 等: 空响应 (引擎不阻塞)。
+    sendEmptyPlatformResponse(runner, message.response_handle);
+}
+
+fn handleSurfaceChannelMessage(runner: *Runner, message: c.FlutterPlatformMessage, payload: []const u8) void {
     const request = surface_channel.parseRequest(runner.allocator, payload) catch |err| {
         const code = surface_channel.parseErrorCode(err);
         std.debug.print("[error] Invalid fushell surface message: {s}\n", .{code});
