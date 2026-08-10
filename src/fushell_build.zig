@@ -4,12 +4,21 @@ const player = @import("player.zig");
 const flutter_runner = @import("flutter_runner.zig");
 const hot_reload = @import("hot_reload.zig");
 const frontend_server = @import("frontend_server.zig");
+const build_support = @import("build_support");
 
 comptime {
     _ = hot_reload;
 }
 
 const embedded_runner = @embedFile("fushell_runner_bin");
+
+/// VM service URI 轮询间隔 (ns)。URI 在引擎启动日志回调中写入, 通常在
+/// 引擎 run 后几百 ms 内就绪; 50ms 轮询兼顾及时性与低开销。
+const vm_uri_poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
+/// 文件监听轮询间隔 (ns)。mtime 轮询 (非 inotify 事件驱动) 因
+/// std.Io.Threaded 的 Dir.iterate 存在 BADF bug 而自实现目录迭代;
+/// 500ms 足够捕获保存操作, 开销可忽略。
+const watch_poll_interval_ns: u64 = 500 * std.time.ns_per_ms;
 
 // fushell SDK 包 (fushell-build sdk 释放)
 const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
@@ -19,15 +28,6 @@ const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
 const embedded_engine_debug = @embedFile("flutter_engine_so_debug");
 const embedded_engine_profile = @embedFile("flutter_engine_so_profile");
 const embedded_engine_release = @embedFile("flutter_engine_so_release");
-
-extern "c" fn posix_spawnp(
-    pid: *std.c.pid_t,
-    file: [*:0]const u8,
-    file_actions: ?*const anyopaque,
-    attrp: ?*const anyopaque,
-    argv: [*:null]const ?[*:0]const u8,
-    envp: [*:null]?[*:0]u8,
-) c_int;
 
 const Mode = enum { debug, profile, release };
 
@@ -56,7 +56,12 @@ const Options = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
     const args = try init.minimal.args.toSlice(allocator);
-    const io = std.Io.Threaded.global_single_threaded.io();
+    // 带全局环境的 io: runCommand 的 std.process.spawn 解析 argv[0] (PATH) 需要
+    var threaded = build_support.makeIo(allocator) catch {
+        std.debug.print("[error] failed to initialize process environment.\n", .{});
+        std.process.exit(1);
+    };
+    const io = threaded.io();
 
     const options = parseArgs(args) catch |err| {
         printUsage();
@@ -68,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.sdk) {
         const sdk_dir = options.sdk_dir orelse "vendor";
         releaseSdk(allocator, io, sdk_dir) catch |err| {
-            std.debug.print("fushell-build sdk failed: {s}\n", .{@errorName(err)});
+            std.debug.print("[error] fushell-build sdk failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         return;
@@ -80,14 +85,14 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(workdir_z);
         const chdir_result = std.c.chdir(workdir_z.ptr);
         if (chdir_result != 0) {
-            std.debug.print("fushell-build failed: cannot chdir to {s} (errno {d})\n", .{ workdir, std.posix.errno(chdir_result) });
+            std.debug.print("[error] fushell-build failed: cannot chdir to {s} (errno {d})\n", .{ workdir, std.posix.errno(chdir_result) });
             std.process.exit(1);
         }
         std.debug.print("working directory: {s}\n", .{workdir});
     }
 
     buildBundle(allocator, io, options) catch |err| {
-        std.debug.print("fushell-build failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] fushell-build failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 
@@ -97,10 +102,14 @@ pub fn main(init: std.process.Init) !void {
         const enable_vm_service = options.run and options.mode == .debug;
         var hot_thread: ?std.Thread = null;
         if (enable_vm_service) {
-            hot_thread = std.Thread.spawn(.{}, hotReloadThreadMain, .{}) catch null;
+            const spawn_result = std.Thread.spawn(.{}, hotReloadThreadMain, .{});
+            hot_thread = spawn_result catch |err| blk: {
+                std.debug.print("[error] hot reload unavailable: {s}\n", .{@errorName(err)});
+                break :blk null;
+            };
         }
         player.runPlayer(allocator, options.bundle_dir, enable_vm_service) catch |err| {
-            std.debug.print("fushell-build run failed: {s}\n", .{@errorName(err)});
+            std.debug.print("[error] fushell-build run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         if (hot_thread) |t| t.join();
@@ -192,16 +201,16 @@ fn hotReloadThreadMain() void {
 
     // 等待 VM service URI (引擎启动后日志回调写入)
     var waited: usize = 0;
-    while (flutter_runner.vm_service_uri_len == 0) {
+    var uri_buf: [512]u8 = undefined;
+    const uri = while (true) {
+        if (flutter_runner.vm_service.get(&uri_buf)) |u| break u;
         if (waited > 20_000) {
             std.debug.print("[hot-reload] timeout waiting for VM service URI.\n", .{});
             return;
         }
-        std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .real) catch return;
-        waited += 50;
-    }
-
-    const uri = flutter_runner.vm_service_uri[0..flutter_runner.vm_service_uri_len];
+        std.Io.sleep(io, .{ .nanoseconds = vm_uri_poll_interval_ns }, .real) catch return;
+        waited += vm_uri_poll_interval_ns / std.time.ns_per_ms;
+    };
     std.debug.print("[hot-reload] connecting to VM service: {s}\n", .{uri});
     const parsed = hot_reload.parseUri(uri) catch |err| {
         std.debug.print("[hot-reload] bad VM service URI: {s}\n", .{@errorName(err)});
@@ -266,7 +275,7 @@ fn hotReloadThreadMain() void {
     defer freeFileMap(allocator, &baseline);
 
     while (true) {
-        std.Io.sleep(io, .{ .nanoseconds = 500 * std.time.ns_per_ms }, .real) catch return;
+        std.Io.sleep(io, .{ .nanoseconds = watch_poll_interval_ns }, .real) catch return;
 
         var current = scanLibDartFiles(allocator, "lib") catch continue;
         var changed_paths = filesChanged(allocator, &baseline, &current) catch {
@@ -582,50 +591,32 @@ fn pathExists(allocator: std.mem.Allocator, path: []const u8) !bool {
 }
 
 fn runCommand(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    _ = io;
-
+    _ = allocator;
     std.debug.print("$", .{});
     for (argv) |arg| std.debug.print(" {s}", .{arg});
     std.debug.print("\n", .{});
 
     if (argv.len == 0) return error.CommandFailed;
 
-    var owned_args = try allocator.alloc([:0]u8, argv.len);
-    defer allocator.free(owned_args);
-    var argv_z = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    defer allocator.free(argv_z);
-    for (argv, 0..) |arg, index| {
-        owned_args[index] = try allocator.dupeZ(u8, arg);
-        argv_z[index] = owned_args[index].ptr;
-    }
-    defer for (owned_args) |arg| allocator.free(arg);
+    // 用 std.process.spawn (替代早期 posix_spawnp workaround):
+    // 需要完整 environ 才能解析 PATH (参考 build_support.makeIo 的 /proc/self/environ 方案)。
+    var child = try std.process.spawn(io, .{ .argv = argv });
+    // Child 无 deinit: wait 后由 io 释放 (spawn 的 stdio 管道在 wait 时清理)
 
-    var pid: std.c.pid_t = undefined;
-    const spawn_result = posix_spawnp(&pid, argv_z[0].?, null, null, argv_z.ptr, std.c.environ);
-    if (spawn_result != 0) {
-        std.debug.print("posix_spawnp({s}) failed with errno {d}\n", .{ argv[0], spawn_result });
-        return error.CommandFailed;
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.debug.print("command exited with status {d}\n", .{code});
+                return error.CommandFailed;
+            }
+        },
+        .signal, .stopped => |sig| {
+            std.debug.print("command terminated by signal {d}\n", .{sig});
+            return error.CommandFailed;
+        },
+        .unknown => return error.CommandFailed,
     }
-
-    var status: c_int = 0;
-    while (true) {
-        const wait_result = std.c.waitpid(pid, &status, 0);
-        if (wait_result >= 0) break;
-        switch (std.posix.errno(wait_result)) {
-            .INTR => continue,
-            else => return error.CommandFailed,
-        }
-    }
-
-    if ((status & 0x7f) == 0) {
-        const code: u8 = @intCast((status >> 8) & 0xff);
-        if (code == 0) return;
-        std.debug.print("command exited with status {d}\n", .{code});
-        return error.CommandFailed;
-    }
-
-    std.debug.print("command terminated by signal {d}\n", .{status & 0x7f});
-    return error.CommandFailed;
 }
 
 fn writeEmbeddedEngine(io: std.Io, mode: Mode, path: []const u8) !void {
@@ -659,7 +650,7 @@ fn releaseSdk(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     defer allocator.free(lib_dir);
 
     // 创建目录 (幂等: createDirPath 会递归创建不存在的路径)
-    std.Io.Dir.cwd().createDirPath(io, lib_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, lib_dir) catch return error.SdkReleaseDirCreateFailed;
 
     // 写 pubspec.yaml
     const pubspec_path = try std.fs.path.join(allocator, &.{ target, "pubspec.yaml" });

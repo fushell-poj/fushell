@@ -135,6 +135,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    build_tool_mod.addImport("build_support", b.createModule(.{
+        .root_source_file = b.path("build_support.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     // fushell-build run: 进程内播放 (player.zig → flutter_runner → c/wayland/EGL)
     build_tool_mod.addImport("c", c_mod);
     build_tool_mod.addImport("wayland", wayland_mod);

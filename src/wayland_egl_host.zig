@@ -270,7 +270,7 @@ pub const Host = struct {
 
     pub fn initEglBootstrap(self: *Host) !void {
         // eglGetDisplay/Initialize 在 DisplayState.init 完成 (共享);
-        // 这里只做每窗口的 config/context 创建。
+        // context 也是共享的 (Mesa 驱动线程按 context 创建, 共享后不随窗口增长)。
         std.debug.assert(self.display_state.egl_display != null);
         if (c.eglBindAPI(c.EGL_OPENGL_ES_API) != c.EGL_TRUE) return eglError("eglBindAPI");
 
@@ -295,9 +295,6 @@ pub const Host = struct {
         self.egl_context = c.eglCreateContext(self.display_state.egl_display, self.egl_config, c.EGL_NO_CONTEXT, &context_attribs);
         if (self.egl_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext");
 
-        self.egl_resource_context = c.eglCreateContext(self.display_state.egl_display, self.egl_config, self.egl_context, &context_attribs);
-        if (self.egl_resource_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext(resource)");
-
         const pbuffer_attribs = [_]c.EGLint{
             c.EGL_WIDTH,  1,
             c.EGL_HEIGHT, 1,
@@ -305,9 +302,6 @@ pub const Host = struct {
         };
         self.egl_bootstrap_surface = c.eglCreatePbufferSurface(self.display_state.egl_display, self.egl_config, &pbuffer_attribs);
         if (self.egl_bootstrap_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(bootstrap)");
-
-        self.egl_resource_surface = c.eglCreatePbufferSurface(self.display_state.egl_display, self.egl_config, &pbuffer_attribs);
-        if (self.egl_resource_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(resource)");
 
         self.display_state.openGlesLibrary();
         try self.makeCurrent();
@@ -372,7 +366,7 @@ pub const Host = struct {
     }
 
     pub fn makeResourceCurrent(self: *Host) !void {
-        if (self.egl_resource_context == null or self.egl_resource_context == c.EGL_NO_CONTEXT) return self.makeCurrent();
+        if (self.egl_resource_context == null or self.egl_resource_context == c.EGL_NO_CONTEXT) return self.makeWindowCurrent();
         if (c.eglMakeCurrent(self.display_state.egl_display, self.egl_resource_surface, self.egl_resource_surface, self.egl_resource_context) != c.EGL_TRUE) {
             return eglError("eglMakeCurrent(resource)");
         }
@@ -555,6 +549,10 @@ pub const Host = struct {
     }
 
     fn emitMetrics(self: *Host) void {
+        // 窗口可能正被自己的线程 shutdown (引擎销毁中): 共享连接的主线程
+        // 仍可能 dispatch 到本窗口的 scale/configure 事件 (fractional_scale_manager
+        // 是全局对象, 绑主 queue)。此时引擎句柄已失效, 再发 metrics 会 UAF。
+        if (self.state == .shutting_down or self.state == .failed) return;
         self.resizeWindow();
         if (self.metrics_callback) |callback| callback(self.metrics_context, self.metrics());
     }
@@ -575,6 +573,8 @@ pub const Host = struct {
     }
 
     fn emitPointer(self: *Host, event: PointerEvent) void {
+        // 同 emitMetrics: 主线程 dispatch 可能触达关闭中的窗口。
+        if (self.state == .shutting_down or self.state == .failed) return;
         if (self.pointer_callback) |callback| callback(self.pointer_context, event);
     }
 
@@ -611,7 +611,7 @@ pub const Host = struct {
         }
         if (output_count == 0 or next_scale == self.scale) return;
         self.scale = next_scale;
-        std.debug.print("Using provisional Wayland scale {d} from {d} advertised output(s) before surface enter.\n", .{ next_scale, output_count });
+        std.debug.print("Using Wayland scale {d} from {d} advertised output(s) before surface enter.\n", .{ next_scale, output_count });
     }
 
     fn recomputeScale(self: *Host) void {

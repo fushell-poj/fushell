@@ -8,6 +8,10 @@
 //! 本模块只实现客户端最小子集: TCP 连接 + HTTP Upgrade 握手 +
 //! text 帧编解码 + JSON-RPC 请求/响应。
 
+/// VM service 响应等待超时 (ms)。VM service 对 JSON-RPC 请求通常毫秒级响应,
+/// 5s 是保守上限 (frontend_server 编译期间 VM 繁忙时也不会超过)。
+const vm_service_poll_timeout_ms: i32 = 5000;
+
 const std = @import("std");
 const net = std.Io.net;
 

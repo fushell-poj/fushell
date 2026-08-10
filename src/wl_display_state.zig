@@ -11,6 +11,11 @@
 //! 每个窗口的 surface 对象绑自己的 queue。连接级 flush 用互斥锁保护。
 
 const std = @import("std");
+
+/// atomic.Mutex (0.16) 无 lock(), 统一用自旋 tryLock 封装。
+fn lockMutex(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
@@ -98,7 +103,10 @@ pub const DisplayState = struct {
             return error.MissingWaylandGlobal;
         }
 
-        // 诊断: roundtrip 后再同步一次 (output bind 的 scale 事件可能稍后到达)
+        // 第二次 roundtrip: bind wl_output 后, compositor 的 geometry/scale 事件
+        // 在后续 roundtrip 中到达 (协议保证: bind 请求之后的同步点必然收到已绑定
+        // 对象的全部当前属性事件)。没有这一步, output.scale 会停在 1, 窗口按
+        // 1x 渲染 → 在 2x 屏幕上模糊。
         if (self.display.?.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
         for (&self.outputs) |*output_state| {
             if (output_state.output != null) {
@@ -212,7 +220,7 @@ pub const DisplayState = struct {
     // ── flush (连接级互斥) ────────────────────────────
 
     pub fn flushLocked(self: *DisplayState) void {
-        while (!self.flush_mutex.tryLock()) std.atomic.spinLoopHint();
+        lockMutex(&self.flush_mutex);
         defer self.flush_mutex.unlock();
         if (self.display) |display| _ = display.flush();
     }

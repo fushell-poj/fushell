@@ -18,7 +18,7 @@ pub fn runPlayer(allocator: std.mem.Allocator, bundle_path: []const u8, enable_v
     try flutter_runner.run(allocator, .{
         .engine_library = engine_library,
         .bundle_path = bundle_path,
-        .is_main_window = true,
+        .role = .primary,
         .enable_vm_service = enable_vm_service,
     });
 }

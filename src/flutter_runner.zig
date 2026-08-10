@@ -7,15 +7,23 @@ const display_state = @import("wl_display_state.zig");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 
+/// 默认帧间隔 (60Hz)。引擎的 vsync 回调携带实际时间戳, 此值仅用于
+/// 无 vsync 驱动的兜底计算; 真实刷新率由 compositor 通过 frame 事件驱动。
 const frame_interval_nanos: u64 = 16_666_667;
+/// 平台线程任务队列上限。引擎任务突发时临时积压, 满时入队方自旋等待
+/// (见 queueFlutterTask), 不会丢任务。1024 足够覆盖单帧引擎任务量。
 const max_pending_flutter_tasks = 1024;
 const flutter_default_font_family = "Roboto";
 
 /// spawn 窗口注册表: 主窗口退出时关闭所有子窗口 (共享 Dart VM)。
-/// 子窗口线程不 detach, 由主线程 join, 保证进程干净退出。
+/// 子窗口线程不 detach: 结束标记 finished, 由复用槽位时 (或主窗口退出时) join
+/// 回收资源, 避免 detach/join 竞态 (join 已 detach 线程是未定义行为)。
+/// 64 = 单个播放器进程的窗口数上限 (槽位数组大小, 实际窗口数远小于此)。
 const max_spawned_windows = 64;
 const SpawnEntry = struct {
     active: bool = false,
+    /// 线程已结束但尚未 join (等待复用槽位时回收)。
+    finished: bool = false,
     thread: std.Thread = undefined,
     host: ?*egl.Host = null,
 };
@@ -28,7 +36,7 @@ var global_display_state: ?*display_state.DisplayState = null;
 var display_state_mutex: std.atomic.Mutex = .unlocked;
 
 fn getDisplayState() !*display_state.DisplayState {
-    while (!display_state_mutex.tryLock()) std.atomic.spinLoopHint();
+    lockDisplayStateMutex();
     defer display_state_mutex.unlock();
     if (global_display_state == null) {
         const state = try std.heap.page_allocator.create(display_state.DisplayState);
@@ -63,9 +71,13 @@ fn findHostBySurface(surface: ?*wl.Surface) ?*egl.Host {
     return null;
 }
 
-/// atomic.Mutex (0.16) 无 lock(), 用自旋 tryLock。
+/// atomic.Mutex (0.16) 无 lock(), 统一用自旋 tryLock 封装。
 fn lockSpawnMutex() void {
     while (!spawn_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn lockDisplayStateMutex() void {
+    while (!display_state_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn unlockSpawnMutex() void {
@@ -81,6 +93,10 @@ fn shutdownSpawnedWindows() void {
         if (entry.active) {
             if (entry.host) |host| host.running = false;
             threads[i] = entry.thread;
+        } else if (entry.finished) {
+            // 已结束未回收的线程: join 立即返回, 回收资源
+            threads[i] = entry.thread;
+            entry.finished = false;
         } else {
             threads[i] = null;
         }
@@ -93,23 +109,32 @@ fn shutdownSpawnedWindows() void {
     std.debug.print("all spawned windows shut down.\n", .{});
 }
 
+pub const Role = enum {
+    /// 主窗口: 创建共享 DisplayState, runEventLoop 结束后关闭所有 spawn 窗口, 销毁 VM。
+    primary,
+    /// spawn 窗口: 共享主窗口的 DisplayState 与 Dart VM, 不负责 VM 生命周期。
+    spawned,
+};
+
 pub const Options = struct {
     engine_library: []const u8,
     bundle_path: []const u8,
-    /// 引擎关闭时是否销毁 Dart VM。多 engine 共享 VM 场景 (多窗口) 必须为 false,
-    /// 由最后一个 engine (或进程退出) 负责 VM 生命周期。
-    shutdown_vm_when_done: bool = true,
+    /// 窗口角色 (primary/spawned), 派生 VM 生命周期与共享状态管理。
+    role: Role = .primary,
     /// 自定义 Dart entrypoint (custom_dart_entrypoint), 空则用 main。
     entrypoint: ?[]const u8 = null,
     /// 传给 entrypoint 的命令行参数 (dart_entrypoint_argv)。
     entrypoint_argv: ?[]const []const u8 = null,
     /// 外部提供的 Host (spawn 窗口): 主线程需要访问它以触发退出。
     external_host: ?*egl.Host = null,
-    /// 主窗口: runEventLoop 结束后先关闭所有 spawn 窗口再销毁 VM。
-    is_main_window: bool = false,
     /// 启动 VM service (热重载用, 仅 debug/JIT 引擎支持):
     /// 传 --enable-vm-service --vm-service-port=0, URI 从引擎日志解析。
     enable_vm_service: bool = false,
+
+    /// VM 生命周期由角色派生: primary 负责销毁, spawned 共享。
+    pub fn shutdownVmWhenDone(self: Options) bool {
+        return self.role == .primary;
+    }
 };
 
 const Bundle = struct {
@@ -182,14 +207,19 @@ const Runner = struct {
     }
 
     fn queueFlutterTask(self: *Runner, task: c.FlutterTask, target_time_nanos: u64) void {
-        self.lockTaskQueue();
-        defer self.task_mutex.unlock();
-        if (self.pending_task_count == self.pending_tasks.len) {
-            std.debug.print("Flutter platform task queue is full; dropping task.\n", .{});
-            return;
+        // 引擎 post_task_callback 契约: 必须接受任务 (void 返回)。
+        // 队列满时不能丢 — 释放锁让消费方 (主事件循环) 有机会出队, 然后重试。
+        while (true) {
+            self.lockTaskQueue();
+            if (self.pending_task_count < self.pending_tasks.len) {
+                self.pending_tasks[self.pending_task_count] = .{ .task = task, .target_time_nanos = target_time_nanos };
+                self.pending_task_count += 1;
+                self.task_mutex.unlock();
+                return;
+            }
+            self.task_mutex.unlock();
+            std.Thread.yield() catch {};
         }
-        self.pending_tasks[self.pending_task_count] = .{ .task = task, .target_time_nanos = target_time_nanos };
-        self.pending_task_count += 1;
     }
 
     fn popDueFlutterTask(self: *Runner) ?c.FlutterTask {
@@ -224,9 +254,7 @@ const Runner = struct {
     }
 
     fn lockTaskQueue(self: *Runner) void {
-        while (!self.task_mutex.tryLock()) {
-            std.atomic.spinLoopHint();
-        }
+        while (!self.task_mutex.tryLock()) std.atomic.spinLoopHint();
     }
 };
 
@@ -253,7 +281,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     defer bundle.deinit(allocator);
     defer if (aot_data != null) {
         flutter.ensureSuccess(api.collect_aot_data(aot_data), "FlutterEngineCollectAOTData") catch |err| {
-            std.debug.print("FlutterEngineCollectAOTData failed: {s}\n", .{@errorName(err)});
+            std.debug.print("[error] FlutterEngineCollectAOTData failed: {s}\n", .{@errorName(err)});
         };
     };
 
@@ -264,8 +292,8 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     // spawn 窗口 acquire 共享。主窗口退出时 shutdownSpawnedWindows 先 join 全部
     // spawn, 再 host.deinit() 使引用归零 → 连接完整清理。
     const state = try getDisplayState();
-    try host.attach(state, options.is_main_window);
-    if (options.is_main_window) {
+    try host.attach(state, options.role == .primary);
+    if (options.role == .primary) {
         main_runner_host = host;
         display_state.setPointerEventCallback(displayPointerRouter, null);
     }
@@ -282,7 +310,9 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     renderer.unnamed_0.open_gl.struct_size = @sizeOf(c.FlutterOpenGLRendererConfig);
     renderer.unnamed_0.open_gl.make_current = makeCurrentCallback;
     renderer.unnamed_0.open_gl.clear_current = clearCurrentCallback;
-    renderer.unnamed_0.open_gl.make_resource_current = makeResourceCurrentCallback;
+    // make_resource_current 设为 null: 引擎不做异步纹理上传 (用主 context 同步上传)。
+    // 共享 resource context 时 io 线程持锁无释放点 (无 present 回调), 会导致 raster 线程死锁。
+    renderer.unnamed_0.open_gl.make_resource_current = null;
     renderer.unnamed_0.open_gl.present = presentCallback;
     renderer.unnamed_0.open_gl.fbo_callback = fboCallback;
     renderer.unnamed_0.open_gl.gl_proc_resolver = glProcResolverCallback;
@@ -305,7 +335,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     project_args.vsync_callback = vsyncCallback;
     project_args.custom_task_runners = &custom_task_runners;
     project_args.platform_message_callback = platformMessageCallback;
-    project_args.shutdown_dart_vm_when_done = options.shutdown_vm_when_done;
+    project_args.shutdown_dart_vm_when_done = options.shutdownVmWhenDone();
     project_args.log_message_callback = logMessageCallback;
     project_args.log_tag = "fushell";
     if (is_aot) project_args.aot_data = aot_data;
@@ -348,7 +378,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
     errdefer if (runner.engine != null) {
         const shutdown_result = api.shutdown(runner.engine);
         if (shutdown_result != c.kSuccess) {
-            std.debug.print("FlutterEngineShutdown after startup error failed: {s}\n", .{flutter.resultName(shutdown_result)});
+            std.debug.print("[error] FlutterEngineShutdown after startup error failed: {s}\n", .{flutter.resultName(shutdown_result)});
         }
     };
 
@@ -357,7 +387,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) !void {
 
     // 主窗口关闭: 先关闭所有子窗口引擎 (它们共享 VM), 再销毁 VM。
     // 否则子引擎仍在使用 VM 时销毁 → 崩溃。
-    if (options.is_main_window) shutdownSpawnedWindows();
+    if (options.role == .primary) shutdownSpawnedWindows();
 
     std.debug.print("Shutting down Flutter engine.\n", .{});
     try flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown");
@@ -444,7 +474,7 @@ fn prepareBundle(allocator: std.mem.Allocator, assets_path: []const u8, icu_data
     const injected_assets_path = prepareFontconfigAssetsOverlay(allocator, assets_path) catch |err| switch (err) {
         error.SystemFontUnavailable, error.FontManifestAlreadyProvidesDefault => null,
         else => fallback: {
-            std.debug.print("System font asset injection failed: {s}; continuing with original bundle assets.\n", .{@errorName(err)});
+            std.debug.print("[error] System font asset injection failed: {s}; continuing with original bundle assets.\n", .{@errorName(err)});
             break :fallback null;
         },
     };
@@ -581,7 +611,15 @@ fn writeInjectedFontManifest(allocator: std.mem.Allocator, original_assets_path:
     const original_manifest_path = try std.fs.path.join(allocator, &.{ original_assets_path, "FontManifest.json" });
     defer allocator.free(original_manifest_path);
 
-    const original_manifest = readFileAllocC(allocator, original_manifest_path) catch null;
+    // 区分"缺失"(无 FontManifest 的旧 bundle, 允许降级) 与"读取失败"(真实错误)。
+    var original_manifest: ?[]u8 = null;
+    if (readFileAllocC(allocator, original_manifest_path)) |manifest| {
+        original_manifest = manifest;
+    } else |err| {
+        if (err != error.FileUnavailable) {
+            std.debug.print("[warn] failed to read original FontManifest.json: {s}\n", .{@errorName(err)});
+        }
+    }
     defer if (original_manifest) |manifest| allocator.free(manifest);
 
     const generated = try buildFontManifest(allocator, original_manifest, family, asset);
@@ -727,8 +765,11 @@ fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics) !void {
 
 fn metricsCallback(context: ?*anyopaque, host_metrics: egl.Metrics) void {
     const runner = fromUserData(context);
+    // 窗口 shutdown 中 (引擎销毁): 主线程 dispatch 的 scale 事件可能触达,
+    // 引擎句柄已失效 → 发送即 UAF。
+    if (runner.engine == null or runner.host.state == .shutting_down) return;
     sendMetrics(runner, host_metrics) catch |err| {
-        std.debug.print("Flutter metrics callback failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Flutter metrics callback failed: {s}\n", .{@errorName(err)});
     };
 }
 
@@ -761,7 +802,7 @@ fn sendPointerEvent(runner: *Runner, host_event: egl.PointerEvent) !void {
 fn pointerCallback(context: ?*anyopaque, host_event: egl.PointerEvent) void {
     const runner = fromUserData(context);
     sendPointerEvent(runner, host_event) catch |err| {
-        std.debug.print("Flutter pointer callback failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Flutter pointer callback failed: {s}\n", .{@errorName(err)});
     };
 }
 
@@ -776,14 +817,14 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
     const payload = if (message.message == null or message.message_size == 0) "" else message.message[0..message.message_size];
 
     if (!std.mem.eql(u8, channel, surface_channel.channel_name)) {
-        std.debug.print("Unsupported Flutter platform channel: {s}\n", .{channel});
+        std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
         sendEmptyPlatformResponse(runner, message.response_handle);
         return;
     }
 
     const request = surface_channel.parseRequest(runner.allocator, payload) catch |err| {
         const code = surface_channel.parseErrorCode(err);
-        std.debug.print("Invalid fushell surface message: {s}\n", .{code});
+        std.debug.print("[error] Invalid fushell surface message: {s}\n", .{code});
         sendSurfaceError(runner, message.response_handle, null, code, "invalid fushell surface request");
         return;
     };
@@ -791,7 +832,7 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
 
     handleSurfaceRequest(runner, request) catch |err| {
         const code = surfaceRequestErrorCode(err);
-        std.debug.print("Fushell surface request failed: {s}\n", .{code});
+        std.debug.print("[error] Fushell surface request failed: {s}\n", .{code});
         sendSurfaceError(runner, message.response_handle, request.id(), code, "fushell surface request failed");
         return;
     };
@@ -837,6 +878,11 @@ fn spawnWindow(runner: *Runner, request: surface_channel.SpawnRequest) !void {
     var slot: ?usize = null;
     for (&spawn_entries, 0..) |*entry, i| {
         if (!entry.active) {
+            // 复用槽位前回收上一个已结束的线程 (join 已结束线程立即返回)
+            if (entry.finished) {
+                entry.thread.join();
+                entry.finished = false;
+            }
             entry.active = true;
             slot = i;
             break;
@@ -844,7 +890,7 @@ fn spawnWindow(runner: *Runner, request: surface_channel.SpawnRequest) !void {
     }
     unlockSpawnMutex();
     const slot_index = slot orelse {
-        std.debug.print("too many spawned windows (max {d})\n", .{max_spawned_windows});
+        std.debug.print("[error] too many spawned windows (max {d})\n", .{max_spawned_windows});
         return error.TooManySpawnedWindows;
     };
 
@@ -871,7 +917,7 @@ fn spawnWindow(runner: *Runner, request: surface_channel.SpawnRequest) !void {
         lockSpawnMutex();
         spawn_entries[slot_index].active = false;
         unlockSpawnMutex();
-        std.debug.print("failed to spawn window thread: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] failed to spawn window thread: {s}\n", .{@errorName(err)});
         return error.WindowSpawnFailed;
     };
     lockSpawnMutex();
@@ -900,6 +946,9 @@ fn spawnThreadMain(context: *SpawnContext) void {
         lockSpawnMutex();
         spawn_entries[context.slot].active = false;
         spawn_entries[context.slot].host = null;
+        // 标记线程已结束: 下次复用该槽位 (或主窗口退出) 时 join 回收资源。
+        // 不能在这里 detach — join 一个已 detach 的线程是未定义行为。
+        spawn_entries[context.slot].finished = true;
         unlockSpawnMutex();
         host.deinit();
         std.heap.page_allocator.free(context.engine_library);
@@ -912,14 +961,14 @@ fn spawnThreadMain(context: *SpawnContext) void {
     run(std.heap.page_allocator, .{
         .engine_library = context.engine_library,
         .bundle_path = context.bundle_path,
-        .shutdown_vm_when_done = false,
+        .role = .spawned,
         // 新窗口用 main 入口 (main 是 AOT tree-shaker 的根, 永远保留);
         // 窗口身份通过 argv[0] 传递, Dart 侧用 PlatformDispatcher.instance.args 区分。
         .entrypoint = null,
         .entrypoint_argv = context.args,
         .external_host = &host,
     }) catch |err| {
-        std.debug.print("spawned window engine failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] spawned window engine failed: {s}\n", .{@errorName(err)});
     };
 }
 
@@ -944,7 +993,7 @@ fn surfaceRequestErrorCode(err: anyerror) []const u8 {
 
 fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: i64) void {
     const response = surface_channel.successResponse(runner.allocator, id) catch |err| {
-        std.debug.print("Failed to encode fushell surface success response: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Failed to encode fushell surface success response: {s}\n", .{@errorName(err)});
         return;
     };
     defer runner.allocator.free(response);
@@ -953,7 +1002,7 @@ fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPlatfor
 
 fn sendSurfaceError(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: ?i64, code: []const u8, message: []const u8) void {
     const response = surface_channel.errorResponse(runner.allocator, id, code, message) catch |err| {
-        std.debug.print("Failed to encode fushell surface error response: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Failed to encode fushell surface error response: {s}\n", .{@errorName(err)});
         return;
     };
     defer runner.allocator.free(response);
@@ -966,24 +1015,24 @@ fn sendPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatf
         return;
     }
     if (runner.engine == null) {
-        std.debug.print("Cannot reply to Flutter platform message before engine handle is available.\n", .{});
+        std.debug.print("[error] Cannot reply to Flutter platform message before engine handle is available.\n", .{});
         return;
     }
     const result = runner.api.send_platform_message_response(runner.engine, response_handle, response.ptr, response.len);
     if (result != c.kSuccess) {
-        std.debug.print("FlutterEngineSendPlatformMessageResponse failed: {s}\n", .{flutter.resultName(result)});
+        std.debug.print("[error] FlutterEngineSendPlatformMessageResponse failed: {s}\n", .{flutter.resultName(result)});
     }
 }
 
 fn sendEmptyPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle) void {
     if (response_handle == null) return;
     if (runner.engine == null) {
-        std.debug.print("Cannot reply to unsupported Flutter platform message before engine handle is available.\n", .{});
+        std.debug.print("[error] Cannot reply to unsupported Flutter platform message before engine handle is available.\n", .{});
         return;
     }
     const result = runner.api.send_platform_message_response(runner.engine, response_handle, null, 0);
     if (result != c.kSuccess) {
-        std.debug.print("FlutterEngineSendPlatformMessageResponse(empty) failed: {s}\n", .{flutter.resultName(result)});
+        std.debug.print("[error] FlutterEngineSendPlatformMessageResponse(empty) failed: {s}\n", .{flutter.resultName(result)});
     }
 }
 
@@ -995,7 +1044,7 @@ fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
         runner.bootstrap_render_logged = true;
     }
     runner.host.makeCurrent() catch |err| {
-        std.debug.print("Flutter make_current callback failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Flutter make_current callback failed: {s}\n", .{@errorName(err)});
         return false;
     };
     if (ready) runner.beginRender();
@@ -1006,20 +1055,7 @@ fn clearCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
     if (!runner.host.isReady()) return true;
     runner.host.clearCurrent() catch |err| {
-        std.debug.print("Flutter clear_current callback failed: {s}\n", .{@errorName(err)});
-        return false;
-    };
-    return true;
-}
-
-fn makeResourceCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
-    const runner = fromUserData(user_data);
-    if (!runner.host.isReady() and !runner.bootstrap_resource_logged) {
-        std.debug.print("Flutter requested resource rendering before FushellSurface.init completed; using EGL bootstrap pbuffer until Dart selects a surface role.\n", .{});
-        runner.bootstrap_resource_logged = true;
-    }
-    runner.host.makeResourceCurrent() catch |err| {
-        std.debug.print("Flutter make_resource_current callback failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Flutter clear_current callback failed: {s}\n", .{@errorName(err)});
         return false;
     };
     return true;
@@ -1029,7 +1065,7 @@ fn presentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
     if (!runner.host.isReady()) {
         if (!runner.bootstrap_present_logged) {
-            std.debug.print("Flutter requested present before FushellSurface.init completed; dropping bootstrap frame until Dart selects a surface role.\n", .{});
+            std.debug.print("[error] Flutter requested present before FushellSurface.init completed; dropping bootstrap frame until Dart selects a surface role.\n", .{});
             runner.bootstrap_present_logged = true;
         }
         return true;
@@ -1041,12 +1077,12 @@ fn presentCallback(user_data: ?*anyopaque) callconv(.c) bool {
         }
         const schedule_result = runner.api.schedule_frame(runner.engine);
         if (schedule_result != c.kSuccess) {
-            std.debug.print("FlutterEngineScheduleFrame after stale resize frame failed: {s}\n", .{flutter.resultName(schedule_result)});
+            std.debug.print("[error] FlutterEngineScheduleFrame after stale resize frame failed: {s}\n", .{flutter.resultName(schedule_result)});
         }
         return true;
     }
     runner.host.swapBuffers() catch |err| {
-        std.debug.print("Flutter present callback failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] Flutter present callback failed: {s}\n", .{@errorName(err)});
         return false;
     };
     if (!runner.first_present_logged) {
@@ -1076,21 +1112,41 @@ fn glProcResolverCallback(user_data: ?*anyopaque, name: [*c]const u8) callconv(.
 fn vsyncCallback(user_data: ?*anyopaque, baton: isize) callconv(.c) void {
     const runner = fromUserData(user_data);
     if (runner.engine == null) {
-        std.debug.print("Flutter vsync requested before engine handle was available; dropping baton {d}.\n", .{baton});
+        std.debug.print("[error] Flutter vsync requested before engine handle was available; dropping baton {d}.\n", .{baton});
         return;
     }
     const frame_start = runner.now();
     const frame_target = frame_start + frame_interval_nanos;
     const result = runner.api.on_vsync(runner.engine, baton, frame_start, frame_target);
     if (result != c.kSuccess) {
-        std.debug.print("FlutterEngineOnVsync failed: {s}\n", .{flutter.resultName(result)});
+        std.debug.print("[error] FlutterEngineOnVsync failed: {s}\n", .{flutter.resultName(result)});
     }
 }
 
 /// 热重载: 从引擎日志解析出的 VM service URI (http://127.0.0.1:PORT/TOKEN/)。
-/// logMessageCallback 写入, hot_reload 模块读取。
-pub var vm_service_uri: [512]u8 = undefined;
-pub var vm_service_uri_len: usize = 0;
+/// logMessageCallback (主线程) 写入, hot_reload 线程读取 — 带锁共享。
+pub const VmServiceState = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    uri: [512]u8 = undefined,
+    len: usize = 0,
+
+    pub fn set(self: *VmServiceState, value: []const u8) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (value.len > self.uri.len) return;
+        @memcpy(self.uri[0..value.len], value);
+        self.len = value.len;
+    }
+
+    pub fn get(self: *VmServiceState, out: []u8) ?[]const u8 {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.len == 0 or self.len > out.len) return null;
+        @memcpy(out[0..self.len], self.uri[0..self.len]);
+        return out[0..self.len];
+    }
+};
+pub var vm_service: VmServiceState = .{};
 
 fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
     const safe_tag = if (tag == null) "flutter" else std.mem.span(tag);
@@ -1098,15 +1154,14 @@ fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, _: ?*anyopaque) 
     std.debug.print("[{s}] {s}\n", .{ safe_tag, safe_message });
 
     // 解析 VM service 地址: "The Dart VM service is listening on http://..."
-    if (vm_service_uri_len == 0) {
+    {
         const prefix = "The Dart VM service is listening on ";
         if (std.mem.indexOf(u8, safe_message, prefix)) |idx| {
             const rest = safe_message[idx + prefix.len ..];
             const end = std.mem.indexOfAny(u8, rest, " \t\r\n") orelse rest.len;
-            if (end > 0 and end <= vm_service_uri.len) {
-                @memcpy(vm_service_uri[0..end], rest[0..end]);
-                vm_service_uri_len = end;
-                std.debug.print("[fushell] VM service URI: {s}\n", .{vm_service_uri[0..end]});
+            if (end > 0) {
+                vm_service.set(rest[0..end]);
+                std.debug.print("[fushell] VM service URI: {s}\n", .{rest[0..end]});
             }
         }
     }
