@@ -21,12 +21,12 @@ pub const Request = union(enum) {
         };
     }
 
-    pub fn deinit(self: Request, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: Request, gpa: std.mem.Allocator) void {
         switch (self) {
-            .init => |request| request.deinit(allocator),
+            .init => |request| request.deinit(gpa),
             .update_layer => {},
-            .update_window => |request| request.deinit(allocator),
-            .spawn_window => |request| request.deinit(allocator),
+            .update_window => |request| request.deinit(gpa),
+            .spawn_window => |request| request.deinit(gpa),
         }
     }
 };
@@ -35,14 +35,14 @@ pub const InitRequest = struct {
     id: i64,
     role: Role,
 
-    pub fn deinit(self: InitRequest, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: InitRequest, gpa: std.mem.Allocator) void {
         switch (self.role) {
             .window => |window| {
-                allocator.free(window.title);
-                allocator.free(window.app_id);
+                gpa.free(window.title);
+                gpa.free(window.app_id);
             },
             .layer => |layer| {
-                allocator.free(layer.namespace);
+                gpa.free(layer.namespace);
             },
         }
     }
@@ -57,9 +57,9 @@ pub const WindowSurfaceUpdateRequest = struct {
     id: i64,
     update: WindowSurfaceUpdate,
 
-    pub fn deinit(self: WindowSurfaceUpdateRequest, allocator: std.mem.Allocator) void {
-        if (self.update.title) |title| allocator.free(title);
-        if (self.update.app_id) |app_id| allocator.free(app_id);
+    pub fn deinit(self: WindowSurfaceUpdateRequest, gpa: std.mem.Allocator) void {
+        if (self.update.title) |title| gpa.free(title);
+        if (self.update.app_id) |app_id| gpa.free(app_id);
     }
 };
 
@@ -162,8 +162,8 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-pub fn parseRequest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Request {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return error.InvalidSurfaceInitPayload;
+pub fn parseRequest(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Request {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return error.InvalidSurfaceInitPayload;
     defer parsed.deinit();
 
     const root = object(parsed.value) orelse return error.InvalidSurfaceInitPayload;
@@ -173,7 +173,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!
     if (std.mem.eql(u8, method, init_method)) {
         const role_value = root.get("role") orelse return error.MissingRequiredSurfaceField;
         const role_object = object(role_value) orelse return error.InvalidSurfaceField;
-        return .{ .init = .{ .id = id, .role = try parseRole(allocator, role_object) } };
+        return .{ .init = .{ .id = id, .role = try parseRole(gpa, role_object) } };
     }
 
     if (std.mem.eql(u8, method, update_layer_method)) {
@@ -185,7 +185,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!
     if (std.mem.eql(u8, method, update_window_method)) {
         const update_value = root.get("update") orelse return error.MissingRequiredSurfaceField;
         const update_object = object(update_value) orelse return error.InvalidSurfaceField;
-        return .{ .update_window = .{ .id = id, .update = try parseWindowSurfaceUpdate(allocator, update_object) } };
+        return .{ .update_window = .{ .id = id, .update = try parseWindowSurfaceUpdate(gpa, update_object) } };
     }
 
     if (std.mem.eql(u8, method, spawn_window_method)) {
@@ -195,17 +195,17 @@ pub fn parseRequest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!
             else => return error.InvalidSurfaceField,
         };
 
-        var args: [][]const u8 = try allocator.alloc([]const u8, 0);
-        errdefer allocator.free(args);
+        var args: [][]const u8 = try gpa.alloc([]const u8, 0);
+        errdefer gpa.free(args);
         if (root.get("args")) |args_value| {
             const array = switch (args_value) {
                 .array => |array| array,
                 else => return error.InvalidSurfaceField,
             };
-            args = try allocator.alloc([]const u8, array.items.len);
+            args = try gpa.alloc([]const u8, array.items.len);
             for (array.items, 0..) |item, i| {
                 args[i] = switch (item) {
-                    .string => |string| try allocator.dupe(u8, string),
+                    .string => |string| try gpa.dupe(u8, string),
                     else => return error.InvalidSurfaceField,
                 };
             }
@@ -213,7 +213,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!
 
         return .{ .spawn_window = .{
             .id = id,
-            .entrypoint = try allocator.dupe(u8, entrypoint),
+            .entrypoint = try gpa.dupe(u8, entrypoint),
             .args = args,
         } };
     }
@@ -227,30 +227,30 @@ pub const SpawnRequest = struct {
     entrypoint: []u8,
     args: [][]const u8,
 
-    pub fn deinit(self: SpawnRequest, allocator: std.mem.Allocator) void {
-        allocator.free(self.entrypoint);
-        for (self.args) |arg| allocator.free(arg);
-        allocator.free(self.args);
+    pub fn deinit(self: SpawnRequest, gpa: std.mem.Allocator) void {
+        gpa.free(self.entrypoint);
+        for (self.args) |arg| gpa.free(arg);
+        gpa.free(self.args);
     }
 };
 
-pub fn parseInitRequest(allocator: std.mem.Allocator, bytes: []const u8) ParseError!InitRequest {
-    const request = try parseRequest(allocator, bytes);
+pub fn parseInitRequest(gpa: std.mem.Allocator, bytes: []const u8) ParseError!InitRequest {
+    const request = try parseRequest(gpa, bytes);
     return switch (request) {
         .init => |init_request| init_request,
         .update_layer, .update_window => error.UnsupportedSurfaceMethod,
     };
 }
 
-pub fn successResponse(allocator: std.mem.Allocator, id: i64) ![]u8 {
-    return try std.fmt.allocPrint(allocator, "{{\"id\":{d},\"ok\":true}}", .{id});
+pub fn successResponse(gpa: std.mem.Allocator, id: i64) ![]u8 {
+    return try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"ok\":true}}", .{id});
 }
 
-pub fn errorResponse(allocator: std.mem.Allocator, id: ?i64, code: []const u8, message: []const u8) ![]u8 {
+pub fn errorResponse(gpa: std.mem.Allocator, id: ?i64, code: []const u8, message: []const u8) ![]u8 {
     if (id) |request_id| {
-        return try std.fmt.allocPrint(allocator, "{{\"id\":{d},\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}", .{ request_id, code, message });
+        return try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}", .{ request_id, code, message });
     }
-    return try std.fmt.allocPrint(allocator, "{{\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}", .{ code, message });
+    return try std.fmt.allocPrint(gpa, "{{\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}", .{ code, message });
 }
 
 pub fn parseErrorCode(err: ParseError) []const u8 {
@@ -264,31 +264,31 @@ pub fn parseErrorCode(err: ParseError) []const u8 {
     };
 }
 
-fn parseRole(allocator: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!Role {
+fn parseRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!Role {
     const kind = requiredString(role_object, "kind") catch return error.MissingRequiredSurfaceField;
     if (std.mem.eql(u8, kind, "window")) {
-        return .{ .window = try parseWindowRole(allocator, role_object) };
+        return .{ .window = try parseWindowRole(gpa, role_object) };
     }
     if (std.mem.eql(u8, kind, "layer")) {
-        return .{ .layer = try parseLayerRole(allocator, role_object) };
+        return .{ .layer = try parseLayerRole(gpa, role_object) };
     }
     return error.UnsupportedSurfaceRole;
 }
 
-fn parseWindowRole(allocator: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!WindowRole {
+fn parseWindowRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!WindowRole {
     return .{
-        .title = try duplicateRequiredString(allocator, role_object, "title"),
-        .app_id = try duplicateRequiredString(allocator, role_object, "appId"),
+        .title = try duplicateRequiredString(gpa, role_object, "title"),
+        .app_id = try duplicateRequiredString(gpa, role_object, "appId"),
         .width = optionalPositiveI32(role_object, "width") catch return error.InvalidSurfaceField,
         .height = optionalPositiveI32(role_object, "height") catch return error.InvalidSurfaceField,
     };
 }
 
-fn parseLayerRole(allocator: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!LayerRole {
+fn parseLayerRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!LayerRole {
     const exclusive_zone = (optionalI32(role_object, "exclusiveZone") catch return error.InvalidSurfaceField) orelse -1;
     const keyboard = (optionalString(role_object, "keyboardInteractivity") catch return error.InvalidSurfaceField) orelse "none";
     return .{
-        .namespace = try duplicateRequiredString(allocator, role_object, "namespace"),
+        .namespace = try duplicateRequiredString(gpa, role_object, "namespace"),
         .layer = parseLayer(requiredString(role_object, "layer") catch return error.MissingRequiredSurfaceField) catch return error.InvalidSurfaceField,
         .anchors = parseAnchors(role_object.get("anchors") orelse return error.MissingRequiredSurfaceField) catch return error.InvalidSurfaceField,
         .margins = (parseMargins(role_object.get("margins")) catch return error.InvalidSurfaceField) orelse .{},
@@ -314,10 +314,10 @@ fn parseLayerSurfaceUpdate(update_object: std.json.ObjectMap) ParseError!LayerSu
     };
 }
 
-fn parseWindowSurfaceUpdate(allocator: std.mem.Allocator, update_object: std.json.ObjectMap) ParseError!WindowSurfaceUpdate {
+fn parseWindowSurfaceUpdate(gpa: std.mem.Allocator, update_object: std.json.ObjectMap) ParseError!WindowSurfaceUpdate {
     return .{
-        .title = try duplicateOptionalString(allocator, update_object, "title"),
-        .app_id = try duplicateOptionalString(allocator, update_object, "appId"),
+        .title = try duplicateOptionalString(gpa, update_object, "title"),
+        .app_id = try duplicateOptionalString(gpa, update_object, "appId"),
     };
 }
 
@@ -369,13 +369,13 @@ fn parseMargins(value: ?std.json.Value) !?Margins {
     };
 }
 
-fn duplicateRequiredString(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ParseError![]u8 {
-    return try allocator.dupe(u8, requiredString(obj, key) catch return error.MissingRequiredSurfaceField);
+fn duplicateRequiredString(gpa: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ParseError![]u8 {
+    return try gpa.dupe(u8, requiredString(obj, key) catch return error.MissingRequiredSurfaceField);
 }
 
-fn duplicateOptionalString(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ParseError!?[]u8 {
+fn duplicateOptionalString(gpa: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ParseError!?[]u8 {
     const value = optionalString(obj, key) catch return error.InvalidSurfaceField;
-    return if (value) |string| try allocator.dupe(u8, string) else null;
+    return if (value) |string| try gpa.dupe(u8, string) else null;
 }
 
 fn requiredString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
@@ -438,8 +438,8 @@ test "parse window init request" {
     const json =
         \\{"id":1,"method":"surface.init","role":{"kind":"window","title":"Smoke","appId":"dev.fushell.smoke","width":800,"height":600}}
     ;
-    const request = try parseInitRequest(std.testing.allocator, json);
-    defer request.deinit(std.testing.allocator);
+    const request = try parseInitRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
     try std.testing.expectEqual(@as(i64, 1), request.id);
     try std.testing.expectEqualStrings("Smoke", request.role.window.title);
     try std.testing.expectEqual(@as(?i32, 800), request.role.window.width);
@@ -449,8 +449,8 @@ test "parse layer init request" {
     const json =
         \\{"id":2,"method":"surface.init","role":{"kind":"layer","namespace":"panel","layer":"top","anchors":["top","left","right"],"margins":{"top":1,"right":2,"bottom":3,"left":4},"exclusiveZone":32,"keyboardInteractivity":"onDemand"}}
     ;
-    const request = try parseInitRequest(std.testing.allocator, json);
-    defer request.deinit(std.testing.allocator);
+    const request = try parseInitRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
     try std.testing.expectEqual(@as(i64, 2), request.id);
     try std.testing.expectEqual(.top, request.role.layer.layer);
     try std.testing.expect(request.role.layer.anchors.top);
@@ -463,8 +463,8 @@ test "parse layer init request allows compositor-sized zero width" {
     const json =
         \\{"id":3,"method":"surface.init","role":{"kind":"layer","namespace":"bar","layer":"top","anchors":["top","left","right"],"width":0,"height":36}}
     ;
-    const request = try parseInitRequest(std.testing.allocator, json);
-    defer request.deinit(std.testing.allocator);
+    const request = try parseInitRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
     try std.testing.expectEqual(@as(?i32, 0), request.role.layer.width);
     try std.testing.expectEqual(@as(?i32, 36), request.role.layer.height);
 }
@@ -473,8 +473,8 @@ test "parse layer update request" {
     const json =
         \\{"id":4,"method":"surface.updateLayer","update":{"width":0,"height":32,"anchors":["top","left","right"],"margins":{"top":0,"right":1,"bottom":2,"left":3},"exclusiveZone":32,"keyboardInteractivity":"none"}}
     ;
-    const request = try parseRequest(std.testing.allocator, json);
-    defer request.deinit(std.testing.allocator);
+    const request = try parseRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
     try std.testing.expectEqual(@as(i64, 4), request.id());
     try std.testing.expectEqual(@as(?i32, 0), request.update_layer.update.width);
     try std.testing.expectEqual(@as(?i32, 32), request.update_layer.update.height);
@@ -487,8 +487,8 @@ test "parse window update request" {
     const json =
         \\{"id":5,"method":"surface.updateWindow","update":{"title":"New title","appId":"dev.fushell.new"}}
     ;
-    const request = try parseRequest(std.testing.allocator, json);
-    defer request.deinit(std.testing.allocator);
+    const request = try parseRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
     try std.testing.expectEqual(@as(i64, 5), request.id());
     try std.testing.expectEqualStrings("New title", request.update_window.update.title.?);
     try std.testing.expectEqualStrings("dev.fushell.new", request.update_window.update.app_id.?);
@@ -498,15 +498,15 @@ test "parse empty update requests" {
     const layer_json =
         \\{"id":6,"method":"surface.updateLayer","update":{}}
     ;
-    const layer_request = try parseRequest(std.testing.allocator, layer_json);
-    defer layer_request.deinit(std.testing.allocator);
+    const layer_request = try parseRequest(std.testing.gpa, layer_json);
+    defer layer_request.deinit(std.testing.gpa);
     try std.testing.expect(layer_request.update_layer.update.isEmpty());
 
     const window_json =
         \\{"id":7,"method":"surface.updateWindow","update":{}}
     ;
-    const window_request = try parseRequest(std.testing.allocator, window_json);
-    defer window_request.deinit(std.testing.allocator);
+    const window_request = try parseRequest(std.testing.gpa, window_json);
+    defer window_request.deinit(std.testing.gpa);
     try std.testing.expect(window_request.update_window.update.isEmpty());
 }
 
@@ -514,27 +514,27 @@ test "reject invalid update values" {
     const negative_size =
         \\{"id":8,"method":"surface.updateLayer","update":{"height":-1}}
     ;
-    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, negative_size));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.gpa, negative_size));
 
     const empty_anchors =
         \\{"id":9,"method":"surface.updateLayer","update":{"anchors":[]}}
     ;
-    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, empty_anchors));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.gpa, empty_anchors));
 }
 
 test "reject unsupported method" {
     const json =
         \\{"id":10,"method":"surface.nope","update":{}}
     ;
-    try std.testing.expectError(error.UnsupportedSurfaceMethod, parseRequest(std.testing.allocator, json));
+    try std.testing.expectError(error.UnsupportedSurfaceMethod, parseRequest(std.testing.gpa, json));
 }
 
 test "encode responses" {
-    const ok = try successResponse(std.testing.allocator, 7);
-    defer std.testing.allocator.free(ok);
+    const ok = try successResponse(std.testing.gpa, 7);
+    defer std.testing.gpa.free(ok);
     try std.testing.expectEqualStrings("{\"id\":7,\"ok\":true}", ok);
 
-    const err = try errorResponse(std.testing.allocator, null, "Bad", "bad request");
-    defer std.testing.allocator.free(err);
+    const err = try errorResponse(std.testing.gpa, null, "Bad", "bad request");
+    defer std.testing.gpa.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "\"ok\":false") != null);
 }

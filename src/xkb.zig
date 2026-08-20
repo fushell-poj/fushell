@@ -75,12 +75,12 @@ pub const Xkb = struct {
     alt: bool = false,
     super_: bool = false,
 
-    pub fn init(keymap_str: []const u8) !Xkb {
+    pub fn init(gpa: std.mem.Allocator, keymap_str: []const u8) !Xkb {
         var self = Xkb{};
         self.context = xkb_context_new(CONTEXT_NO_FLAGS) orelse return error.XkbContextFailed;
         errdefer xkb_context_unref(self.context);
-        const str_z = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}", .{keymap_str}, 0);
-        defer std.heap.page_allocator.free(str_z);
+        const str_z = try std.fmt.allocPrintSentinel(gpa, "{s}", .{keymap_str}, 0);
+        defer gpa.free(str_z);
         self.keymap = xkb_keymap_new_from_string(self.context, str_z, KEYMAP_FORMAT_TEXT_V1, KEYMAP_COMPILE_NO_FLAGS) orelse
             return error.XkbKeymapFailed;
         errdefer xkb_keymap_unref(self.keymap);

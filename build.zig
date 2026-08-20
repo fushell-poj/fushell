@@ -10,12 +10,9 @@ pub fn build(b: *std.Build) void {
 
     // Flutter 引擎工作区 (pull-flutter / build-engine 共享), 无默认值, 必须指定:
     //   ① -Dflutter-workspace=X  ② FLUTTER_ENGINE_DIR  ③ ./flutter_engine_dir
-    var threaded = build_support.makeIo(std.heap.page_allocator) catch {
-        std.debug.print("error: failed to initialize build environment.\n", .{});
-        std.process.exit(1);
-    };
-    const io = threaded.io();
-    const flutter_workspace = build_support.resolveWorkspaceConfig(io, std.heap.page_allocator, b.option([]const u8, "flutter-workspace", "Flutter engine workspace path (or FLUTTER_ENGINE_DIR, or ./flutter_engine_dir)")) catch |err| {
+    // zig 0.16: b.graph.io 自带完整环境, spawn 可解析 PATH (gclient/gn/ninja)。
+    const io = b.graph.io;
+    const flutter_workspace = build_support.resolveWorkspaceConfig(io, b.allocator, b.option([]const u8, "flutter-workspace", "Flutter engine workspace path (or FLUTTER_ENGINE_DIR, or ./flutter_engine_dir)")) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

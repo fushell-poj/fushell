@@ -2,8 +2,8 @@ const std = @import("std");
 const player = @import("player.zig");
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(allocator);
+    const gpa = init.gpa;
+    const args = try init.minimal.args.toSlice(gpa);
 
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
         printUsage();
@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    player.runPlayer(allocator, bundle_root, false) catch |err| {
+    player.runPlayer(gpa, bundle_root, false) catch |err| {
         std.debug.print("fushell-runner failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };

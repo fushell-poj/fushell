@@ -31,9 +31,9 @@ pub const Api = struct {
     const CreateAotDataFn = *const fn (*const c.FlutterEngineAOTDataSource, *c.FlutterEngineAOTData) callconv(.c) c.FlutterEngineResult;
     const CollectAotDataFn = *const fn (c.FlutterEngineAOTData) callconv(.c) c.FlutterEngineResult;
 
-    pub fn load(allocator: std.mem.Allocator, library_path: []const u8) !Api {
-        const path_z = try allocator.dupeZ(u8, library_path);
-        defer allocator.free(path_z);
+    pub fn load(gpa: std.mem.Allocator, library_path: []const u8) !Api {
+        const path_z = try gpa.dupeZ(u8, library_path);
+        defer gpa.free(path_z);
 
         _ = std.c.dlerror();
         const handle = std.c.dlopen(path_z.ptr, .{ .LAZY = true }) orelse {

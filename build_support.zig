@@ -1,8 +1,5 @@
 //! build.zig 各 step (pull-flutter / build-engine) 的公共运行时辅助:
 //! 子进程执行、环境构造、路径解析、幂等文件写入。
-//!
-//! 环境注意 (实测): zig 0.16 全局单例 io 的 environ 为空, spawn 无法解析
-//! PATH (报 OutOfMemory); 从 /proc/self/environ 构造完整环境 (纯 zig)。
 
 const std = @import("std");
 
@@ -86,38 +83,6 @@ fn dirExists(io: std.Io, path: []const u8) bool {
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
     dir.close(io);
     return true;
-}
-
-/// 构造带全局环境的 io (spawn 解析 argv[0] 需要 environ)。
-pub fn makeIo(allocator: std.mem.Allocator) !std.Io.Threaded {
-    const environ_block = try readProcEnviron(allocator);
-    return std.Io.Threaded.init(allocator, .{
-        .environ = .{ .block = environ_block },
-    });
-}
-
-/// 从 /proc/self/environ 构造 POSIX 环境块 (null 结尾的 KEY=VALUE 指针数组)。
-/// 返回的 block 引用分配的内存, 生命周期由调用方 (make 的 arena) 保证。
-pub fn readProcEnviron(allocator: std.mem.Allocator) !std.process.Environ.PosixBlock {
-    var file = try std.Io.Dir.openFileAbsolute(
-        std.Io.Threaded.global_single_threaded.io(),
-        "/proc/self/environ",
-        .{},
-    );
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    var buf: [65536]u8 = undefined;
-    const n = try file.readPositional(std.Io.Threaded.global_single_threaded.io(), &.{&buf}, 0);
-
-    var entries = std.array_list.Managed([:0]u8).init(allocator);
-    defer entries.deinit();
-    var it = std.mem.splitScalar(u8, buf[0..n], 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        try entries.append(try allocator.dupeZ(u8, entry));
-    }
-    const ptrs = try allocator.allocSentinel(?[*:0]const u8, entries.items.len, null);
-    for (entries.items, 0..) |e, i| ptrs[i] = e.ptr;
-    return .{ .slice = ptrs };
 }
 
 /// 解析绝对路径 (相对路径基于当前目录)。

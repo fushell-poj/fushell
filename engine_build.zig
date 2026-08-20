@@ -51,9 +51,8 @@ pub const BuildEngine = struct {
     fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
         const self: *BuildEngine = @fieldParentPtr("step", step);
         const allocator = options.gpa;
-
-        var threaded = try support.makeIo(allocator);
-        const io = threaded.io();
+        // zig 0.16: step.owner.graph.io 自带完整环境, spawn 可解析 PATH (gclient/gn/ninja)。
+        const io = step.owner.graph.io;
 
         const workspace = try support.resolveWorkspace(io, allocator, self.workspace);
         std.debug.print("{s} workspace: {s}\n", .{ prefix, workspace });
@@ -222,7 +221,7 @@ fn headAligned(io: std.Io, allocator: std.mem.Allocator, workspace: []const u8) 
     const head_path = std.fs.path.join(allocator, &.{ workspace, ".git/HEAD" }) catch return false;
     defer allocator.free(head_path);
     const content = support.readSmallFile(io, head_path) orelse return false;
-    defer std.heap.page_allocator.free(content);
+    defer std.heap.page_allocator.free(content); // readSmallFile 内部用 page_allocator 分配
     const trimmed = std.mem.trim(u8, content, " \n\r");
     return std.mem.eql(u8, trimmed, support.engine_commit);
 }

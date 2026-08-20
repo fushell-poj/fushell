@@ -16,7 +16,7 @@ const zwlr = wayland.client.zwlr;
 const display_state = @import("wl_display_state.zig");
 
 pub const DataControl = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     display: *display_state.DisplayState,
     manager: ?*zwlr.DataControlManagerV1 = null,
     device: ?*zwlr.DataControlDeviceV1 = null,
@@ -35,16 +35,16 @@ pub const DataControl = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    pub fn init(allocator: std.mem.Allocator, display: *display_state.DisplayState) DataControl {
-        return .{ .allocator = allocator, .display = display };
+    pub fn init(gpa: std.mem.Allocator, display: *display_state.DisplayState) DataControl {
+        return .{ .gpa = gpa, .display = display };
     }
 
     pub fn deinit(self: *DataControl) void {
         self.lock();
         defer self.mutex.unlock();
-        for (self.offer_mimes.items) |m| self.allocator.free(m);
-        self.offer_mimes.deinit(self.allocator);
-        self.published_text.deinit(self.allocator);
+        for (self.offer_mimes.items) |m| self.gpa.free(m);
+        self.offer_mimes.deinit(self.gpa);
+        self.published_text.deinit(self.gpa);
         self.manager = null;
         self.device = null;
         self.source = null;
@@ -95,7 +95,7 @@ pub const DataControl = struct {
         self.lock();
         defer self.mutex.unlock();
         self.published_text.clearRetainingCapacity();
-        self.published_text.appendSlice(self.allocator, text) catch return;
+        self.published_text.appendSlice(self.gpa, text) catch return;
 
         if (self.manager == null or self.device == null) return; // 无 data-control → 仅内存
         // 销毁旧 source (若有)
@@ -112,7 +112,7 @@ pub const DataControl = struct {
 
     /// 请求系统剪贴板文本。返回 null = 无内容或失败。
     /// 调用方负责 free 返回值。
-    pub fn requestText(self: *DataControl, out_allocator: std.mem.Allocator) ?[]const u8 {
+    pub fn requestText(self: *DataControl, gpa: std.mem.Allocator) ?[]const u8 {
         // 阶段 1: 锁内检查 + 发起 receive。锁在阶段 2 前必须释放 —
         // 否则等待循环里 dispatch 的 source.send 事件 (sourceListener)
         // 会自旋等同一把锁 → 死锁 (应用内复制→粘贴必现)。
@@ -189,7 +189,7 @@ pub const DataControl = struct {
         }
         thread.join();
         if (ctx.n == 0) return null;
-        return out_allocator.dupe(u8, ctx.buf[0..ctx.n]) catch null;
+        return gpa.dupe(u8, ctx.buf[0..ctx.n]) catch null;
     }
 
     fn sourceListener(source: *zwlr.DataControlSourceV1, event: zwlr.DataControlSourceV1.Event, data: *DataControl) void {
@@ -231,7 +231,7 @@ pub const DataControl = struct {
                 doffer.id.setListener(*DataControl, offerListener, data);
                 // 新 offer 开始: 旧 offer 的 mime 作废。
                 data.lock();
-                for (data.offer_mimes.items) |m| data.allocator.free(m);
+                for (data.offer_mimes.items) |m| data.gpa.free(m);
                 data.offer_mimes.clearRetainingCapacity();
                 data.mutex.unlock();
             },
@@ -267,9 +267,9 @@ pub const DataControl = struct {
                 // 注意: mime 事件先于 selection 到达 (compositor 顺序),
                 // 此时 data.offer 尚未设置 — 不能做 offer 匹配检查。
                 const mime_z: [*:0]const u8 = offer_ev.mime_type;
-                const copy = data.allocator.dupe(u8, std.mem.span(mime_z)) catch return;
-                data.offer_mimes.append(data.allocator, copy) catch {
-                    data.allocator.free(copy);
+                const copy = data.gpa.dupe(u8, std.mem.span(mime_z)) catch return;
+                data.offer_mimes.append(data.gpa, copy) catch {
+                    data.gpa.free(copy);
                 };
             },
         }

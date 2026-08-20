@@ -22,7 +22,7 @@ pub const EditingState = struct {
 pub const SendFn = *const fn (client_id: i64, msg: []const u8) void;
 
 pub const Client = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     client_id: i64 = -1,
     send_fn: ?SendFn = null,
     active: bool = false,
@@ -43,13 +43,13 @@ pub const Client = struct {
     caret_rect_x: f64 = 0,
     caret_rect_y: f64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator) Client {
-        return .{ .allocator = allocator };
+    pub fn init(gpa: std.mem.Allocator) Client {
+        return .{ .gpa = gpa };
     }
 
     pub fn deinit(self: *Client) void {
-        self.state.text.deinit(self.allocator);
-        self.* = .{ .allocator = self.allocator };
+        self.state.text.deinit(self.gpa);
+        self.* = .{ .gpa = self.gpa };
     }
 
     fn sendUpdate(self: *Client) void {
@@ -75,7 +75,7 @@ pub const Client = struct {
     /// 应用引擎发来的 setEditingState (程序化赋值 / 初始状态)。
     pub fn applyEditingState(self: *Client, text: []const u8, base: i64, extent: i64) !void {
         self.state.text.clearRetainingCapacity();
-        try self.state.text.appendSlice(self.allocator, text);
+        try self.state.text.appendSlice(self.gpa, text);
         // Flutter 的 selection 是 UTF-16 code unit, 转成字节偏移存储。
         self.state.selection_base = utf16ToByte(self.state.text.items, base);
         self.state.selection_extent = utf16ToByte(self.state.text.items, extent);
@@ -127,7 +127,7 @@ pub const Client = struct {
         _ = try self.removeComposingRegion();
         if (text) |t| {
             const base: usize = @min(@as(usize, @intCast(@max(self.state.selection_base, 0))), self.state.text.items.len);
-            try self.state.text.replaceRange(self.allocator, base, 0, t);
+            try self.state.text.replaceRange(self.gpa, base, 0, t);
             const end: i64 = @intCast(base + t.len);
             self.state.selection_base = end;
             self.state.selection_extent = end;
@@ -156,7 +156,7 @@ pub const Client = struct {
             self.state.composing_end = -1;
             return 0;
         }
-        try self.state.text.replaceRange(self.allocator, cs, ce - cs, "");
+        try self.state.text.replaceRange(self.gpa, cs, ce - cs, "");
         self.state.composing_start = -1;
         self.state.composing_end = -1;
         // selection 在组合区之后 → 前移; 在组合区内 → 移到起点。
@@ -175,7 +175,7 @@ pub const Client = struct {
         const pos: usize = @intCast(@max(self.state.selection_base, 0));
         const start = pos -| @as(usize, before);
         const end = @min(pos + @as(usize, after), self.state.text.items.len);
-        try self.state.text.replaceRange(self.allocator, start, end - start, "");
+        try self.state.text.replaceRange(self.gpa, start, end - start, "");
         const s: i64 = @intCast(start);
         self.state.selection_base = s;
         self.state.selection_extent = s;
@@ -188,7 +188,7 @@ pub const Client = struct {
         // selectionRange() 已 clamp 到 [0, len] — 防止 applyEditingState
         // 的 UTF-16 转换在竞态下产生越界偏移。
         const sel = self.selectionRange();
-        try self.state.text.replaceRange(self.allocator, sel.start, sel.end - sel.start, bytes);
+        try self.state.text.replaceRange(self.gpa, sel.start, sel.end - sel.start, bytes);
         const pos: i64 = @intCast(sel.start + bytes.len);
         self.state.selection_base = pos;
         self.state.selection_extent = pos;
@@ -199,7 +199,7 @@ pub const Client = struct {
     pub fn backspace(self: *Client) !void {
         const sel = self.selectionRange();
         if (sel.start != sel.end) {
-            try self.state.text.replaceRange(self.allocator, sel.start, sel.end - sel.start, "");
+            try self.state.text.replaceRange(self.gpa, sel.start, sel.end - sel.start, "");
             const pos: i64 = @intCast(sel.start);
             self.state.selection_base = pos;
             self.state.selection_extent = pos;
@@ -214,7 +214,7 @@ pub const Client = struct {
             i -= 1;
             if ((self.state.text.items[i] & 0xC0) != 0x80) break;
         }
-        try self.state.text.replaceRange(self.allocator, i, sel.start - i, "");
+        try self.state.text.replaceRange(self.gpa, i, sel.start - i, "");
         const pos: i64 = @intCast(i);
         self.state.selection_base = pos;
         self.state.selection_extent = pos;
@@ -224,7 +224,7 @@ pub const Client = struct {
     pub fn deleteForward(self: *Client) !void {
         const sel = self.selectionRange();
         if (sel.start != sel.end) {
-            try self.state.text.replaceRange(self.allocator, sel.start, sel.end - sel.start, "");
+            try self.state.text.replaceRange(self.gpa, sel.start, sel.end - sel.start, "");
             const pos: i64 = @intCast(sel.start);
             self.state.selection_base = pos;
             self.state.selection_extent = pos;
@@ -233,7 +233,7 @@ pub const Client = struct {
         if (sel.end >= self.state.text.items.len) return;
         var i = sel.end + 1;
         while (i < self.state.text.items.len and (self.state.text.items[i] & 0xC0) == 0x80) : (i += 1) {}
-        try self.state.text.replaceRange(self.allocator, sel.end, i - sel.end, "");
+        try self.state.text.replaceRange(self.gpa, sel.end, i - sel.end, "");
         const pos: i64 = @intCast(sel.end);
         self.state.selection_base = pos;
         self.state.selection_extent = pos;
@@ -299,20 +299,20 @@ pub const Client = struct {
 };
 
 /// JSON 中字符串转义 (updateEditingState 里 text 可能含引号/反斜杠/换行)。
-pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+pub fn jsonEscape(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer out.deinit(gpa);
     for (input) |ch| {
         switch (ch) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
             0...0x1F => {
                 var hexbuf: [8]u8 = undefined;
                 const hex = try std.fmt.bufPrint(&hexbuf, "\\u{x:0>4}", .{ch});
-                try out.appendSlice(allocator, hex);
+                try out.appendSlice(gpa, hex);
             },
-            else => try out.append(allocator, ch),
+            else => try out.append(gpa, ch),
         }
     }
-    return out.toOwnedSlice(allocator);
+    return out.toOwnedSlice(gpa);
 }

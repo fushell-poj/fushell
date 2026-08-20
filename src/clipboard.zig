@@ -11,22 +11,22 @@
 const std = @import("std");
 
 pub const Clipboard = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     /// 进程内剪贴板副本 (data-control 可用时同步系统, 不可用时兜底)。
     text: std.ArrayListUnmanaged(u8) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) Clipboard {
-        return .{ .allocator = allocator };
+    pub fn init(gpa: std.mem.Allocator) Clipboard {
+        return .{ .gpa = gpa };
     }
 
     pub fn deinit(self: *Clipboard) void {
-        self.text.deinit(self.allocator);
-        self.* = .{ .allocator = self.allocator };
+        self.text.deinit(self.gpa);
+        self.* = .{ .gpa = self.gpa };
     }
 
     pub fn setText(self: *Clipboard, bytes: []const u8) !void {
         self.text.clearRetainingCapacity();
-        try self.text.appendSlice(self.allocator, bytes);
+        try self.text.appendSlice(self.gpa, bytes);
     }
 
     pub fn getText(self: *const Clipboard) []const u8 {
@@ -34,10 +34,10 @@ pub const Clipboard = struct {
     }
 
     /// 解析 Clipboard.setData 参数 {"text": "..."} → 文本。返回 false = 无 text 字段。
-    pub fn parseSetData(payload: []const u8) ?[]const u8 {
-        var stream = std.json.Scanner.initCompleteInput(std.heap.page_allocator, payload);
+    pub fn parseSetData(gpa: std.mem.Allocator, payload: []const u8) ?[]const u8 {
+        var stream = std.json.Scanner.initCompleteInput(gpa, payload);
         defer stream.deinit();
-        const value = std.json.parseFromTokenSource(std.json.Value, std.heap.page_allocator, &stream, .{}) catch return null;
+        const value = std.json.parseFromTokenSource(std.json.Value, gpa, &stream, .{}) catch return null;
         defer value.deinit();
         const map = switch (value.value) {
             .object => |m| m,

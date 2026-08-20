@@ -54,16 +54,15 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = std.heap.page_allocator;
-    const args = try init.minimal.args.toSlice(allocator);
-    // 带全局环境的 io: runCommand 的 std.process.spawn 解析 argv[0] (PATH) 需要
-    var threaded = build_support.makeIo(allocator) catch {
-        std.debug.print("[error] failed to initialize process environment.\n", .{});
-        std.process.exit(1);
-    };
-    const io = threaded.io();
-
-    const options = parseArgs(args) catch |err| {
+    const gpa = init.gpa;
+    // 进程级 arena: 生命周期 = 整个进程, 退出时自动回收。
+    // args.toSlice 文档要求 arena 式分配器 (结果含多个分配);
+    // 默认 bundle_dir (defaultBundleDir) 也用它, 避免每次打包泄漏一个字符串。
+    const runtime_arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(runtime_arena);
+    // zig 0.16: init.io 自带完整环境, std.process.spawn 可解析 PATH 命令 (flutter/gclient 等)
+    const io = init.io;
+    const options = parseArgs(runtime_arena, args) catch |err| {
         printUsage();
         if (err == error.HelpRequested) return;
         return err;
@@ -72,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     // sdk 子命令: 释放内嵌的 fushell 包 (不需要工作目录/打包)
     if (options.sdk) {
         const sdk_dir = options.sdk_dir orelse "vendor";
-        releaseSdk(allocator, io, sdk_dir) catch |err| {
+        releaseSdk(gpa, io, sdk_dir) catch |err| {
             std.debug.print("[error] fushell-build sdk failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -81,8 +80,8 @@ pub fn main(init: std.process.Init) !void {
 
     // 目录参数 → 工作目录 (所有相对路径: flutter 命令/产物/bundle 默认目录)
     if (options.workdir) |workdir| {
-        const workdir_z = try allocator.dupeZ(u8, workdir);
-        defer allocator.free(workdir_z);
+        const workdir_z = try gpa.dupeZ(u8, workdir);
+        defer gpa.free(workdir_z);
         const chdir_result = std.c.chdir(workdir_z.ptr);
         if (chdir_result != 0) {
             std.debug.print("[error] fushell-build failed: cannot chdir to {s} (errno {d})\n", .{ workdir, std.posix.errno(chdir_result) });
@@ -91,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("working directory: {s}\n", .{workdir});
     }
 
-    buildBundle(allocator, io, options) catch |err| {
+    buildBundle(gpa, io, options) catch |err| {
         std.debug.print("[error] fushell-build failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -102,13 +101,13 @@ pub fn main(init: std.process.Init) !void {
         const enable_vm_service = options.run and options.mode == .debug;
         var hot_thread: ?std.Thread = null;
         if (enable_vm_service) {
-            const spawn_result = std.Thread.spawn(.{}, hotReloadThreadMain, .{});
+            const spawn_result = std.Thread.spawn(.{}, hotReloadThreadMain, .{gpa});
             hot_thread = spawn_result catch |err| blk: {
                 std.debug.print("[error] hot reload unavailable: {s}\n", .{@errorName(err)});
                 break :blk null;
             };
         }
-        player.runPlayer(allocator, options.bundle_dir, enable_vm_service) catch |err| {
+        player.runPlayer(gpa, options.bundle_dir, enable_vm_service) catch |err| {
             std.debug.print("[error] fushell-build run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -116,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn parseArgs(args: []const [:0]const u8) !Options {
+fn parseArgs(runtime_arena: std.mem.Allocator, args: []const [:0]const u8) !Options {
     var mode: Mode = .debug;
     var run: bool = false;
     var positional: [2][]const u8 = undefined;
@@ -172,7 +171,7 @@ fn parseArgs(args: []const [:0]const u8) !Options {
     // 第一个位置参数: 目录 → 工作目录 (entry/输出用默认); 否则 → entrypoint
     var workdir: ?[]const u8 = null;
     var entrypoint: []const u8 = "lib/main.dart";
-    var bundle_dir: []const u8 = defaultBundleDir(mode);
+    var bundle_dir: []const u8 = defaultBundleDir(runtime_arena, mode);
     if (positional_count >= 1) {
         if (isDir(positional[0])) {
             workdir = positional[0];
@@ -194,9 +193,8 @@ fn parseArgs(args: []const [:0]const u8) !Options {
 
 /// 热重载线程: 等待引擎报告 VM service URI → 连接 → getVM 验证。
 /// (spike 阶段: 验证 WebSocket + JSON-RPC 链路; 后续扩展为文件监听 + reload)
-fn hotReloadThreadMain() void {
-    const allocator = std.heap.page_allocator;
-    var threaded = std.Io.Threaded.init(allocator, .{});
+fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
     const io = threaded.io();
 
     // 等待 VM service URI (引擎启动后日志回调写入)
@@ -241,14 +239,14 @@ fn hotReloadThreadMain() void {
     std.debug.print("[hot-reload] isolateId: {s}\n", .{isolate_id});
 
     // 定位 flutter SDK (用于 frontend_server 启动参数)
-    const flutter_root = queryFlutterRoot(allocator, io) catch |err| {
+    const flutter_root = queryFlutterRoot(gpa, io) catch |err| {
         std.debug.print("[hot-reload] cannot find Flutter SDK: {s}\n", .{@errorName(err)});
         return;
     };
-    defer allocator.free(flutter_root);
+    defer gpa.free(flutter_root);
 
-    const project_dir = std.process.currentPathAlloc(io, allocator) catch return;
-    defer allocator.free(project_dir);
+    const project_dir = std.process.currentPathAlloc(io, gpa) catch return;
+    defer gpa.free(project_dir);
 
     const kernel_path = "/tmp/fushell-hotreload-kernel.dill";
     var main_uri_buf: [4096]u8 = undefined;
@@ -256,7 +254,7 @@ fn hotReloadThreadMain() void {
     var err_buf: [4096]u8 = undefined;
 
     // 常驻 frontend_server (诊断模式: 查退出根因)
-    var fs = frontend_server.FrontendServer.start(allocator, io, flutter_root, project_dir, kernel_path, main_uri) catch |err| {
+    var fs = frontend_server.FrontendServer.start(gpa, io, flutter_root, project_dir, kernel_path, main_uri) catch |err| {
         std.debug.print("[hot-reload] frontend_server start failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -271,21 +269,21 @@ fn hotReloadThreadMain() void {
     std.debug.print("[hot-reload] initial compile done. Watching lib/**/*.dart (press 'r' to reload)...\n", .{});
 
     // 文件监听 (轮询 mtime)
-    var baseline = scanLibDartFiles(allocator, "lib") catch return;
-    defer freeFileMap(allocator, &baseline);
+    var baseline = scanLibDartFiles(gpa, "lib") catch return;
+    defer freeFileMap(gpa, &baseline);
 
     while (true) {
         std.Io.sleep(io, .{ .nanoseconds = watch_poll_interval_ns }, .real) catch return;
 
-        var current = scanLibDartFiles(allocator, "lib") catch continue;
-        var changed_paths = filesChanged(allocator, &baseline, &current) catch {
-            freeFileMap(allocator, &current);
+        var current = scanLibDartFiles(gpa, "lib") catch continue;
+        var changed_paths = filesChanged(gpa, &baseline, &current) catch {
+            freeFileMap(gpa, &current);
             continue;
         };
         // changed_paths 的路径借用自 current (之后成为新 baseline), 只 deinit 容器本身
-        defer changed_paths.deinit(allocator);
+        defer changed_paths.deinit(gpa);
         // 更新基线
-        freeFileMap(allocator, &baseline);
+        freeFileMap(gpa, &baseline);
         baseline = current;
         if (changed_paths.items.len == 0) continue;
 
@@ -325,16 +323,16 @@ fn hotReloadThreadMain() void {
 
 const FileEntry = struct { path: []const u8, mtime: i64 };
 
-fn scanLibDartFiles(allocator: std.mem.Allocator, dir: []const u8) !std.ArrayList(FileEntry) {
+fn scanLibDartFiles(gpa: std.mem.Allocator, dir: []const u8) !std.ArrayList(FileEntry) {
     var result: std.ArrayList(FileEntry) = .empty;
-    try scanDirRecursive(allocator, &result, dir);
+    try scanDirRecursive(gpa, &result, dir);
     return result;
 }
 
-fn scanDirRecursive(allocator: std.mem.Allocator, out: *std.ArrayList(FileEntry), dir: []const u8) !void {
+fn scanDirRecursive(gpa: std.mem.Allocator, out: *std.ArrayList(FileEntry), dir: []const u8) !void {
     // 用 raw getdents64 遍历 (zig 0.16 Threaded 的 Dir.iterate 有 BADF bug)
-    const dir_z = try allocator.dupeZ(u8, dir);
-    defer allocator.free(dir_z);
+    const dir_z = try gpa.dupeZ(u8, dir);
+    defer gpa.free(dir_z);
     const fd = std.os.linux.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     if (std.os.linux.errno(fd) != .SUCCESS) return;
     defer _ = std.os.linux.close(@intCast(fd));
@@ -347,22 +345,22 @@ fn scanDirRecursive(allocator: std.mem.Allocator, out: *std.ArrayList(FileEntry)
         if (n == 0) break;
         var off: usize = 0;
         while (off < n) {
-            const ent: *std.os.linux.dirent64 = @alignCast(@ptrCast(buf[off..].ptr));
+            const ent: *std.os.linux.dirent64 = @ptrCast(@alignCast(buf[off..].ptr));
             const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
             off += ent.reclen;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            const full = try std.fs.path.join(allocator, &.{ dir, name });
+            const full = try std.fs.path.join(gpa, &.{ dir, name });
             if (ent.type == std.os.linux.DT.DIR) {
-                try scanDirRecursive(allocator, out, full);
-                allocator.free(full);
+                try scanDirRecursive(gpa, out, full);
+                gpa.free(full);
             } else if (std.mem.endsWith(u8, name, ".dart")) {
                 const st = statMtime(full) orelse {
-                    allocator.free(full);
+                    gpa.free(full);
                     continue;
                 };
-                try out.append(allocator, .{ .path = full, .mtime = st });
+                try out.append(gpa, .{ .path = full, .mtime = st });
             } else {
-                allocator.free(full);
+                gpa.free(full);
             }
         }
     }
@@ -375,7 +373,7 @@ fn statMtime(path: []const u8) ?i64 {
 }
 
 /// 返回变化的文件路径列表 (增量编译的 invalidated files)。
-fn filesChanged(allocator: std.mem.Allocator, old: *std.ArrayList(FileEntry), new: *std.ArrayList(FileEntry)) !std.ArrayList([]const u8) {
+fn filesChanged(gpa: std.mem.Allocator, old: *std.ArrayList(FileEntry), new: *std.ArrayList(FileEntry)) !std.ArrayList([]const u8) {
     var changed: std.ArrayList([]const u8) = .empty;
     for (new.items) |n| {
         var found = false;
@@ -383,19 +381,19 @@ fn filesChanged(allocator: std.mem.Allocator, old: *std.ArrayList(FileEntry), ne
             if (std.mem.eql(u8, o.path, n.path)) {
                 found = true;
                 if (o.mtime != n.mtime) {
-                    try changed.append(allocator, n.path);
+                    try changed.append(gpa, n.path);
                 }
                 break;
             }
         }
-        if (!found) try changed.append(allocator, n.path);
+        if (!found) try changed.append(gpa, n.path);
     }
     return changed;
 }
 
-fn freeFileMap(allocator: std.mem.Allocator, map: *std.ArrayList(FileEntry)) void {
-    for (map.items) |e| allocator.free(e.path);
-    map.deinit(allocator);
+fn freeFileMap(gpa: std.mem.Allocator, map: *std.ArrayList(FileEntry)) void {
+    for (map.items) |e| gpa.free(e.path);
+    map.deinit(gpa);
 }
 
 /// 路径存在且是目录 (Io.Dir.openDir 成功且关闭正常 = 目录)。
@@ -407,14 +405,14 @@ fn isDir(path: []const u8) bool {
 }
 
 /// 默认输出目录: build/linux/<arch>/<mode> (arch 来自构建目标, Flutter 命名)。
-fn defaultBundleDir(mode: Mode) []const u8 {
+fn defaultBundleDir(gpa: std.mem.Allocator, mode: Mode) []const u8 {
     const arch = @import("build_options").flutter_arch;
     const mode_str = switch (mode) {
         .debug => "debug",
         .release => "release",
         .profile => "profile",
     };
-    return std.fmt.allocPrint(std.heap.page_allocator, "build/linux/{s}/{s}", .{ arch, mode_str }) catch "build/bundle";
+    return std.fmt.allocPrint(gpa, "build/linux/{s}/{s}", .{ arch, mode_str }) catch "build/bundle";
 }
 
 fn printUsage() void {
@@ -439,80 +437,80 @@ fn printUsage() void {
     std.debug.print("  <output>/lib/libapp.so\n", .{});
 }
 
-fn buildBundle(allocator: std.mem.Allocator, io: std.Io, options: Options) !void {
+fn buildBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !void {
     switch (options.mode) {
-        .debug => try buildDebugBundle(allocator, io, options.entrypoint, options.bundle_dir),
-        .release, .profile => try buildAotBundle(allocator, io, options.mode, options.entrypoint, options.bundle_dir),
+        .debug => try buildDebugBundle(gpa, io, options.entrypoint, options.bundle_dir),
+        .release, .profile => try buildAotBundle(gpa, io, options.mode, options.entrypoint, options.bundle_dir),
     }
 }
 
-fn buildDebugBundle(allocator: std.mem.Allocator, io: std.Io, entrypoint: []const u8, bundle_dir: []const u8) !void {
+fn buildDebugBundle(gpa: std.mem.Allocator, io: std.Io, entrypoint: []const u8, bundle_dir: []const u8) !void {
     const target_platform = targetPlatform();
-    const flutter_root = try queryFlutterRoot(allocator, io);
-    defer allocator.free(flutter_root);
+    const flutter_root = try queryFlutterRoot(gpa, io);
+    defer gpa.free(flutter_root);
 
-    const icu_data = try std.fs.path.join(allocator, &.{ flutter_root, "bin", "cache", "artifacts", "engine", target_platform, "icudtl.dat" });
-    defer allocator.free(icu_data);
+    const icu_data = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "artifacts", "engine", target_platform, "icudtl.dat" });
+    defer gpa.free(icu_data);
 
-    try runCommand(allocator, io, &.{ "flutter", "pub", "get" });
-    const platform_arg = try std.fmt.allocPrint(allocator, "--target-platform={s}", .{target_platform});
-    defer allocator.free(platform_arg);
-    try runCommand(allocator, io, &.{ "flutter", "build", "bundle", "--debug", platform_arg, "-t", entrypoint });
+    try runCommand(gpa, io, &.{ "flutter", "pub", "get" });
+    const platform_arg = try std.fmt.allocPrint(gpa, "--target-platform={s}", .{target_platform});
+    defer gpa.free(platform_arg);
+    try runCommand(gpa, io, &.{ "flutter", "build", "bundle", "--debug", platform_arg, "-t", entrypoint });
 
-    const data_dir = try std.fs.path.join(allocator, &.{ bundle_dir, "data" });
-    defer allocator.free(data_dir);
-    const lib_dir = try std.fs.path.join(allocator, &.{ bundle_dir, "lib" });
-    defer allocator.free(lib_dir);
-    const data_icu = try std.fs.path.join(allocator, &.{ data_dir, "icudtl.dat" });
-    defer allocator.free(data_icu);
-    const data_assets = try std.fs.path.join(allocator, &.{ data_dir, "flutter_assets" });
-    defer allocator.free(data_assets);
-    const engine_library = try std.fs.path.join(allocator, &.{ lib_dir, "libflutter_engine.so" });
-    defer allocator.free(engine_library);
+    const data_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "data" });
+    defer gpa.free(data_dir);
+    const lib_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "lib" });
+    defer gpa.free(lib_dir);
+    const data_icu = try std.fs.path.join(gpa, &.{ data_dir, "icudtl.dat" });
+    defer gpa.free(data_icu);
+    const data_assets = try std.fs.path.join(gpa, &.{ data_dir, "flutter_assets" });
+    defer gpa.free(data_assets);
+    const engine_library = try std.fs.path.join(gpa, &.{ lib_dir, "libflutter_engine.so" });
+    defer gpa.free(engine_library);
 
-    try runCommand(allocator, io, &.{ "rm", "-rf", bundle_dir });
-    try runCommand(allocator, io, &.{ "mkdir", "-p", data_dir, lib_dir });
-    try runCommand(allocator, io, &.{ "cp", icu_data, data_icu });
-    try runCommand(allocator, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
+    try runCommand(gpa, io, &.{ "rm", "-rf", bundle_dir });
+    try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
+    try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
+    try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
     try writeEmbeddedEngine(io, .debug, engine_library);
-    try writeBundleEntry(allocator, io, bundle_dir);
+    try writeBundleEntry(gpa, io, bundle_dir);
 
     std.debug.print("fushell bundle ready: {s}\n", .{bundle_dir});
 }
 
 /// release/profile 共用: AOT 编译 app (assemble) + 组装 AOT bundle。
 /// assemble target 名与 -dBuildMode 按模式派生 (release_bundle_... / profile_bundle_...)。
-fn buildAotBundle(allocator: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []const u8, bundle_dir: []const u8) !void {
+fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []const u8, bundle_dir: []const u8) !void {
     const target_platform = targetPlatform();
-    const flutter_root = try queryFlutterRoot(allocator, io);
-    defer allocator.free(flutter_root);
+    const flutter_root = try queryFlutterRoot(gpa, io);
+    defer gpa.free(flutter_root);
 
-    const icu_data = try std.fs.path.join(allocator, &.{ flutter_root, "bin", "cache", "artifacts", "engine", target_platform, "icudtl.dat" });
-    defer allocator.free(icu_data);
+    const icu_data = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "artifacts", "engine", target_platform, "icudtl.dat" });
+    defer gpa.free(icu_data);
 
     // 1. AOT 编译 app: `flutter build bundle --release` 只产 flutter_assets
     //    (releaseCopyFlutterBundle 不含 AOT), libapp.so 由 assemble 的
     //    {mode}_bundle_<platform>_assets target (依赖 AotElf) 产出。
     //    参数形式与官方 `flutter build linux --release` 内部完全一致
     //    (tool_backend.dart): -d defines + --output=build + target。
-    try runCommand(allocator, io, &.{ "flutter", "pub", "get" });
-    const platform_arg = try std.fmt.allocPrint(allocator, "-dTargetPlatform={s}", .{target_platform});
-    defer allocator.free(platform_arg);
-    const target_file_arg = try std.fmt.allocPrint(allocator, "-dTargetFile={s}", .{entrypoint});
-    defer allocator.free(target_file_arg);
-    const assemble_target = try std.fmt.allocPrint(allocator, "{s}_bundle_{s}_assets", .{ @tagName(mode), target_platform });
-    defer allocator.free(assemble_target);
-    const build_mode_arg = try std.fmt.allocPrint(allocator, "-dBuildMode={s}", .{@tagName(mode)});
-    defer allocator.free(build_mode_arg);
-    try runCommand(allocator, io, &.{
+    try runCommand(gpa, io, &.{ "flutter", "pub", "get" });
+    const platform_arg = try std.fmt.allocPrint(gpa, "-dTargetPlatform={s}", .{target_platform});
+    defer gpa.free(platform_arg);
+    const target_file_arg = try std.fmt.allocPrint(gpa, "-dTargetFile={s}", .{entrypoint});
+    defer gpa.free(target_file_arg);
+    const assemble_target = try std.fmt.allocPrint(gpa, "{s}_bundle_{s}_assets", .{ @tagName(mode), target_platform });
+    defer gpa.free(assemble_target);
+    const build_mode_arg = try std.fmt.allocPrint(gpa, "-dBuildMode={s}", .{@tagName(mode)});
+    defer gpa.free(build_mode_arg);
+    try runCommand(gpa, io, &.{
         "flutter",    "assemble",     "--no-version-check", "--output=build",
         platform_arg, build_mode_arg, target_file_arg,      assemble_target,
     });
 
     // 2. 校验 libapp.so (gen_snapshot 产物, 与自编引擎同 commit 配对)
-    const app_so = try std.fs.path.join(allocator, &.{ "build", "lib", "libapp.so" });
-    defer allocator.free(app_so);
-    if (!try pathExists(allocator, app_so)) {
+    const app_so = try std.fs.path.join(gpa, &.{ "build", "lib", "libapp.so" });
+    defer gpa.free(app_so);
+    if (!try pathExists(gpa, app_so)) {
         std.debug.print("libapp.so not found at {s}\n", .{app_so});
         std.debug.print("`flutter assemble -dBuildMode={s} {s}` should have produced it (gen_snapshot AOT output).\n", .{ @tagName(mode), assemble_target });
         std.debug.print("Verify the Flutter SDK engine commit matches the embedded engine (42d3d75a).\n", .{});
@@ -520,26 +518,26 @@ fn buildAotBundle(allocator: std.mem.Allocator, io: std.Io, mode: Mode, entrypoi
     }
 
     // 3. 组装 AOT bundle
-    const data_dir = try std.fs.path.join(allocator, &.{ bundle_dir, "data" });
-    defer allocator.free(data_dir);
-    const lib_dir = try std.fs.path.join(allocator, &.{ bundle_dir, "lib" });
-    defer allocator.free(lib_dir);
-    const data_icu = try std.fs.path.join(allocator, &.{ data_dir, "icudtl.dat" });
-    defer allocator.free(data_icu);
-    const data_assets = try std.fs.path.join(allocator, &.{ data_dir, "flutter_assets" });
-    defer allocator.free(data_assets);
-    const engine_library = try std.fs.path.join(allocator, &.{ lib_dir, "libflutter_engine.so" });
-    defer allocator.free(engine_library);
-    const app_so_dest = try std.fs.path.join(allocator, &.{ lib_dir, "libapp.so" });
-    defer allocator.free(app_so_dest);
+    const data_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "data" });
+    defer gpa.free(data_dir);
+    const lib_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "lib" });
+    defer gpa.free(lib_dir);
+    const data_icu = try std.fs.path.join(gpa, &.{ data_dir, "icudtl.dat" });
+    defer gpa.free(data_icu);
+    const data_assets = try std.fs.path.join(gpa, &.{ data_dir, "flutter_assets" });
+    defer gpa.free(data_assets);
+    const engine_library = try std.fs.path.join(gpa, &.{ lib_dir, "libflutter_engine.so" });
+    defer gpa.free(engine_library);
+    const app_so_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so" });
+    defer gpa.free(app_so_dest);
 
-    try runCommand(allocator, io, &.{ "rm", "-rf", bundle_dir });
-    try runCommand(allocator, io, &.{ "mkdir", "-p", data_dir, lib_dir });
-    try runCommand(allocator, io, &.{ "cp", icu_data, data_icu });
-    try runCommand(allocator, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
-    try runCommand(allocator, io, &.{ "cp", app_so, app_so_dest });
+    try runCommand(gpa, io, &.{ "rm", "-rf", bundle_dir });
+    try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
+    try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
+    try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
+    try runCommand(gpa, io, &.{ "cp", app_so, app_so_dest });
     try writeEmbeddedEngine(io, mode, engine_library);
-    try writeBundleEntry(allocator, io, bundle_dir);
+    try writeBundleEntry(gpa, io, bundle_dir);
 
     std.debug.print("fushell {s} bundle ready: {s}\n", .{ @tagName(mode), bundle_dir });
 }
@@ -553,53 +551,52 @@ fn targetPlatform() []const u8 {
     };
 }
 
-fn queryFlutterRoot(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
+fn queryFlutterRoot(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     _ = io;
 
-    if (try envValue(allocator, "FLUTTER_ROOT")) |root| return root;
-    if (try envValue(allocator, "FLUTTER_SDK")) |root| return root;
+    if (try envValue(gpa, "FLUTTER_ROOT")) |root| return root;
+    if (try envValue(gpa, "FLUTTER_SDK")) |root| return root;
 
     const path = std.c.getenv("PATH") orelse return error.FlutterRootUnavailable;
     var entries = std.mem.splitScalar(u8, std.mem.span(path), ':');
     while (entries.next()) |entry| {
         if (entry.len == 0) continue;
-        const flutter_exe = try std.fs.path.join(allocator, &.{ entry, "flutter" });
-        defer allocator.free(flutter_exe);
-        if (!try pathExists(allocator, flutter_exe)) continue;
+        const flutter_exe = try std.fs.path.join(gpa, &.{ entry, "flutter" });
+        defer gpa.free(flutter_exe);
+        if (!try pathExists(gpa, flutter_exe)) continue;
 
         const root_candidate = std.fs.path.dirname(entry) orelse continue;
-        const root = try allocator.dupe(u8, root_candidate);
-        errdefer allocator.free(root);
-        const icu_probe = try std.fs.path.join(allocator, &.{ root, "bin", "cache", "artifacts", "engine", targetPlatform(), "icudtl.dat" });
-        defer allocator.free(icu_probe);
-        if (try pathExists(allocator, icu_probe)) return root;
-        allocator.free(root);
+        const root = try gpa.dupe(u8, root_candidate);
+        errdefer gpa.free(root);
+        const icu_probe = try std.fs.path.join(gpa, &.{ root, "bin", "cache", "artifacts", "engine", targetPlatform(), "icudtl.dat" });
+        defer gpa.free(icu_probe);
+        if (try pathExists(gpa, icu_probe)) return root;
+        gpa.free(root);
     }
 
     return error.FlutterRootUnavailable;
 }
 
-fn envValue(allocator: std.mem.Allocator, comptime name: []const u8) !?[]u8 {
+fn envValue(gpa: std.mem.Allocator, comptime name: []const u8) !?[]u8 {
     const raw = std.c.getenv(name ++ "\x00") orelse return null;
-    return try allocator.dupe(u8, std.mem.span(raw));
+    return try gpa.dupe(u8, std.mem.span(raw));
 }
 
-fn pathExists(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
+fn pathExists(gpa: std.mem.Allocator, path: []const u8) !bool {
+    const path_z = try gpa.dupeZ(u8, path);
+    defer gpa.free(path_z);
     return std.c.access(path_z.ptr, std.c.F_OK) == 0;
 }
 
-fn runCommand(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    _ = allocator;
+fn runCommand(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    _ = gpa;
     std.debug.print("$", .{});
     for (argv) |arg| std.debug.print(" {s}", .{arg});
     std.debug.print("\n", .{});
 
     if (argv.len == 0) return error.CommandFailed;
 
-    // 用 std.process.spawn (替代早期 posix_spawnp workaround):
-    // 需要完整 environ 才能解析 PATH (参考 build_support.makeIo 的 /proc/self/environ 方案)。
+    // 用 std.process.spawn (需要完整环境解析 PATH, io 由调用方提供: init.io / graph.io)
     var child = try std.process.spawn(io, .{ .argv = argv });
     // Child 无 deinit: wait 后由 io 释放 (spawn 的 stdio 管道在 wait 时清理)
 
@@ -630,11 +627,11 @@ fn writeEmbeddedEngine(io: std.Io, mode: Mode, path: []const u8) !void {
 
 /// 打包入口: 把内嵌的 runner 可执行文件写出为 <bundle_dir>/<app-name> (chmod +x)。
 /// app 名取自项目 pubspec.yaml 的 name 字段 (官方 my_app 同款命名)。
-fn writeBundleEntry(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []const u8) !void {
-    const app_name = try readPubspecName(allocator, io);
-    defer allocator.free(app_name);
-    const entry_path = try std.fs.path.join(allocator, &.{ bundle_dir, app_name });
-    defer allocator.free(entry_path);
+fn writeBundleEntry(gpa: std.mem.Allocator, io: std.Io, bundle_dir: []const u8) !void {
+    const app_name = try readPubspecName(gpa, io);
+    defer gpa.free(app_name);
+    const entry_path = try std.fs.path.join(gpa, &.{ bundle_dir, app_name });
+    defer gpa.free(entry_path);
     var file = try std.Io.Dir.cwd().createFile(io, entry_path, .{ .permissions = .executable_file });
     defer file.close(io);
     try file.writeStreamingAll(io, embedded_runner);
@@ -643,32 +640,32 @@ fn writeBundleEntry(allocator: std.mem.Allocator, io: std.Io, bundle_dir: []cons
 
 /// `sdk` 子命令: 释放内嵌的 fushell 包到 <dir>/fushell (默认 ./vendor/fushell)。
 /// 外部项目通过 path 依赖导入: pubspec → fushell: { path: <dir>/fushell }
-fn releaseSdk(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
-    const target = try std.fs.path.join(allocator, &.{ dir, "fushell" });
-    defer allocator.free(target);
-    const lib_dir = try std.fs.path.join(allocator, &.{ target, "lib" });
-    defer allocator.free(lib_dir);
+fn releaseSdk(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+    const target = try std.fs.path.join(gpa, &.{ dir, "fushell" });
+    defer gpa.free(target);
+    const lib_dir = try std.fs.path.join(gpa, &.{ target, "lib" });
+    defer gpa.free(lib_dir);
 
     // 创建目录 (幂等: createDirPath 会递归创建不存在的路径)
     std.Io.Dir.cwd().createDirPath(io, lib_dir) catch return error.SdkReleaseDirCreateFailed;
 
     // 写 pubspec.yaml
-    const pubspec_path = try std.fs.path.join(allocator, &.{ target, "pubspec.yaml" });
-    defer allocator.free(pubspec_path);
+    const pubspec_path = try std.fs.path.join(gpa, &.{ target, "pubspec.yaml" });
+    defer gpa.free(pubspec_path);
     var pubspec_file = try std.Io.Dir.cwd().createFile(io, pubspec_path, .{});
     defer pubspec_file.close(io);
     try pubspec_file.writeStreamingAll(io, embedded_sdk_pubspec);
 
     // 写 lib/fushell.dart
-    const lib_path = try std.fs.path.join(allocator, &.{ lib_dir, "fushell.dart" });
-    defer allocator.free(lib_path);
+    const lib_path = try std.fs.path.join(gpa, &.{ lib_dir, "fushell.dart" });
+    defer gpa.free(lib_path);
     var lib_file = try std.Io.Dir.cwd().createFile(io, lib_path, .{});
     defer lib_file.close(io);
     try lib_file.writeStreamingAll(io, embedded_sdk_lib);
 
     // 写 README.md
-    const readme_path = try std.fs.path.join(allocator, &.{ target, "README.md" });
-    defer allocator.free(readme_path);
+    const readme_path = try std.fs.path.join(gpa, &.{ target, "README.md" });
+    defer gpa.free(readme_path);
     var readme_file = try std.Io.Dir.cwd().createFile(io, readme_path, .{});
     defer readme_file.close(io);
     try readme_file.writeStreamingAll(io, embedded_sdk_readme);
@@ -681,7 +678,7 @@ fn releaseSdk(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
 }
 
 /// 解析 pubspec.yaml 的第一层 name (无缩进的 "name:" 行)。
-fn readPubspecName(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+fn readPubspecName(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
     var buf: [8192]u8 = undefined;
     const content = std.Io.Dir.cwd().readFile(io, "pubspec.yaml", &buf) catch return error.PubspecNotFound;
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -690,7 +687,7 @@ fn readPubspecName(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
         if (std.mem.startsWith(u8, trimmed, "name:")) {
             const value = std.mem.trim(u8, trimmed["name:".len..], " \t\r");
             if (value.len > 0 and value[0] != '#') {
-                return allocator.dupe(u8, value);
+                return gpa.dupe(u8, value);
             }
         }
     }

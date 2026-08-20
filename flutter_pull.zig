@@ -42,10 +42,8 @@ pub const PullFlutter = struct {
     fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
         const self: *PullFlutter = @fieldParentPtr("step", step);
         const allocator = options.gpa;
-
-        // 自建 io: 全局单例的 environ 为空, spawn 无法解析 PATH (报 OutOfMemory)。
-        var threaded = try support.makeIo(allocator);
-        const io = threaded.io();
+        // zig 0.16: step.owner.graph.io 自带完整环境, spawn 可解析 PATH (gclient/git)。
+        const io = step.owner.graph.io;
 
         // 相对路径基于当前目录解析为绝对路径
         const workspace = try support.resolveWorkspace(io, allocator, self.workspace);

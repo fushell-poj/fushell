@@ -26,33 +26,33 @@ pub const FrontendServer = struct {
     /// 启动 frontend_server 常驻进程。
     /// flutter_root: Flutter SDK 根。project_dir: app 项目目录 (找 .dart_tool/package_config.json)。
     /// output_dill: 编译产物路径 (kernel dill)。
-    pub fn start(allocator: std.mem.Allocator, io: std.Io, flutter_root: []const u8, project_dir: []const u8, output_dill: []const u8, main_uri: []const u8) !FrontendServer {
+    pub fn start(gpa: std.mem.Allocator, io: std.Io, flutter_root: []const u8, project_dir: []const u8, output_dill: []const u8, main_uri: []const u8) !FrontendServer {
         // 定位引擎产物
-        const engine_dir = try engineArtifactsDir(allocator, flutter_root);
-        defer allocator.free(engine_dir);
-        const snapshot = try std.fs.path.join(allocator, &.{ engine_dir, "linux-x64", "frontend_server_aot.dart.snapshot" });
-        defer allocator.free(snapshot);
-        const dart_rt = try std.fs.path.join(allocator, &.{ flutter_root, "bin", "cache", "dart-sdk", "bin", "dartaotruntime" });
-        defer allocator.free(dart_rt);
-        const packages = try std.fs.path.join(allocator, &.{ project_dir, ".dart_tool", "package_config.json" });
-        defer allocator.free(packages);
+        const engine_dir = try engineArtifactsDir(gpa, flutter_root);
+        defer gpa.free(engine_dir);
+        const snapshot = try std.fs.path.join(gpa, &.{ engine_dir, "linux-x64", "frontend_server_aot.dart.snapshot" });
+        defer gpa.free(snapshot);
+        const dart_rt = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "dart-sdk", "bin", "dartaotruntime" });
+        defer gpa.free(dart_rt);
+        const packages = try std.fs.path.join(gpa, &.{ project_dir, ".dart_tool", "package_config.json" });
+        defer gpa.free(packages);
 
         // sdk-root / platform dill: 优先 linux-x64/flutter_patched_sdk, 否则 common/flutter_patched_sdk
         var sdk_root_buf: [4096]u8 = undefined;
         const sdk_root: []const u8 = blk: {
-            const linux_patched = try std.fs.path.join(allocator, &.{ engine_dir, "linux-x64", "flutter_patched_sdk" });
-            defer allocator.free(linux_patched);
+            const linux_patched = try std.fs.path.join(gpa, &.{ engine_dir, "linux-x64", "flutter_patched_sdk" });
+            defer gpa.free(linux_patched);
             if (dirExists(linux_patched)) {
                 const n = (try std.fmt.bufPrint(&sdk_root_buf, "{s}/", .{linux_patched})).len;
                 break :blk sdk_root_buf[0..n];
             }
-            const common_patched = try std.fs.path.join(allocator, &.{ engine_dir, "common", "flutter_patched_sdk" });
-            defer allocator.free(common_patched);
+            const common_patched = try std.fs.path.join(gpa, &.{ engine_dir, "common", "flutter_patched_sdk" });
+            defer gpa.free(common_patched);
             const n = (try std.fmt.bufPrint(&sdk_root_buf, "{s}/", .{common_patched})).len;
             break :blk sdk_root_buf[0..n];
         };
-        const platform_dill = try std.fs.path.join(allocator, &.{ sdk_root, "platform_strong.dill" });
-        defer allocator.free(platform_dill);
+        const platform_dill = try std.fs.path.join(gpa, &.{ sdk_root, "platform_strong.dill" });
+        defer gpa.free(platform_dill);
 
         // 管道: 用 spawn 的 .pipe 模式 (spawn 自己创建/管理, 避免手动 fd 竞争)
         var stdin_pipe: [2]std.posix.fd_t = undefined;
@@ -217,21 +217,21 @@ pub const FrontendServer = struct {
 };
 
 /// 引擎产物目录: <flutter_root>/bin/cache/artifacts/engine (解析符号链接后的真实路径)。
-fn engineArtifactsDir(allocator: std.mem.Allocator, flutter_root: []const u8) ![]const u8 {
-    const link = try std.fs.path.join(allocator, &.{ flutter_root, "bin", "cache", "artifacts", "engine", "linux-x64", "frontend_server_aot.dart.snapshot" });
-    defer allocator.free(link);
+fn engineArtifactsDir(gpa: std.mem.Allocator, flutter_root: []const u8) ![]const u8 {
+    const link = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "artifacts", "engine", "linux-x64", "frontend_server_aot.dart.snapshot" });
+    defer gpa.free(link);
     const io = std.Io.Threaded.global_single_threaded.io();
     var buf: [4096]u8 = undefined;
     const n = std.Io.Dir.readLinkAbsolute(io, link, &buf) catch return error.FrontendServerStartFailed;
     var resolved: []const u8 = buf[0..n];
     if (!std.fs.path.isAbsolute(resolved)) {
         const base = std.fs.path.dirname(link) orelse ".";
-        resolved = try std.fs.path.resolve(allocator, &.{ base, resolved });
+        resolved = try std.fs.path.resolve(gpa, &.{ base, resolved });
     }
     // resolved 是快照文件路径 → 取 dirname(linux-x64) 的 dirname (engine 目录)
     const snap_dir = std.fs.path.dirname(resolved) orelse return error.FrontendServerStartFailed;
     const engine_dir = std.fs.path.dirname(snap_dir) orelse return error.FrontendServerStartFailed;
-    return allocator.dupe(u8, engine_dir);
+    return gpa.dupe(u8, engine_dir);
 }
 
 fn dirExists(path: []const u8) bool {
