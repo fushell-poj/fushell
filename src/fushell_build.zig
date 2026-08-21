@@ -1,5 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const flutter = @import("flutter_embedder.zig");
+const display_state = @import("wl_display_state.zig");
+const egl = @import("wayland_egl_host.zig");
 const player = @import("player.zig");
 const flutter_runner = @import("flutter_runner.zig");
 const hot_reload = @import("hot_reload.zig");
@@ -111,6 +114,9 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("[error] fushell-build run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
+        // 主窗口已关 (引擎退出): 通知热重载线程退出, 再 join 收尸。
+        // 否则 watcher 的 while(true) 永挂, join 卡死进程。
+        hot_reload_stop.store(true, .release);
         if (hot_thread) |t| t.join();
     }
 }
@@ -193,8 +199,11 @@ fn parseArgs(runtime_arena: std.mem.Allocator, args: []const [:0]const u8) !Opti
 
 /// 热重载线程: 等待引擎报告 VM service URI → 连接 → getVM 验证。
 /// (spike 阶段: 验证 WebSocket + JSON-RPC 链路; 后续扩展为文件监听 + reload)
+/// 主窗口关闭后由 main 置位, watcher while 循环检查退出 (避免 join 卡死)。
+var hot_reload_stop = std.atomic.Value(bool).init(false);
 fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
     const io = threaded.io();
 
     // 等待 VM service URI (引擎启动后日志回调写入)
@@ -273,6 +282,7 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
     defer freeFileMap(gpa, &baseline);
 
     while (true) {
+        if (hot_reload_stop.load(.acquire)) break;
         std.Io.sleep(io, .{ .nanoseconds = watch_poll_interval_ns }, .real) catch return;
 
         var current = scanLibDartFiles(gpa, "lib") catch continue;

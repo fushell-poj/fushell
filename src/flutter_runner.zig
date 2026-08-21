@@ -54,6 +54,24 @@ fn getDisplayState(gpa: std.mem.Allocator) !*display_state.DisplayState {
     return global_display_state.?;
 }
 
+/// 主窗口关闭后显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全)。
+/// ImeV3 持有 Wayland 对象 (text_input 等), 由 state 的 disconnect 统一收尾;
+/// 这里只回收 gpa.create 的对象内存 + DataControl 内部 buffer。
+fn shutdownShared(gpa: std.mem.Allocator, state: *display_state.DisplayState) void {
+    if (state.data_control) |dc| {
+        dc.deinit();
+        gpa.destroy(dc);
+        state.data_control = null;
+        if (global_data_control == state.data_control) global_data_control = null;
+        global_data_control = null;
+    }
+    if (state.ime) |ime| {
+        ime.deinit();
+        gpa.destroy(ime);
+        state.ime = null;
+    }
+}
+
 /// 主窗口 runner (指针路由的目标之一)。
 /// 进程级 data-control (系统剪贴板): 主窗口 attach 时创建, 绑定到共享 display。
 var global_data_control: ?*data_control.DataControl = null;
@@ -688,13 +706,18 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
         };
     };
 
+    const state = try getDisplayState(gpa);
+    // state 对象销毁必须在 host.deinit 之后 (defer LIFO: 后注册者先执行),
+    // 先让 host.deinit 触发 state.deinit 释放 Wayland/EGL, 再回收入口对象。
+    // ⚠️ defer 必须是【函数级】, 不能放在 if 块内 — Zig 的 defer 在词法块结束
+    // (包括 if 的 }) 时执行, 若放 if 内会在 attach 之前就 destroy state (悬垂引用).
+    defer if (options.role == .primary and global_display_state == state) {
+        gpa.destroy(state);
+        global_display_state = null;
+    };
     var local_host: egl.Host = .{};
     const host: *egl.Host = options.external_host orelse &local_host;
     defer if (options.external_host == null) local_host.deinit();
-    // 进程级共享 DisplayState: 主窗口首次创建 (acquire 时 connect),
-    // spawn 窗口 acquire 共享。主窗口退出时 shutdownSpawnedWindows 先 join 全部
-    // spawn, 再 host.deinit() 使引用归零 → 连接完整清理。
-    const state = try getDisplayState(gpa);
     try host.attach(state, options.role == .primary);
     if (options.role == .primary) {
         main_runner_host = host;
@@ -832,21 +855,39 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     // argv 独立于 entrypoint 注入: 新窗口用 main 入口, 窗口标识通过 argv 传递
     // (Dart 侧 main(List<String> args) 接收)。
     // run 返回后释放 — 引擎只读这些指针 (消费≠释放), 不负责 free。
+    // 注意: defer 必须放在函数级 (不能放 if/for 块内) — Zig 的 defer 是词法块作用域,
+    // 放在块内会在块结束(})即释放, 导致 api.run 读到已释放指针 (UAF, 0xaa poison)。
+    var entrypoint_arg_z: ?[:0]u8 = null;
+    defer if (entrypoint_arg_z) |z| gpa.free(z);
+    var entrypoint_argv_z: ?[]?[*:0]const u8 = null;
+    defer if (entrypoint_argv_z) |z| gpa.free(z);
+    var argv_elem_zs: ?[][:0]u8 = null;
+    defer if (argv_elem_zs) |zs| {
+        for (zs) |z| gpa.free(z); // 每个元素 dupeZ 的内容
+        gpa.free(zs); // 结构体数组本身 ([:0]u8 = ptr+len)
+    };
+
     if (options.entrypoint) |entrypoint| {
-        const entrypoint_z = try gpa.dupeZ(u8, entrypoint);
-        defer gpa.free(entrypoint_z);
-        project_args.custom_dart_entrypoint = entrypoint_z.ptr;
+        const z = try gpa.dupeZ(u8, entrypoint);
+        entrypoint_arg_z = z;
+        project_args.custom_dart_entrypoint = z.ptr;
     }
     if (options.entrypoint_argv) |argv| {
-        const argv_z = try gpa.allocSentinel(?[*:0]const u8, argv.len, null);
-        defer gpa.free(argv_z);
+        // 容器用普通 alloc(len+1) + 手动末尾 null: allocSentinel 返回的 slice 用普通
+        // []T free 时与 DebugAllocator 的 alignment/bucket 定位不一致 (Invalid free)。
+        const z = try gpa.alloc(?[*:0]const u8, argv.len + 1);
+        entrypoint_argv_z = z;
+        z[argv.len] = null; // C 数组末尾 null (const char* const* sentinel)
+        // 元素类型必须 [:0]u8 (与 dupeZ 返回同型) — 同上, allocSentinel 分配与 []u8 free 不匹配。
+        const elems = try gpa.alloc([:0]u8, argv.len);
+        argv_elem_zs = elems;
         for (argv, 0..) |arg, i| {
-            const arg_z = try gpa.dupeZ(u8, arg);
-            defer gpa.free(arg_z);
-            argv_z[i] = arg_z.ptr;
+            const az = try gpa.dupeZ(u8, arg);
+            elems[i] = az;
+            z[i] = az.ptr;
         }
         project_args.dart_entrypoint_argc = @intCast(argv.len);
-        project_args.dart_entrypoint_argv = argv_z.ptr;
+        project_args.dart_entrypoint_argv = @ptrCast(z.ptr);
     }
 
     std.debug.print("Starting Flutter engine with bundle assets: {s}\n", .{bundle.assets_path});
@@ -868,7 +909,11 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
 
     // 主窗口关闭: 先关闭所有子窗口引擎 (它们共享 VM), 再销毁 VM。
     // 否则子引擎仍在使用 VM 时销毁 → 崩溃。
-    if (options.role == .primary) shutdownSpawnedWindows();
+    if (options.role == .primary) {
+        shutdownSpawnedWindows();
+        // 显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全; 不再依赖 defer 时序)。
+        shutdownShared(gpa, state);
+    }
 
     std.debug.print("Shutting down Flutter engine.\n", .{});
     try flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown");

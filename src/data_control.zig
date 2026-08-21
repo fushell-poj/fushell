@@ -45,9 +45,12 @@ pub const DataControl = struct {
         for (self.offer_mimes.items) |m| self.gpa.free(m);
         self.offer_mimes.deinit(self.gpa);
         self.published_text.deinit(self.gpa);
+        if (self.manager) |m| m.destroy();
         self.manager = null;
+        if (self.device) |dev| dev.destroy();
         self.device = null;
         self.source = null;
+        if (self.offer) |off| off.destroy();
         self.offer = null;
     }
 

@@ -140,6 +140,7 @@ pub const DisplayState = struct {
             self.gles_library = null;
         }
         if (self.pointer) |pointer| pointer.release();
+        if (self.keyboard) |keyboard| keyboard.release();
         if (self.seat) |seat| seat.release();
         for (&self.outputs) |*output_state| {
             if (output_state.output) |output| output.release();

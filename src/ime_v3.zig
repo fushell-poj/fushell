@@ -29,6 +29,7 @@ pub const ImeCallback = *const fn (event: ImeEvent, ctx: ?*anyopaque) void;
 
 pub const ImeV3 = struct {
     text_input: ?*zwp.TextInputV3 = null,
+    manager: ?*zwp.TextInputManagerV3 = null,
     callback: ?ImeCallback = null,
     callback_ctx: ?*anyopaque = null,
     primary_queue: ?*wl.EventQueue = null,
@@ -48,6 +49,8 @@ pub const ImeV3 = struct {
         const manager = wl.Registry.bind(global, name, zwp.TextInputManagerV3, v) catch {
             return;
         };
+        // 保存 manager 引用供 deinit 释放 (registry.bind 创建的 proxy 需显式 destroy)。
+        self.manager = manager;
         if (self.text_input) |old| old.destroy();
         self.text_input = manager.getTextInput(seat) catch {
             return;
@@ -57,6 +60,14 @@ pub const ImeV3 = struct {
             ti.setListener(*ImeV3, listener, self);
             if (self.primary_queue) |q| ti.setQueue(q);
         }
+    }
+
+    /// 释放 proxy (manager/text_input)。shutdownShared 调用。
+    pub fn deinit(self: *ImeV3) void {
+        if (self.text_input) |ti| ti.destroy();
+        self.text_input = null;
+        if (self.manager) |m| m.destroy();
+        self.manager = null;
     }
 
     pub fn setCallback(self: *ImeV3, callback: ImeCallback, ctx: ?*anyopaque) void {
@@ -77,8 +88,7 @@ pub const ImeV3 = struct {
             // ContentHint/ContentPurpose 是 packed struct — 默认全 false。
             ti.setContentType(.{}, .normal);
             ti.commit();
-        } else {
-        }
+        } else {}
     }
 
     /// TextField 失焦。
