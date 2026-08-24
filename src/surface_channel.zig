@@ -1,41 +1,48 @@
 const std = @import("std");
 
 pub const channel_name = "dev.fushell/surface";
-pub const init_method = "surface.init";
-pub const update_layer_method = "surface.updateLayer";
-pub const update_window_method = "surface.updateWindow";
-pub const spawn_window_method = "window.spawn";
+pub const open_window_method = "window.open";
+pub const close_window_method = "window.close";
+pub const update_window_method = "window.update";
+pub const update_layer_method = "layer.update";
+pub const exit_method = "process.exit";
 
 pub const Request = union(enum) {
-    init: InitRequest,
-    update_layer: LayerSurfaceUpdateRequest,
-    update_window: WindowSurfaceUpdateRequest,
-    spawn_window: SpawnRequest,
+    open_window: OpenWindowRequest,
+    close_window: CloseWindowRequest,
+    update_window: WindowUpdateRequest,
+    update_layer: LayerUpdateRequest,
+    exit: ExitRequest,
 
     pub fn id(self: Request) i64 {
         return switch (self) {
-            .init => |request| request.id,
-            .update_layer => |request| request.id,
+            .open_window => |request| request.id,
+            .close_window => |request| request.id,
             .update_window => |request| request.id,
-            .spawn_window => |request| request.id,
+            .update_layer => |request| request.id,
+            .exit => |request| request.id,
         };
     }
 
     pub fn deinit(self: Request, gpa: std.mem.Allocator) void {
         switch (self) {
-            .init => |request| request.deinit(gpa),
-            .update_layer => {},
+            .open_window => |request| request.deinit(gpa),
+            .close_window => {},
             .update_window => |request| request.deinit(gpa),
-            .spawn_window => |request| request.deinit(gpa),
+            .update_layer => {},
+            .exit => {},
         }
     }
 };
 
-pub const InitRequest = struct {
+/// window.open: 创建新窗口 (可指定父窗口), 成功后回复窗口 id (= Flutter view_id)。
+pub const OpenWindowRequest = struct {
     id: i64,
     role: Role,
+    /// 父窗口 id (= 父 view_id); null = 无父。
+    parent: ?i64 = null,
 
-    pub fn deinit(self: InitRequest, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: OpenWindowRequest, gpa: std.mem.Allocator) void {
         switch (self.role) {
             .window => |window| {
                 gpa.free(window.title);
@@ -48,19 +55,31 @@ pub const InitRequest = struct {
     }
 };
 
-pub const LayerSurfaceUpdateRequest = struct {
+pub const CloseWindowRequest = struct {
     id: i64,
-    update: LayerSurfaceUpdate,
+    window_id: i64,
 };
 
-pub const WindowSurfaceUpdateRequest = struct {
+pub const WindowUpdateRequest = struct {
     id: i64,
+    window_id: i64,
     update: WindowSurfaceUpdate,
 
-    pub fn deinit(self: WindowSurfaceUpdateRequest, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: WindowUpdateRequest, gpa: std.mem.Allocator) void {
         if (self.update.title) |title| gpa.free(title);
         if (self.update.app_id) |app_id| gpa.free(app_id);
     }
+};
+
+pub const LayerUpdateRequest = struct {
+    id: i64,
+    window_id: i64,
+    update: LayerSurfaceUpdate,
+};
+
+pub const ExitRequest = struct {
+    id: i64,
+    code: i64,
 };
 
 pub const Role = union(enum) {
@@ -170,80 +189,47 @@ pub fn parseRequest(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Reques
     const id = requiredInt(root, "id") catch return error.InvalidSurfaceField;
     const method = requiredString(root, "method") catch return error.MissingRequiredSurfaceField;
 
-    if (std.mem.eql(u8, method, init_method)) {
+    if (std.mem.eql(u8, method, open_window_method)) {
         const role_value = root.get("role") orelse return error.MissingRequiredSurfaceField;
         const role_object = object(role_value) orelse return error.InvalidSurfaceField;
-        return .{ .init = .{ .id = id, .role = try parseRole(gpa, role_object) } };
+        const parent = (optionalInt(root, "parent") catch return error.InvalidSurfaceField);
+        return .{ .open_window = .{ .id = id, .role = try parseRole(gpa, role_object), .parent = parent } };
+    }
+
+    if (std.mem.eql(u8, method, close_window_method)) {
+        const window_id = requiredInt(root, "windowId") catch return error.MissingRequiredSurfaceField;
+        return .{ .close_window = .{ .id = id, .window_id = window_id } };
     }
 
     if (std.mem.eql(u8, method, update_layer_method)) {
+        const window_id = requiredInt(root, "windowId") catch return error.MissingRequiredSurfaceField;
         const update_value = root.get("update") orelse return error.MissingRequiredSurfaceField;
         const update_object = object(update_value) orelse return error.InvalidSurfaceField;
-        return .{ .update_layer = .{ .id = id, .update = try parseLayerSurfaceUpdate(update_object) } };
+        return .{ .update_layer = .{ .id = id, .window_id = window_id, .update = try parseLayerSurfaceUpdate(update_object) } };
     }
 
     if (std.mem.eql(u8, method, update_window_method)) {
+        const window_id = requiredInt(root, "windowId") catch return error.MissingRequiredSurfaceField;
         const update_value = root.get("update") orelse return error.MissingRequiredSurfaceField;
         const update_object = object(update_value) orelse return error.InvalidSurfaceField;
-        return .{ .update_window = .{ .id = id, .update = try parseWindowSurfaceUpdate(gpa, update_object) } };
+        return .{ .update_window = .{ .id = id, .window_id = window_id, .update = try parseWindowSurfaceUpdate(gpa, update_object) } };
     }
 
-    if (std.mem.eql(u8, method, spawn_window_method)) {
-        const entrypoint_value = root.get("entrypoint") orelse return error.MissingRequiredSurfaceField;
-        const entrypoint = switch (entrypoint_value) {
-            .string => |string| string,
-            else => return error.InvalidSurfaceField,
-        };
-
-        var args: [][]const u8 = try gpa.alloc([]const u8, 0);
-        errdefer gpa.free(args);
-        if (root.get("args")) |args_value| {
-            const array = switch (args_value) {
-                .array => |array| array,
-                else => return error.InvalidSurfaceField,
-            };
-            args = try gpa.alloc([]const u8, array.items.len);
-            for (array.items, 0..) |item, i| {
-                args[i] = switch (item) {
-                    .string => |string| try gpa.dupe(u8, string),
-                    else => return error.InvalidSurfaceField,
-                };
-            }
-        }
-
-        return .{ .spawn_window = .{
-            .id = id,
-            .entrypoint = try gpa.dupe(u8, entrypoint),
-            .args = args,
-        } };
+    if (std.mem.eql(u8, method, exit_method)) {
+        const code = (optionalInt(root, "code") catch return error.InvalidSurfaceField) orelse 0;
+        return .{ .exit = .{ .id = id, .code = code } };
     }
 
     return error.UnsupportedSurfaceMethod;
 }
 
-/// 打开新窗口的请求: 以指定 Dart entrypoint + argv 创建新 engine + 新窗口。
-pub const SpawnRequest = struct {
-    id: i64,
-    entrypoint: []u8,
-    args: [][]const u8,
-
-    pub fn deinit(self: SpawnRequest, gpa: std.mem.Allocator) void {
-        gpa.free(self.entrypoint);
-        for (self.args) |arg| gpa.free(arg);
-        gpa.free(self.args);
-    }
-};
-
-pub fn parseInitRequest(gpa: std.mem.Allocator, bytes: []const u8) ParseError!InitRequest {
-    const request = try parseRequest(gpa, bytes);
-    return switch (request) {
-        .init => |init_request| init_request,
-        .update_layer, .update_window => error.UnsupportedSurfaceMethod,
-    };
-}
-
 pub fn successResponse(gpa: std.mem.Allocator, id: i64) ![]u8 {
     return try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"ok\":true}}", .{id});
+}
+
+/// window.open 成功响应: 带窗口 id (= Flutter view_id)。
+pub fn openSuccessResponse(gpa: std.mem.Allocator, id: i64, window_id: i64) ![]u8 {
+    return try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"ok\":true,\"windowId\":{d}}}", .{ id, window_id });
 }
 
 pub fn errorResponse(gpa: std.mem.Allocator, id: ?i64, code: []const u8, message: []const u8) ![]u8 {
@@ -434,48 +420,57 @@ fn object(value: std.json.Value) ?std.json.ObjectMap {
     };
 }
 
-test "parse window init request" {
+test "parse window open request" {
     const json =
-        \\{"id":1,"method":"surface.init","role":{"kind":"window","title":"Smoke","appId":"dev.fushell.smoke","width":800,"height":600}}
+        \\{"id":1,"method":"window.open","role":{"kind":"window","title":"Smoke","appId":"dev.fushell.smoke","width":800,"height":600}}
     ;
-    const request = try parseInitRequest(std.testing.gpa, json);
+    const request = try parseRequest(std.testing.gpa, json);
     defer request.deinit(std.testing.gpa);
-    try std.testing.expectEqual(@as(i64, 1), request.id);
-    try std.testing.expectEqualStrings("Smoke", request.role.window.title);
-    try std.testing.expectEqual(@as(?i32, 800), request.role.window.width);
+    try std.testing.expectEqual(@as(i64, 1), request.id());
+    try std.testing.expectEqualStrings("Smoke", request.open_window.role.window.title);
+    try std.testing.expectEqual(@as(?i32, 800), request.open_window.role.window.width);
+    try std.testing.expectEqual(@as(?i64, null), request.open_window.parent);
 }
 
-test "parse layer init request" {
+test "parse window open with parent" {
     const json =
-        \\{"id":2,"method":"surface.init","role":{"kind":"layer","namespace":"panel","layer":"top","anchors":["top","left","right"],"margins":{"top":1,"right":2,"bottom":3,"left":4},"exclusiveZone":32,"keyboardInteractivity":"onDemand"}}
+        \\{"id":2,"method":"window.open","parent":7,"role":{"kind":"window","title":"Child","appId":"dev.fushell.child"}}
     ;
-    const request = try parseInitRequest(std.testing.gpa, json);
+    const request = try parseRequest(std.testing.gpa, json);
     defer request.deinit(std.testing.gpa);
-    try std.testing.expectEqual(@as(i64, 2), request.id);
-    try std.testing.expectEqual(.top, request.role.layer.layer);
-    try std.testing.expect(request.role.layer.anchors.top);
-    try std.testing.expect(!request.role.layer.anchors.bottom);
-    try std.testing.expectEqual(@as(i32, 32), request.role.layer.exclusive_zone);
-    try std.testing.expectEqual(.on_demand, request.role.layer.keyboard_interactivity);
+    try std.testing.expectEqual(@as(?i64, 7), request.open_window.parent);
 }
 
-test "parse layer init request allows compositor-sized zero width" {
+test "parse layer open request" {
     const json =
-        \\{"id":3,"method":"surface.init","role":{"kind":"layer","namespace":"bar","layer":"top","anchors":["top","left","right"],"width":0,"height":36}}
+        \\{"id":3,"method":"window.open","role":{"kind":"layer","namespace":"panel","layer":"top","anchors":["top","left","right"],"margins":{"top":1,"right":2,"bottom":3,"left":4},"exclusiveZone":32,"keyboardInteractivity":"onDemand"}}
     ;
-    const request = try parseInitRequest(std.testing.gpa, json);
+    const request = try parseRequest(std.testing.gpa, json);
     defer request.deinit(std.testing.gpa);
-    try std.testing.expectEqual(@as(?i32, 0), request.role.layer.width);
-    try std.testing.expectEqual(@as(?i32, 36), request.role.layer.height);
+    try std.testing.expectEqual(@as(i64, 3), request.id());
+    try std.testing.expectEqual(.top, request.open_window.role.layer.layer);
+    try std.testing.expect(request.open_window.role.layer.anchors.top);
+    try std.testing.expect(!request.open_window.role.layer.anchors.bottom);
+    try std.testing.expectEqual(@as(i32, 32), request.open_window.role.layer.exclusive_zone);
+    try std.testing.expectEqual(.on_demand, request.open_window.role.layer.keyboard_interactivity);
+}
+
+test "parse close window request" {
+    const json =
+        \\{"id":4,"method":"window.close","windowId":9}
+    ;
+    const request = try parseRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
+    try std.testing.expectEqual(@as(i64, 9), request.close_window.window_id);
 }
 
 test "parse layer update request" {
     const json =
-        \\{"id":4,"method":"surface.updateLayer","update":{"width":0,"height":32,"anchors":["top","left","right"],"margins":{"top":0,"right":1,"bottom":2,"left":3},"exclusiveZone":32,"keyboardInteractivity":"none"}}
+        \\{"id":5,"method":"layer.update","windowId":3,"update":{"width":0,"height":32,"anchors":["top","left","right"],"margins":{"top":0,"right":1,"bottom":2,"left":3},"exclusiveZone":32,"keyboardInteractivity":"none"}}
     ;
     const request = try parseRequest(std.testing.gpa, json);
     defer request.deinit(std.testing.gpa);
-    try std.testing.expectEqual(@as(i64, 4), request.id());
+    try std.testing.expectEqual(@as(i64, 3), request.update_layer.window_id);
     try std.testing.expectEqual(@as(?i32, 0), request.update_layer.update.width);
     try std.testing.expectEqual(@as(?i32, 32), request.update_layer.update.height);
     try std.testing.expect(request.update_layer.update.anchors.?.top);
@@ -485,46 +480,55 @@ test "parse layer update request" {
 
 test "parse window update request" {
     const json =
-        \\{"id":5,"method":"surface.updateWindow","update":{"title":"New title","appId":"dev.fushell.new"}}
+        \\{"id":6,"method":"window.update","windowId":2,"update":{"title":"New title","appId":"dev.fushell.new"}}
     ;
     const request = try parseRequest(std.testing.gpa, json);
     defer request.deinit(std.testing.gpa);
-    try std.testing.expectEqual(@as(i64, 5), request.id());
+    try std.testing.expectEqual(@as(i64, 2), request.update_window.window_id);
     try std.testing.expectEqualStrings("New title", request.update_window.update.title.?);
     try std.testing.expectEqualStrings("dev.fushell.new", request.update_window.update.app_id.?);
 }
 
 test "parse empty update requests" {
     const layer_json =
-        \\{"id":6,"method":"surface.updateLayer","update":{}}
+        \\{"id":7,"method":"layer.update","windowId":1,"update":{}}
     ;
     const layer_request = try parseRequest(std.testing.gpa, layer_json);
     defer layer_request.deinit(std.testing.gpa);
     try std.testing.expect(layer_request.update_layer.update.isEmpty());
 
     const window_json =
-        \\{"id":7,"method":"surface.updateWindow","update":{}}
+        \\{"id":8,"method":"window.update","windowId":1,"update":{}}
     ;
     const window_request = try parseRequest(std.testing.gpa, window_json);
     defer window_request.deinit(std.testing.gpa);
     try std.testing.expect(window_request.update_window.update.isEmpty());
 }
 
+test "parse exit request" {
+    const json =
+        \\{"id":9,"method":"process.exit","code":2}
+    ;
+    const request = try parseRequest(std.testing.gpa, json);
+    defer request.deinit(std.testing.gpa);
+    try std.testing.expectEqual(@as(i64, 2), request.exit.code);
+}
+
 test "reject invalid update values" {
     const negative_size =
-        \\{"id":8,"method":"surface.updateLayer","update":{"height":-1}}
+        \\{"id":10,"method":"layer.update","windowId":1,"update":{"height":-1}}
     ;
     try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.gpa, negative_size));
 
     const empty_anchors =
-        \\{"id":9,"method":"surface.updateLayer","update":{"anchors":[]}}
+        \\{"id":11,"method":"layer.update","windowId":1,"update":{"anchors":[]}}
     ;
     try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.gpa, empty_anchors));
 }
 
 test "reject unsupported method" {
     const json =
-        \\{"id":10,"method":"surface.nope","update":{}}
+        \\{"id":12,"method":"window.spawn","entrypoint":"settings"}
     ;
     try std.testing.expectError(error.UnsupportedSurfaceMethod, parseRequest(std.testing.gpa, json));
 }

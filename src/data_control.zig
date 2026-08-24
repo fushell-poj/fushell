@@ -184,7 +184,7 @@ pub const DataControl = struct {
         var waited_ms: u32 = 0;
         while (!ctx.done and waited_ms < 2000) {
             if (self.display.display) |d| {
-                if (self.display.primary_queue) |q| _ = d.dispatchQueuePending(q);
+                if (self.display.shared_queue) |q| _ = d.dispatchQueuePending(q);
             }
             const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
             _ = std.os.linux.nanosleep(&ts, null);

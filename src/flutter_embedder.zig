@@ -5,6 +5,9 @@ pub const Api = struct {
     handle: ?*anyopaque,
     run: EngineRunFn,
     shutdown: EngineShutdownFn,
+    add_view: AddViewFn,
+    remove_view: RemoveViewFn,
+    send_view_focus: SendViewFocusFn,
     send_window_metrics: SendWindowMetricsFn,
     send_pointer_event: SendPointerEventFn,
     send_platform_message: SendPlatformMessageFn,
@@ -19,6 +22,9 @@ pub const Api = struct {
 
     const EngineRunFn = *const fn (usize, *const c.FlutterRendererConfig, *const c.FlutterProjectArgs, ?*anyopaque, *c.FlutterEngine) callconv(.c) c.FlutterEngineResult;
     const EngineShutdownFn = *const fn (c.FlutterEngine) callconv(.c) c.FlutterEngineResult;
+    const AddViewFn = *const fn (c.FlutterEngine, *const c.FlutterAddViewInfo) callconv(.c) c.FlutterEngineResult;
+    const RemoveViewFn = *const fn (c.FlutterEngine, *const c.FlutterRemoveViewInfo) callconv(.c) c.FlutterEngineResult;
+    const SendViewFocusFn = *const fn (c.FlutterEngine, *const c.FlutterViewFocusEvent) callconv(.c) c.FlutterEngineResult;
     const SendWindowMetricsFn = *const fn (c.FlutterEngine, *const c.FlutterWindowMetricsEvent) callconv(.c) c.FlutterEngineResult;
     const SendPointerEventFn = *const fn (c.FlutterEngine, *const c.FlutterPointerEvent, usize) callconv(.c) c.FlutterEngineResult;
     const SendPlatformMessageFn = *const fn (c.FlutterEngine, *const c.FlutterPlatformMessage) callconv(.c) c.FlutterEngineResult;
@@ -47,6 +53,9 @@ pub const Api = struct {
             .handle = handle,
             .run = try loadSymbol(EngineRunFn, handle, "FlutterEngineRun"),
             .shutdown = try loadSymbol(EngineShutdownFn, handle, "FlutterEngineShutdown"),
+            .add_view = try loadSymbol(AddViewFn, handle, "FlutterEngineAddView"),
+            .remove_view = try loadSymbol(RemoveViewFn, handle, "FlutterEngineRemoveView"),
+            .send_view_focus = try loadSymbol(SendViewFocusFn, handle, "FlutterEngineSendViewFocusEvent"),
             .send_window_metrics = try loadSymbol(SendWindowMetricsFn, handle, "FlutterEngineSendWindowMetricsEvent"),
             .send_pointer_event = try loadSymbol(SendPointerEventFn, handle, "FlutterEngineSendPointerEvent"),
             .send_platform_message = try loadSymbol(SendPlatformMessageFn, handle, "FlutterEngineSendPlatformMessage"),

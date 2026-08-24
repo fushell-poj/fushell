@@ -45,6 +45,10 @@ pub const DisplayState = struct {
     viewporter: ?*wp.Viewporter = null,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
     seat: ?*wl.Seat = null,
+    /// seat 通告的输入能力 (capabilities 事件)。无能力时不 get_pointer/get_keyboard
+    /// — 无头 compositor (cage + 无输入设备) 下 seat 无 pointer/keyboard,
+    /// 无条件调用会触发协议错误 (wl_seat.get_pointer called when no pointer capability)。
+    seat_capabilities: wl.Seat.Capability = .{},
     pointer: ?*wl.Pointer = null,
     keyboard: ?*wl.Keyboard = null,
     data_control: ?*data_control.DataControl = null,
@@ -59,9 +63,9 @@ pub const DisplayState = struct {
     gles_library: ?std.DynLib = null,
 
     ref_count: usize = 0,
-    /// 主窗口的 event queue — 全局对象 (registry/output/seat/pointer) 绑定它,
-    /// 由主窗口线程 dispatch。spawn 窗口只 dispatch 自己的 queue。
-    primary_queue: ?*wl.EventQueue = null,
+    /// 进程级单一 event queue — 全部对象 (全局 + 所有窗口 surface/xdg) 绑定它,
+    /// 由主线程单一事件循环 dispatch (单线程模型, 无 per-window queue)。
+    shared_queue: ?*wl.EventQueue = null,
     /// 连接级 flush 互斥 (多个窗口线程共享同一连接写)。
     flush_mutex: std.atomic.Mutex = .unlocked,
 
@@ -151,8 +155,8 @@ pub const DisplayState = struct {
         if (self.viewporter) |viewporter| viewporter.destroy();
         if (self.wm_base) |wm_base| wm_base.destroy();
         if (self.registry) |registry| registry.destroy();
-        if (self.primary_queue) |queue| queue.destroy();
-        self.primary_queue = null;
+        if (self.shared_queue) |queue| queue.destroy();
+        self.shared_queue = null;
         if (self.display) |display| display.disconnect();
         self.display = null;
         self.compositor = null;
@@ -164,12 +168,15 @@ pub const DisplayState = struct {
         self.pointer = null;
     }
 
-    // ── 主窗口 attach: 绑定全局对象到主 queue + 输入 ────
+    // ── 进程级初始化: 单一 queue 绑定全部对象 + 输入 ──────
 
-    /// 主窗口调用: 创建主 queue, 把全局对象 (registry/output/seat/pointer)
-    /// 绑定到主 queue, 并获取 seat/pointer。spawn 窗口不要调用。
-    pub fn attachPrimary(self: *DisplayState, queue: *wl.EventQueue) !void {
-        self.primary_queue = queue;
+    /// 启动时调用一次: 创建进程级单一 event queue, 把全局对象
+    /// (registry/output/seat/pointer) 与后续所有窗口对象都绑到它,
+    /// 并获取 seat 的 pointer/keyboard (按能力)。
+    pub fn bindGlobals(self: *DisplayState) !void {
+        if (self.shared_queue != null) return; // 幂等
+        const queue = try self.display.?.createQueue();
+        self.shared_queue = queue;
         // 全部全局对象绑主 queue: 主线程 dispatch 主 queue 时统一处理。
         // 漏掉任何一个 (如 wm_base) → 其事件 (ping) 留在 default queue 无人处理
         // → compositor 报窗口未响应。
@@ -194,23 +201,25 @@ pub const DisplayState = struct {
     fn ensurePointer(self: *DisplayState) void {
         const seat = self.seat orelse return;
         if (self.pointer != null) return;
+        if (!self.seat_capabilities.pointer) return; // 无头 compositor: seat 无 pointer 能力
         self.pointer = seat.getPointer() catch {
             std.debug.print("wl_seat.get_pointer failed.\n", .{});
             return;
         };
         self.pointer.?.setListener(*DisplayState, pointerListener, self);
-        if (self.primary_queue) |queue| self.pointer.?.setQueue(queue);
+        if (self.shared_queue) |queue| self.pointer.?.setQueue(queue);
     }
 
     fn ensureKeyboard(self: *DisplayState) void {
         const seat = self.seat orelse return;
         if (self.keyboard != null) return;
+        if (!self.seat_capabilities.keyboard) return; // 无头 compositor: seat 无 keyboard 能力
         self.keyboard = seat.getKeyboard() catch {
             std.debug.print("wl_seat.get_keyboard failed.\n", .{});
             return;
         };
         self.keyboard.?.setListener(*DisplayState, keyboardListener, self);
-        if (self.primary_queue) |queue| self.keyboard.?.setQueue(queue);
+        if (self.shared_queue) |queue| self.keyboard.?.setQueue(queue);
     }
 
     // ── 输出 / scale ──────────────────────────────────
@@ -358,12 +367,18 @@ fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, self: *DisplayS
     }
 }
 
-fn seatListener(_: *wl.Seat, event: wl.Seat.Event, _: *DisplayState) void {
+fn seatListener(_: *wl.Seat, event: wl.Seat.Event, self: *DisplayState) void {
     switch (event) {
-        // pointer/keyboard 的绑定延迟到 attachPrimary (此时 primary_queue 已就绪)。
-        // 过早绑定 (capabilities 事件) 会把 keymap 等事件排进 default queue,
-        // setQueue 之后不会转移 → keymap 永久丢失 → xkb 无法翻译按键。
-        .capabilities => {},
+        .capabilities => |caps| {
+            self.seat_capabilities = caps.capabilities;
+            // 热插拔: 能力晚于 bindGlobals 出现时补绑 (仅当主 queue 已就绪)。
+            // 过早绑定会把 keymap 等事件排进 default queue, setQueue 后不转移 →
+            // keymap 永久丢失 → xkb 无法翻译按键。
+            if (self.shared_queue != null) {
+                self.ensurePointer();
+                self.ensureKeyboard();
+            }
+        },
         .name => {},
     }
 }

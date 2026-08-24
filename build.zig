@@ -115,7 +115,9 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwlr_data_control_manager_v1", 2);
     scanner.generate("zwp_text_input_manager_v3", 2);
     // xdg_surface/xdg_toplevel are created from xdg_wm_base, not globals.
-    scanner.generate("xdg_wm_base", 6);
+    // 版本 5: 兼容 wlroots 系 compositor (cage 等最高支持 5); v6 仅新增
+    // popup repositioning, fushell 不需要 (实测 hyprland 支持 v6, cage 报 invalid version)。
+    scanner.generate("xdg_wm_base", 5);
     const wayland_mod = b.createModule(.{
         .root_source_file = scanner.result,
         .target = target,

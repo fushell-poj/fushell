@@ -5,49 +5,115 @@ import 'dart:ui' as ui;
 
 const String _surfaceChannel = 'dev.fushell/surface';
 
-/// Initializes and updates fushell's Wayland surface role.
+/// 窗口管理: fushell 以无头引擎启动 (无隐式窗口), 窗口全部由 Dart 通过
+/// [FushellWindow.openWindow] 创建。每个窗口对应一个 Flutter view
+/// (`PlatformDispatcher.views` 中的 `FlutterView`, viewId = 窗口 id),
+/// 窗口内容用框架的 `View` widget 渲染到对应 view:
 ///
-/// Call [FushellSurface.init] exactly once before `runApp()`. The surface role
-/// is immutable after initialization; fushell will reject repeated calls or
-/// attempts to switch roles.
-final class FushellSurface {
-  FushellSurface._();
+/// ```dart
+/// final id = await FushellWindow.openWindow(title: 'Main', appId: '...');
+/// final view = await FushellWindow.viewById(id);
+/// runApp(ViewCollection(views: [View(view: view, child: const MainApp())]));
+/// ```
+///
+/// 关闭全部窗口不会退出进程; 退出用 [FushellProcess.exit]。
+final class FushellWindow {
+  FushellWindow._();
 
   static int _nextRequestId = 1;
 
-  static Future<void> init(SurfaceRole role) async {
+  /// 创建新窗口, 返回窗口 id (= Flutter view_id)。
+  ///
+  /// [parent] 指定父窗口 id: 子窗口经 xdg `set_parent` 绑定到父窗口
+  /// (transient 语义: 子窗口堆叠于父窗口之上; 父窗口关闭时 compositor 自动
+  /// 解除绑定, 不级联关闭子窗口)。
+  ///
+  /// [layer] 提供时创建 layer-shell 角色窗口 (参数同旧 LayerSurfaceRole,
+  /// 与 xdg 窗口互斥; title/appId 被忽略)。
+  static Future<int> openWindow({
+    required String title,
+    required String appId,
+    int? width,
+    int? height,
+    int? parent,
+    LayerSurfaceRole? layer,
+  }) async {
+    final Map<String, Object?> role = layer == null
+        ? <String, Object?>{
+            'kind': 'window',
+            'title': title,
+            'appId': appId,
+            if (width != null) 'width': width,
+            if (height != null) 'height': height,
+          }
+        : layer.toJson();
+    final Map<String, Object?> response = await _sendRequest(<String, Object?>{
+      'method': 'window.open',
+      'role': role,
+      if (parent != null) 'parent': parent,
+    });
+    final Object? windowId = response['windowId'];
+    if (windowId is! int) {
+      throw const FushellSurfaceException(
+        code: 'InvalidResponse',
+        message: 'window.open response is missing windowId',
+      );
+    }
+    return windowId;
+  }
+
+  /// 关闭窗口 (引擎移除对应 view 后销毁其 Wayland surface)。
+  static Future<void> closeWindow(int windowId) async {
     await _sendRequest(<String, Object?>{
-      'method': 'surface.init',
-      'role': role.toJson(),
+      'method': 'window.close',
+      'windowId': windowId,
     });
   }
 
-  /// Updates mutable properties of the initialized layer-shell role.
-  ///
-  /// This does not change the Wayland role. It only applies properties that are
-  /// mutable on an existing layer surface, such as size, anchors, margins,
-  /// exclusive zone, and keyboard interactivity. Calling this before a layer
-  /// role is initialized, or when the active role is a window, throws a
-  /// [FushellSurfaceException].
-  static Future<void> updateLayer(LayerSurfaceUpdate update) async {
+  /// 更新窗口的 mutable 属性 (title / appId)。
+  static Future<void> updateWindow(
+    int windowId,
+    WindowSurfaceUpdate update,
+  ) async {
     await _sendRequest(<String, Object?>{
-      'method': 'surface.updateLayer',
+      'method': 'window.update',
+      'windowId': windowId,
       'update': update.toJson(),
     });
   }
 
-  /// Updates mutable properties of the initialized xdg toplevel role.
-  ///
-  /// This does not change the Wayland role. It only applies metadata that can be
-  /// changed on the existing window role, currently title and app id.
-  static Future<void> updateWindow(WindowSurfaceUpdate update) async {
+  /// 更新 layer 角色窗口的 mutable 属性。
+  static Future<void> updateLayer(
+    int windowId,
+    LayerSurfaceUpdate update,
+  ) async {
     await _sendRequest(<String, Object?>{
-      'method': 'surface.updateWindow',
+      'method': 'layer.update',
+      'windowId': windowId,
       'update': update.toJson(),
     });
   }
 
-  static Future<void> _sendRequest(Map<String, Object?> request) async {
+  /// 在 `PlatformDispatcher.views` 中查找窗口 id 对应的 FlutterView。
+  ///
+  /// openWindow 回复时 view 已在引擎注册, 但通知 Dart 侧 `PlatformDispatcher`
+  /// 的通道消息可能还在队列中; 此方法会等待 view 出现 (最多 ~1s)。
+  static Future<ui.FlutterView> viewById(int windowId) async {
+    for (var attempt = 0; attempt < 100; attempt++) {
+      for (final ui.FlutterView view in ui.PlatformDispatcher.instance.views) {
+        if (view.viewId == windowId) return view;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    throw FushellSurfaceException(
+      code: 'ViewNotFound',
+      message: 'view $windowId did not appear in PlatformDispatcher.views',
+    );
+  }
+
+  static Future<Map<String, Object?>> _sendRequest(
+    Map<String, Object?> request,
+  ) async {
     final int requestId = _nextRequestId++;
     final Map<String, Object?> requestWithId = <String, Object?>{
       'id': requestId,
@@ -85,7 +151,7 @@ final class FushellSurface {
     }
 
     final Object? ok = decoded['ok'];
-    if (ok == true) return;
+    if (ok == true) return decoded;
 
     final Object? error = decoded['error'];
     if (error is Map<String, Object?>) {
@@ -103,82 +169,30 @@ final class FushellSurface {
   }
 }
 
-/// Opens additional fushell windows.
-///
-/// Each window runs its own Flutter engine instance inside the same fushell
-/// process (sharing the Dart VM). The window runs the Dart entrypoint named by
-/// [entrypoint] from the same bundle.
-final class FushellWindow {
-  FushellWindow._();
+/// 进程控制: 无头 shell 的退出方式。
+final class FushellProcess {
+  FushellProcess._();
 
-  /// Opens a new window running the Dart entrypoint [entrypoint].
-  ///
-  /// [args] are passed to the new window's isolate and are available there via
-  /// `PlatformDispatcher.instance.args`.
-  ///
-  /// The entrypoint must be a top-level Dart function that survives AOT tree
-  /// shaking: reference it from `main` (for example `settings;`), otherwise the
-  /// release snapshot will not contain it and the window fails to start.
-  static Future<void> openWindow({
-    required String entrypoint,
-    List<String> args = const <String>[],
-  }) async {
-    await FushellSurface._sendRequest(<String, Object?>{
-      'method': 'window.spawn',
-      'entrypoint': entrypoint,
-      'args': args,
+  /// 显式退出进程: 宿主按序关闭引擎、销毁全部剩余窗口、断开 Wayland 连接,
+  /// 以 [code] 退出。
+  static Future<void> exit([int code = 0]) async {
+    final int requestId = FushellWindow._nextRequestId++;
+    final ByteData message = _encodeJson(<String, Object?>{
+      'id': requestId,
+      'method': 'process.exit',
+      'code': code,
     });
+    // 进程即将退出, 响应可能收不到 — 不等待。
+    ui.PlatformDispatcher.instance.sendPlatformMessage(
+      _surfaceChannel,
+      message,
+      (_) {},
+    );
   }
 }
 
-sealed class SurfaceRole {
-  const SurfaceRole();
-
-  const factory SurfaceRole.window({
-    required String title,
-    required String appId,
-    int? width,
-    int? height,
-  }) = WindowSurfaceRole;
-
-  const factory SurfaceRole.layer({
-    required String namespace,
-    required LayerSurfaceLayer layer,
-    required Set<LayerSurfaceAnchor> anchors,
-    Margins margins,
-    int exclusiveZone,
-    LayerKeyboardInteractivity keyboardInteractivity,
-    int? width,
-    int? height,
-  }) = LayerSurfaceRole;
-
-  Map<String, Object?> toJson();
-}
-
-final class WindowSurfaceRole extends SurfaceRole {
-  const WindowSurfaceRole({
-    required this.title,
-    required this.appId,
-    this.width,
-    this.height,
-  });
-
-  final String title;
-  final String appId;
-  final int? width;
-  final int? height;
-
-  @override
-  Map<String, Object?> toJson() => <String, Object?>{
-    'kind': 'window',
-    'title': title,
-    'appId': appId,
-    if (width != null) 'width': width,
-    if (height != null) 'height': height,
-  };
-}
-
-final class LayerSurfaceRole extends SurfaceRole {
+/// layer-shell 角色参数 (window.open 的 layer 参数)。
+final class LayerSurfaceRole {
   const LayerSurfaceRole({
     required this.namespace,
     required this.layer,
@@ -199,7 +213,6 @@ final class LayerSurfaceRole extends SurfaceRole {
   final int? width;
   final int? height;
 
-  @override
   Map<String, Object?> toJson() => <String, Object?>{
     'kind': 'layer',
     'namespace': namespace,
@@ -213,10 +226,7 @@ final class LayerSurfaceRole extends SurfaceRole {
   };
 }
 
-/// Mutable layer-shell properties that can be changed after initialization.
-///
-/// All fields are optional. Passing an empty update is valid and is treated as a
-/// no-op by fushell.
+/// layer 窗口的 mutable 属性更新。
 final class LayerSurfaceUpdate {
   const LayerSurfaceUpdate({
     this.width,
@@ -227,22 +237,11 @@ final class LayerSurfaceUpdate {
     this.keyboardInteractivity,
   });
 
-  /// New layer width. `0` asks the compositor to derive width from anchors.
   final int? width;
-
-  /// New layer height. `0` asks the compositor to derive height from anchors.
   final int? height;
-
-  /// New anchor set. When provided, it must not be empty.
   final Set<LayerSurfaceAnchor>? anchors;
-
-  /// New layer margins.
   final Margins? margins;
-
-  /// New exclusive zone. `-1` keeps layer-shell's compositor-defined behavior.
   final int? exclusiveZone;
-
-  /// New keyboard interactivity policy.
   final LayerKeyboardInteractivity? keyboardInteractivity;
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -256,10 +255,7 @@ final class LayerSurfaceUpdate {
   };
 }
 
-/// Mutable xdg toplevel metadata that can be changed after initialization.
-///
-/// All fields are optional. Passing an empty update is valid and is treated as a
-/// no-op by fushell.
+/// xdg 窗口的 mutable 属性更新。
 final class WindowSurfaceUpdate {
   const WindowSurfaceUpdate({this.title, this.appId});
 

@@ -61,16 +61,94 @@ const OutputState = struct {
     entered: bool = false,
 };
 
-/// 主窗口 Host (scale 回调目标; attach 时设置)。
-var primary_host: ?*Host = null;
+/// 进程级单一 EGL render context: raster 渲染 (bootstrap pbuffer) 与全部
+/// 窗口的呈现共用 (compositor 路径下两者同在引擎 raster 线程, 无跨线程
+/// EGL 绑定冲突)。backing store 纹理也创建于此 context。
+pub const RenderContext = struct {
+    display_state: *display_state.DisplayState = undefined,
+    egl_config: c.EGLConfig = null,
+    egl_context: c.EGLContext = null,
+    bootstrap_surface: c.EGLSurface = null,
+
+    pub fn init(self: *RenderContext, state: *display_state.DisplayState) !void {
+        self.display_state = state;
+        std.debug.assert(state.egl_display != null);
+        if (c.eglBindAPI(c.EGL_OPENGL_ES_API) != c.EGL_TRUE) return eglError("eglBindAPI");
+
+        const config_attribs = [_]c.EGLint{
+            c.EGL_SURFACE_TYPE,    c.EGL_WINDOW_BIT | c.EGL_PBUFFER_BIT,
+            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_ES2_BIT,
+            c.EGL_RED_SIZE,        8,
+            c.EGL_GREEN_SIZE,      8,
+            c.EGL_BLUE_SIZE,       8,
+            c.EGL_ALPHA_SIZE,      8,
+            c.EGL_NONE,
+        };
+        var config_count: c.EGLint = 0;
+        if (c.eglChooseConfig(state.egl_display, &config_attribs, &self.egl_config, 1, &config_count) != c.EGL_TRUE or config_count == 0) {
+            return eglError("eglChooseConfig");
+        }
+
+        const context_attribs = [_]c.EGLint{
+            c.EGL_CONTEXT_CLIENT_VERSION, 2,
+            c.EGL_NONE,
+        };
+        self.egl_context = c.eglCreateContext(state.egl_display, self.egl_config, c.EGL_NO_CONTEXT, &context_attribs);
+        if (self.egl_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext");
+
+        const pbuffer_attribs = [_]c.EGLint{
+            c.EGL_WIDTH,  1,
+            c.EGL_HEIGHT, 1,
+            c.EGL_NONE,
+        };
+        self.bootstrap_surface = c.eglCreatePbufferSurface(state.egl_display, self.egl_config, &pbuffer_attribs);
+        if (self.bootstrap_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(bootstrap)");
+
+        state.openGlesLibrary();
+        try self.makeCurrent();
+        try self.clearCurrent();
+    }
+
+    pub fn deinit(self: *RenderContext) void {
+        if (self.display_state.egl_display != null and self.display_state.egl_display != c.EGL_NO_DISPLAY) {
+            if (self.bootstrap_surface != null and self.bootstrap_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.bootstrap_surface);
+            if (self.egl_context != null and self.egl_context != c.EGL_NO_CONTEXT) _ = c.eglDestroyContext(self.display_state.egl_display, self.egl_context);
+        }
+        self.* = .{};
+    }
+
+    /// raster 渲染目标: bootstrap pbuffer。
+    pub fn makeCurrent(self: *RenderContext) !void {
+        if (c.eglMakeCurrent(self.display_state.egl_display, self.bootstrap_surface, self.bootstrap_surface, self.egl_context) != c.EGL_TRUE) {
+            return eglError("eglMakeCurrent");
+        }
+    }
+
+    pub fn clearCurrent(self: *RenderContext) !void {
+        if (c.eglMakeCurrent(self.display_state.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT) != c.EGL_TRUE) {
+            return eglError("eglMakeCurrent(clear)");
+        }
+    }
+
+    /// 呈现目标: 某窗口的 EGL surface (同 context, 换 surface)。
+    pub fn makeSurfaceCurrent(self: *RenderContext, surface: c.EGLSurface) !void {
+        if (surface == null or surface == c.EGL_NO_SURFACE) return error.EglFailed;
+        if (c.eglMakeCurrent(self.display_state.egl_display, surface, surface, self.egl_context) != c.EGL_TRUE) {
+            return eglError("eglMakeCurrent(window)");
+        }
+    }
+
+    pub fn swapBuffers(self: *RenderContext, surface: c.EGLSurface) !void {
+        if (c.eglSwapBuffers(self.display_state.egl_display, surface) != c.EGL_TRUE) return eglError("eglSwapBuffers");
+    }
+};
 
 pub const Host = struct {
     /// 进程级共享连接 (wl_display + EGL display + 全局对象)。
     display_state: *display_state.DisplayState = undefined,
-    /// 本窗口的事件 queue: 窗口对象 (surface/xdg/toplevel) 绑定它。
+    /// 进程级单一 event queue (引用, 不拥有): 窗口对象 (surface/xdg/toplevel)
+    /// 与全局对象都绑它, 由主线程单一事件循环 dispatch。
     event_queue: ?*wl.EventQueue = null,
-    /// 主窗口: 全局对象 (registry/output/seat/pointer) 绑它的 queue。
-    is_primary: bool = false,
     state: State = .uninitialized,
     surface: ?*wl.Surface = null,
     xdg_surface: ?*xdg.Surface = null,
@@ -82,15 +160,18 @@ pub const Host = struct {
     egl_window_width: i32 = 0,
     egl_window_height: i32 = 0,
 
-    egl_config: c.EGLConfig = null,
-    egl_context: c.EGLContext = null,
+    /// 进程级共享 render context (config/context/bootstrap 都在其中);
+    /// 窗口只持有自己的 EGL surface。
+    render_context: *RenderContext = undefined,
     egl_surface: c.EGLSurface = null,
-    egl_bootstrap_surface: c.EGLSurface = null,
-    egl_resource_context: c.EGLContext = null,
-    egl_resource_surface: c.EGLSurface = null,
-
+    /// 本窗口的 Flutter view_id (0 = 非窗口/implicit)。
+    view_id: i64 = 0,
+    /// resize (主线程) 与 present (引擎线程) 互斥: resize 持锁, present 拿不到则跳帧。
+    present_mutex: std.atomic.Mutex = .unlocked,
     configured: bool = false,
-    running: bool = true,
+    /// Wayland compositor 请求关闭该窗口。平台线程下一次 tick 消费并提交
+    /// FlutterEngineRemoveView；不得在协议 listener 栈内直接销毁 Wayland 对象。
+    close_requested: bool = false,
     width: i32 = default_width,
     height: i32 = default_height,
     pending_width: i32 = 0,
@@ -108,27 +189,19 @@ pub const Host = struct {
     pointer_callback: ?PointerCallback = null,
     pointer_context: ?*anyopaque = null,
 
-    /// 绑定到共享 DisplayState (acquire + 创建本窗口 event queue)。
-    /// is_primary=true 的主窗口额外把全局对象绑到自己的 queue 并初始化输入。
-    pub fn attach(self: *Host, state: *display_state.DisplayState, is_primary: bool) !void {
+    /// 绑定到共享 DisplayState: acquire + 引用进程级单一 event queue
+    /// (shared_queue, 由 run() 启动时 bindGlobals 创建)。窗口对象后续
+    /// 都 bind 到这个共享 queue (单线程事件循环模型)。
+    /// attach 先于 bindGlobals/render_context.init (attach 触发连接建立),
+    /// 故 queue 引用在角色初始化前刷新, render_context 由 run() 注入。
+    pub fn attach(self: *Host, state: *display_state.DisplayState) !void {
         self.display_state = state;
-        self.is_primary = is_primary;
         _ = try state.acquire();
-        self.event_queue = state.display.?.createQueue() catch return error.WaylandQueueCreateFailed;
-        if (is_primary) {
-            try state.attachPrimary(self.event_queue.?);
-            primary_host = self;
-            // output scale 变化 → 主窗口重算 scale (共享 scale 状态)
-            display_state.scale_change_callback = struct {
-                fn cb() void {
-                    if (primary_host) |host| host.recomputeScale();
-                }
-            }.cb;
-        }
+        self.event_queue = state.shared_queue;
         self.adoptProvisionalScaleFromOutputs();
     }
 
-    pub fn initializeWindowRole(self: *Host, window: surface_channel.WindowRole) !void {
+    pub fn initializeWindowRole(self: *Host, window: surface_channel.WindowRole, parent_toplevel: ?*xdg.Toplevel) !void {
         try self.beginRoleInitialization();
         errdefer self.state = .failed;
 
@@ -143,6 +216,10 @@ pub const Host = struct {
         self.toplevel = self.xdg_surface.?.getToplevel() catch return error.XdgToplevelCreateFailed;
         self.toplevel.?.setQueue(self.event_queue.?);
         self.toplevel.?.setListener(*Host, xdgToplevelListener, self);
+
+        // 父子绑定: 首次 commit 前 set_parent (xdg transient 语义, 子堆叠父之上;
+        // 父销毁时 compositor 自动解除绑定)。
+        if (parent_toplevel) |parent| self.toplevel.?.setParent(parent);
 
         const title_z = try std.heap.c_allocator.dupeZ(u8, window.title);
         defer std.heap.c_allocator.free(title_z);
@@ -190,6 +267,11 @@ pub const Host = struct {
     pub fn updateLayerRole(self: *Host, update: surface_channel.LayerSurfaceUpdate) !bool {
         try self.requireReadyLayerRole();
         if (update.isEmpty()) return false;
+        // 布局变更时与 present 互斥 (同 resizeWindow)。
+        if (update.affectsLayout()) {
+            while (!self.present_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.present_mutex.unlock();
+        }
 
         const layer_surface = self.layer_surface.?;
         var layout_changed = false;
@@ -268,55 +350,13 @@ pub const Host = struct {
         }
     }
 
-    pub fn initEglBootstrap(self: *Host) !void {
-        // eglGetDisplay/Initialize 在 DisplayState.init 完成 (共享);
-        // context 也是共享的 (Mesa 驱动线程按 context 创建, 共享后不随窗口增长)。
-        std.debug.assert(self.display_state.egl_display != null);
-        if (c.eglBindAPI(c.EGL_OPENGL_ES_API) != c.EGL_TRUE) return eglError("eglBindAPI");
-
-        const config_attribs = [_]c.EGLint{
-            c.EGL_SURFACE_TYPE,    c.EGL_WINDOW_BIT | c.EGL_PBUFFER_BIT,
-            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_ES2_BIT,
-            c.EGL_RED_SIZE,        8,
-            c.EGL_GREEN_SIZE,      8,
-            c.EGL_BLUE_SIZE,       8,
-            c.EGL_ALPHA_SIZE,      8,
-            c.EGL_NONE,
-        };
-        var config_count: c.EGLint = 0;
-        if (c.eglChooseConfig(self.display_state.egl_display, &config_attribs, &self.egl_config, 1, &config_count) != c.EGL_TRUE or config_count == 0) {
-            return eglError("eglChooseConfig");
-        }
-
-        const context_attribs = [_]c.EGLint{
-            c.EGL_CONTEXT_CLIENT_VERSION, 2,
-            c.EGL_NONE,
-        };
-        self.egl_context = c.eglCreateContext(self.display_state.egl_display, self.egl_config, c.EGL_NO_CONTEXT, &context_attribs);
-        if (self.egl_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext");
-
-        const pbuffer_attribs = [_]c.EGLint{
-            c.EGL_WIDTH,  1,
-            c.EGL_HEIGHT, 1,
-            c.EGL_NONE,
-        };
-        self.egl_bootstrap_surface = c.eglCreatePbufferSurface(self.display_state.egl_display, self.egl_config, &pbuffer_attribs);
-        if (self.egl_bootstrap_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(bootstrap)");
-
-        self.display_state.openGlesLibrary();
-        try self.makeCurrent();
-        try self.clearCurrent();
-    }
-
     pub fn attachEglWindowSurface(self: *Host) !void {
-        try self.initEglBootstrap();
-
         self.egl_window_width = self.physicalWidthI32();
         self.egl_window_height = self.physicalHeightI32();
         self.egl_window = c.wl_egl_window_create(@ptrCast(self.surface.?), self.egl_window_width, self.egl_window_height);
         if (self.egl_window == null) return error.WlEglWindowCreateFailed;
 
-        self.egl_surface = c.eglCreateWindowSurface(self.display_state.egl_display, self.egl_config, @ptrCast(self.egl_window.?), null);
+        self.egl_surface = c.eglCreateWindowSurface(self.display_state.egl_display, self.render_context.egl_config, @ptrCast(self.egl_window.?), null);
         if (self.egl_surface == c.EGL_NO_SURFACE) {
             std.debug.print("eglCreateWindowSurface failed: display {*} window {d}x{d} error {x}\n", .{ self.display_state.egl_display, self.egl_window_width, self.egl_window_height, c.eglGetError() });
             return eglError("eglCreateWindowSurface");
@@ -333,6 +373,13 @@ pub const Host = struct {
         self.pointer_context = context;
     }
 
+    /// 消费一次 compositor close 请求。事件派发和消费都发生在平台线程。
+    pub fn takeCloseRequest(self: *Host) bool {
+        if (!self.close_requested) return false;
+        self.close_requested = false;
+        return true;
+    }
+
     pub fn metrics(self: *const Host) Metrics {
         return .{
             .width = @intCast(self.physicalWidthI32()),
@@ -341,42 +388,10 @@ pub const Host = struct {
         };
     }
 
-    pub fn makeCurrent(self: *Host) !void {
-        const surface = if (self.state == .ready and self.egl_surface != null and self.egl_surface != c.EGL_NO_SURFACE)
-            self.egl_surface
-        else
-            self.egl_bootstrap_surface;
-        if (surface == null or surface == c.EGL_NO_SURFACE) return error.EglFailed;
-        if (c.eglMakeCurrent(self.display_state.egl_display, surface, surface, self.egl_context) != c.EGL_TRUE) {
-            return eglError("eglMakeCurrent");
-        }
-    }
-
-    pub fn clearCurrent(self: *Host) !void {
-        if (c.eglMakeCurrent(self.display_state.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT) != c.EGL_TRUE) {
-            return eglError("eglMakeCurrent(clear)");
-        }
-    }
-
-    pub fn makeWindowCurrent(self: *Host) !void {
-        if (self.egl_surface == null or self.egl_surface == c.EGL_NO_SURFACE) return error.EglFailed;
-        if (c.eglMakeCurrent(self.display_state.egl_display, self.egl_surface, self.egl_surface, self.egl_context) != c.EGL_TRUE) {
-            return eglError("eglMakeCurrent(window)");
-        }
-    }
-
-    pub fn makeResourceCurrent(self: *Host) !void {
-        if (self.egl_resource_context == null or self.egl_resource_context == c.EGL_NO_CONTEXT) return self.makeWindowCurrent();
-        if (c.eglMakeCurrent(self.display_state.egl_display, self.egl_resource_surface, self.egl_resource_surface, self.egl_resource_context) != c.EGL_TRUE) {
-            return eglError("eglMakeCurrent(resource)");
-        }
-    }
-
-    pub fn swapBuffers(self: *Host) !void {
-        if (c.eglSwapBuffers(self.display_state.egl_display, self.egl_surface) != c.EGL_TRUE) return eglError("eglSwapBuffers");
-    }
-
     pub fn resizeWindow(self: *Host) void {
+        // resize (主线程) 与 present (引擎线程) 互斥: present 侧 tryLock 跳帧。
+        while (!self.present_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.present_mutex.unlock();
         self.applyBufferScale();
         const physical_width = self.physicalWidthI32();
         const physical_height = self.physicalHeightI32();
@@ -386,28 +401,13 @@ pub const Host = struct {
         if (self.egl_window) |window| c.wl_egl_window_resize(window, physical_width, physical_height, 0, 0);
     }
 
-    pub fn defaultFramebuffer(_: *Host) u32 {
-        return 0;
-    }
-
-    pub fn resolveGlProc(self: *Host, name: [*:0]const u8) ?*anyopaque {
-        const proc = c.eglGetProcAddress(name);
-        if (proc != null) return @ptrCast(@constCast(proc));
-
-        if (self.display_state.gles_library) |*gles_library| {
-            const name_slice: [:0]const u8 = std.mem.span(name);
-            if (gles_library.lookup(?*anyopaque, name_slice)) |symbol| return symbol;
-        }
-        return null;
-    }
-
     pub fn isReady(self: *const Host) bool {
         return self.state == .ready;
     }
 
-    pub fn runEventLoop(self: *Host, message: []const u8, tick_callback: ?EventLoopTickCallback, tick_context: ?*anyopaque) !void {
+    pub fn runEventLoop(self: *Host, quit: *const std.atomic.Value(bool), message: []const u8, tick_callback: ?EventLoopTickCallback, tick_context: ?*anyopaque) !void {
         std.debug.print("{s}\n", .{message});
-        while (self.running) {
+        while (!quit.load(.acquire)) {
             if (tick_callback) |callback| try callback(tick_context);
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
             self.display_state.flushLocked();
@@ -420,17 +420,21 @@ pub const Host = struct {
             const poll_result = c.poll(&fds, fds.len, 8);
             if (poll_result < 0) return error.WaylandDispatchFailed;
             if (poll_result > 0 and (fds[0].revents & c.POLLIN) != 0) {
-                // 多线程原子读: 只有一个线程能成功预约读, 其他线程下一轮 dispatch
-                if (self.display_state.display.?.prepareReadQueue(self.event_queue.?)) {
+                // 单线程模型: 主线程唯一预约读 (无需多线程原子读竞争处理)。
+                if (self.display_state.display.?.prepareReadQueue(self.sharedQueue())) {
                     if (self.display_state.display.?.readEvents() != .SUCCESS) return error.WaylandDispatchFailed;
                 }
             }
         }
     }
 
-    /// 分发本窗口 queue 的已缓冲事件。
+    fn sharedQueue(self: *Host) *wl.EventQueue {
+        return self.display_state.shared_queue orelse self.event_queue.?;
+    }
+
+    /// 分发进程级共享 queue 的已缓冲事件 (全部对象都绑它)。
     fn dispatchQueue(self: *Host) std.posix.E {
-        return self.display_state.display.?.dispatchQueuePending(self.event_queue.?);
+        return self.display_state.display.?.dispatchQueuePending(self.sharedQueue());
     }
 
     pub fn deinit(self: *Host) void {
@@ -438,10 +442,6 @@ pub const Host = struct {
         if (self.display_state.egl_display != null and self.display_state.egl_display != c.EGL_NO_DISPLAY) {
             _ = c.eglMakeCurrent(self.display_state.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
             if (self.egl_surface != null and self.egl_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.egl_surface);
-            if (self.egl_bootstrap_surface != null and self.egl_bootstrap_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.egl_bootstrap_surface);
-            if (self.egl_resource_surface != null and self.egl_resource_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.egl_resource_surface);
-            if (self.egl_resource_context != null and self.egl_resource_context != c.EGL_NO_CONTEXT) _ = c.eglDestroyContext(self.display_state.egl_display, self.egl_resource_context);
-            if (self.egl_context != null and self.egl_context != c.EGL_NO_CONTEXT) _ = c.eglDestroyContext(self.display_state.egl_display, self.egl_context);
         }
         if (self.egl_window) |window| c.wl_egl_window_destroy(window);
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
@@ -453,13 +453,9 @@ pub const Host = struct {
         // 关键: 显式 flush, 否则 destroy 请求只进本地队列, compositor 收不到
         // → 窗口变成幽灵窗口 (线程已死但窗口还在, hyprland ping 无应答 → 未响应)。
         self.display_state.flushLocked();
-        // 释放本窗口的 event queue。主窗口的 queue 就是 primary_queue,
-        // 由 DisplayState.deinit 在销毁全部全局代理后统一销毁; 这里只销毁
-        // spawn 窗口自己的 queue (其代理已在上方全部销毁)。
-        if (!self.is_primary) {
-            if (self.event_queue) |queue| queue.destroy();
-            self.event_queue = null;
-        }
+        // event_queue 是进程级共享 queue (由 DisplayState.deinit 统一销毁),
+        // 这里只清引用。
+        self.event_queue = null;
         // 释放共享连接引用 (归零时 DisplayState 完整清理: eglTerminate + disconnect)
         if (self.display_state.isAcquired()) self.display_state.release();
         // 注意: 不调用 display.disconnect() — libwayland 的 wl_display_disconnect 会
@@ -472,6 +468,8 @@ pub const Host = struct {
 
     fn beginRoleInitialization(self: *Host) !void {
         if (self.state != .uninitialized) return error.SurfaceAlreadyInitialized;
+        // 刷新共享 queue 引用 (attach 时 bindGlobals 尚未创建它)。
+        self.event_queue = self.display_state.shared_queue orelse return error.WaylandQueueCreateFailed;
         self.state = .initializing;
         self.configured = false;
         self.pending_width = 0;
@@ -614,7 +612,7 @@ pub const Host = struct {
         std.debug.print("Using Wayland scale {d} from {d} advertised output(s) before surface enter.\n", .{ next_scale, output_count });
     }
 
-    fn recomputeScale(self: *Host) void {
+    pub fn recomputeScale(self: *Host) void {
         if (self.fractional_scale_120 > 0) return;
         var next_scale: i32 = 1;
         for (self.display_state.outputs) |output_state| {
@@ -808,7 +806,10 @@ fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSu
             self.applyPendingConfigure();
             self.configured = true;
         },
-        .closed => self.running = false,
+        .closed => {
+            self.close_requested = true;
+            std.debug.print("layer_surface close requested for view {d}.\n", .{self.view_id});
+        },
     }
 }
 
@@ -848,8 +849,8 @@ fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, self: *Host)
         .configure_bounds => {},
         .wm_capabilities => {},
         .close => {
-            std.debug.print("xdg_toplevel close event; stopping event loop.\n", .{});
-            self.running = false;
+            self.close_requested = true;
+            std.debug.print("xdg_toplevel close requested for view {d}.\n", .{self.view_id});
         },
     }
 }

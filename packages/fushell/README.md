@@ -1,45 +1,76 @@
 # fushell
 
-Dart API for initializing and updating fushell's Wayland surface role.
+Dart API for the fushell headless shell: create Wayland windows backed by
+Flutter views in a single engine, bind parent/child relationships, and exit
+the process explicitly.
 
-Call `FushellSurface.init` exactly once before `runApp()`. Fushell does not create a fallback window role automatically; rendering before initialization is an error. The selected role is immutable after successful initialization.
+fushell starts **headless** (no implicit window). The Dart `main()` runs as a
+shell: it creates windows via `FushellWindow.openWindow` and renders each
+window's content to the corresponding `FlutterView` with the framework's
+`View`/`ViewCollection` widgets. Closing **all** windows does not exit the
+process; call `FushellProcess.exit` to terminate.
 
-## Window role
+## Creating windows
 
 ```dart
 import 'package:flutter/material.dart';
 import 'package:fushell/fushell.dart';
 
 Future<void> main() async {
-  await FushellSurface.init(
-    const SurfaceRole.window(
-      title: 'My App',
-      appId: 'my.app',
-      width: 800,
-      height: 600,
-    ),
+  WidgetsFlutterBinding.ensureInitialized();
+
+  final int mainWindowId = await FushellWindow.openWindow(
+    title: 'My App',
+    appId: 'my.app',
+    width: 800,
+    height: 600,
+  );
+  // Child window: xdg set_parent (transient). The compositor unparents it
+  // when the parent closes; closing a parent does NOT cascade-close children.
+  final int settingsWindowId = await FushellWindow.openWindow(
+    title: 'Settings',
+    appId: 'my.app.settings',
+    width: 480,
+    height: 360,
+    parent: mainWindowId,
   );
 
-  runApp(const MyApp());
+  final mainView = await FushellWindow.viewById(mainWindowId);
+  final settingsView = await FushellWindow.viewById(settingsWindowId);
+
+  runApp(ViewCollection(views: [
+    View(view: mainView, child: const MainApp()),
+    View(view: settingsView, child: const SettingsApp()),
+  ]));
 }
 ```
 
-Window metadata can be updated after initialization:
+`openWindow` returns the window id, which equals the `FlutterView.viewId`.
+`viewById` waits for the view to appear in `PlatformDispatcher.views`.
+
+## Closing windows & exiting
 
 ```dart
-await FushellSurface.updateWindow(
-  const WindowSurfaceUpdate(
-    title: 'New title',
-    appId: 'my.app.updated',
-  ),
-);
+// Removes the view and destroys the window's Wayland surface.
+await FushellWindow.closeWindow(settingsWindowId);
+
+// A compositor close request (for example, the title-bar close button) follows
+// the same asynchronous RemoveView lifecycle.
+
+// Explicit process exit (headless shell termination).
+await FushellProcess.exit(0);
 ```
 
-## Layer role
+## Layer-shell windows
+
+Pass `layer` to `openWindow` (mutually exclusive with a regular window;
+`title`/`appId` are ignored):
 
 ```dart
-await FushellSurface.init(
-  const SurfaceRole.layer(
+final int topBarId = await FushellWindow.openWindow(
+  title: 'unused',
+  appId: 'unused',
+  layer: const LayerSurfaceRole(
     namespace: 'my-panel',
     layer: LayerSurfaceLayer.top,
     anchors: {
@@ -48,30 +79,53 @@ await FushellSurface.init(
       LayerSurfaceAnchor.right,
     },
     exclusiveZone: 32,
-    width: 0,
     height: 32,
   ),
 );
 ```
 
-Mutable layer-shell properties can be updated after initialization:
+Mutable layer-shell properties are updated with `FushellWindow.updateLayer`:
 
 ```dart
-await FushellSurface.updateLayer(
-  const LayerSurfaceUpdate(
-    height: 28,
-    exclusiveZone: 28,
-    margins: Margins(top: 4),
-  ),
+await FushellWindow.updateLayer(
+  topBarId,
+  const LayerSurfaceUpdate(height: 28, exclusiveZone: 28, margins: Margins(top: 4)),
 );
 ```
 
-`width: 0` or `height: 0` asks the compositor to derive that dimension from anchors. For example, `top + left + right` with `width: 0` creates a top bar whose width is assigned by the compositor.
+`width: 0` / `height: 0` asks the compositor to derive that dimension from
+anchors. Compositors without layer-shell support (e.g. older cage) reject the
+window with a `LayerShellUnavailable` exception — catch it if you want to
+degrade gracefully.
+
+Window metadata updates:
+
+```dart
+await FushellWindow.updateWindow(
+  mainWindowId,
+  const WindowSurfaceUpdate(title: 'New title', appId: 'my.app.updated'),
+);
+```
 
 ## What can hot reload change?
 
-Flutter hot reload can update normal Dart UI state, colors, text, fonts, layout inside the existing Flutter view, and calls to `FushellSurface.updateLayer` / `FushellSurface.updateWindow` that run after reload.
+Flutter hot reload can update Dart UI state, colors, text, fonts, and layout
+inside each existing Flutter view, plus `FushellWindow.updateWindow` /
+`FushellWindow.updateLayer` calls that run after reload.
 
-Role selection remains immutable. Changing the initial `SurfaceRole.window(...)` versus `SurfaceRole.layer(...)` call, namespace, layer choice, initial anchors, or any code that only runs before `runApp()` may require a hot restart or a full fushell process restart. Calling `FushellSurface.init` again is rejected by fushell.
+Hot reload does not rerun `main()`, so changing startup `openWindow` calls
+requires a full fushell process restart. Reloaded callbacks and timers can
+still call `openWindow` to create additional views. Calling `updateLayer` on
+a window role, or `updateWindow` on a layer role, returns a structured
+`FushellSurfaceException`.
 
-Dynamic updates do not switch roles or recreate surfaces. Calling `updateLayer` on a window role, or `updateWindow` on a layer role, returns a structured `FushellSurfaceException`.
+## Concurrency model (for embedder maintainers)
+
+One engine, one Wayland connection, one event loop (main thread), one shared
+EGL render context. Each window is a `FlutterView` (id 1, 2, …) rendered via
+the FlutterCompositor path: the engine rasterizes into GL backing-store
+textures and `present_view_callback` blits them to the window's EGL surface.
+Present runs on an engine thread; `present_mutex` serializes it with main
+thread resizes. Window destruction is asynchronous: `closeWindow` submits
+`FlutterEngineRemoveView` and destroys the surface only after the
+`remove_view_callback` confirms the engine no longer touches the view.

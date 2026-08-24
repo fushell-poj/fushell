@@ -3,7 +3,8 @@ const player = @import("player.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    const args = try init.minimal.args.toSlice(gpa);
+    const runtime_arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(runtime_arena);
 
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
         printUsage();
@@ -39,10 +40,14 @@ fn printUsage() void {
     std.debug.print("\n", .{});
     std.debug.print("Plays the Fushell app bundle located in the same directory as this executable.\n", .{});
     std.debug.print("The Flutter engine belongs to the app bundle.\n", .{});
-    std.debug.print("Additional windows are opened by the app via the window.spawn API (FushellWindow.openWindow).\n", .{});
+    std.debug.print("The app starts headless (no window); windows are created by Dart\n", .{});
+    std.debug.print("via FushellWindow.openWindow (one Flutter view per window). The process\n", .{});
+    std.debug.print("runs until the app calls FushellProcess.exit (closing all windows does\n", .{});
+    std.debug.print("not exit the process).\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("required bundle layout (same directory as this executable):\n", .{});
     std.debug.print("  <dir>/lib/libflutter_engine.so\n", .{});
     std.debug.print("  <dir>/data/icudtl.dat\n", .{});
-    std.debug.print("  <dir>/data/flutter_assets/kernel_blob.bin\n", .{});
+    std.debug.print("  debug/JIT: <dir>/data/flutter_assets/kernel_blob.bin\n", .{});
+    std.debug.print("  release/AOT: <dir>/lib/libapp.so\n", .{});
 }

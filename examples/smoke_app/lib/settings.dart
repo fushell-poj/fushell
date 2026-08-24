@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
 
-/// 设置窗口 UI。由主窗口通过 FushellWindow.openWindow(entrypoint: 'settings')
-/// 打开; 宿主以 main 入口启动新 engine, 通过 dart_entrypoint_argv 传 'settings',
-/// main.dart 按窗口标识分支到本窗口。
+/// 设置窗口 UI。由无头壳 main() 通过 FushellWindow.openWindow(parent: 主窗)
+/// 创建, 内容渲染到对应 view (同一引擎的第二个 view)。
 class SettingsApp extends StatelessWidget {
   const SettingsApp({super.key});
 

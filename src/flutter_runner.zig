@@ -9,6 +9,7 @@ const text_input = @import("text_input.zig");
 const clipboard = @import("clipboard.zig");
 const data_control = @import("data_control.zig");
 const ime_v3 = @import("ime_v3.zig");
+const gl_blit = @import("gl_blit.zig");
 const xkb = @import("xkb.zig");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -21,24 +22,7 @@ const frame_interval_nanos: u64 = 16_666_667;
 const max_pending_flutter_tasks = 1024;
 const flutter_default_font_family = "Roboto";
 
-/// spawn 窗口注册表: 主窗口退出时关闭所有子窗口 (共享 Dart VM)。
-/// 子窗口线程不 detach: 结束标记 finished, 由复用槽位时 (或主窗口退出时) join
-/// 回收资源, 避免 detach/join 竞态 (join 已 detach 线程是未定义行为)。
-/// 64 = 单个播放器进程的窗口数上限 (槽位数组大小, 实际窗口数远小于此)。
-const max_spawned_windows = 64;
-const SpawnEntry = struct {
-    active: bool = false,
-    /// 线程已结束但尚未 join (等待复用槽位时回收)。
-    finished: bool = false,
-    thread: std.Thread = undefined,
-    host: ?*egl.Host = null,
-    /// 键盘事件路由目标 (键盘焦点在 spawn 窗口 surface 时)。
-    runner: ?*Runner = null,
-};
-var spawn_entries: [max_spawned_windows]SpawnEntry = undefined;
-var spawn_mutex: std.atomic.Mutex = .unlocked;
-
-/// 进程级共享 DisplayState (单例): 主窗口首次创建, spawn 窗口共享。
+/// 进程级共享 DisplayState (单例): 引擎启动时创建, 与引擎同生命周期。
 /// 引用计数由 Host.attach/release 管理; 归零时 DisplayState 完整清理。
 var global_display_state: ?*display_state.DisplayState = null;
 var display_state_mutex: std.atomic.Mutex = .unlocked;
@@ -54,7 +38,7 @@ fn getDisplayState(gpa: std.mem.Allocator) !*display_state.DisplayState {
     return global_display_state.?;
 }
 
-/// 主窗口关闭后显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全)。
+/// 进程退出时显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全)。
 /// ImeV3 持有 Wayland 对象 (text_input 等), 由 state 的 disconnect 统一收尾;
 /// 这里只回收 gpa.create 的对象内存 + DataControl 内部 buffer。
 fn shutdownShared(gpa: std.mem.Allocator, state: *display_state.DisplayState) void {
@@ -72,58 +56,88 @@ fn shutdownShared(gpa: std.mem.Allocator, state: *display_state.DisplayState) vo
     }
 }
 
-/// 主窗口 runner (指针路由的目标之一)。
-/// 进程级 data-control (系统剪贴板): 主窗口 attach 时创建, 绑定到共享 display。
+/// 进程级 data-control (系统剪贴板): 引擎级单例, 绑定到共享 display。
 var global_data_control: ?*data_control.DataControl = null;
 
-var main_runner_host: ?*egl.Host = null;
-var main_runner_ref: ?*Runner = null;
+/// 引擎单例 (输入路由 / host 回调的目标)。由 run() 设置。
+var engine_runner: ?*Runner = null;
 
-/// 键盘输入事件 (主线程 push, 目标窗口线程 drain)。
-/// keymap 数据在主线程 mmap 后立即拷贝 (生命周期跨线程)。
-const InputEvent = union(enum) {
-    keymap: []u8,
-    key: struct { keycode: u32, pressed: bool },
-    modifiers: struct { depressed: u32, latched: u32, locked: u32, group: u32 },
-    focus: bool,
+/// 进程退出请求 (process.exit 平台消息设置): 事件循环检查后退出。
+var quit_requested: std.atomic.Value(bool) = .init(false);
+
+/// 进程级窗口注册表: view_id → Host (单引擎多视图)。implicit view (id 0)
+/// 不在表内 (无窗口)。槽位内联 Host (稳定地址, 跨线程引用安全)。
+const max_windows = 64;
+const WindowEntry = struct {
+    active: bool = false,
+    view_id: i64 = 0,
+    parent_view_id: ?i64 = null,
+    /// AddView / RemoveView completion 由 engine-managed thread 回调；回调只在
+    /// 注册表锁内记录结果，平台线程 tick 才响应 Dart 或销毁 Wayland/EGL 资源。
+    add_pending: bool = false,
+    add_result_ready: bool = false,
+    add_result_added: bool = false,
+    remove_pending: bool = false,
+    remove_result_ready: bool = false,
+    remove_result_removed: bool = false,
+    pending_open_response: ?*const c.FlutterPlatformMessageResponseHandle = null,
+    pending_open_request_id: i64 = 0,
+    pending_close_response: ?*const c.FlutterPlatformMessageResponseHandle = null,
+    pending_close_request_id: i64 = 0,
+    host: egl.Host = .{},
 };
+var window_registry: [max_windows]WindowEntry = undefined;
+var window_registry_mutex: std.atomic.Mutex = .unlocked;
+var next_view_id: i64 = 1;
 
-/// 主线程 dispatch 键盘事件 → 焦点窗口 runner 的输入队列。
-fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surface) void {
-    // keymap 在 enter 之前到达 (surface 未知) — 投给主窗口 runner。
-    const runner = findRunnerBySurface(surface) orelse main_runner_ref orelse return;
-    runner.queueInputEvent(event) catch |err| {
-        std.debug.print("[error] queue keyboard event failed: {s}\n", .{@errorName(err)});
-    };
+fn lockWindowRegistry() void {
+    while (!window_registry_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-/// IME 事件路由: 投给键盘焦点窗口 (IME 是全局对象, 事件随焦点窗口)。
-/// text_input.Client 的 send_fn: 发 updateEditingState 到对应 runner 的引擎。
-/// 简单方案: 路由到键盘焦点窗口 (IME 场景) 或 main_runner (普通输入)。
-fn textInputSendCallback(client_id: i64, msg: []const u8) void {
-    _ = client_id;
-    const target = focusRunnerRef() orelse main_runner_ref orelse return;
-    target.sendToEngine("flutter/textinput", msg);
+fn unlockWindowRegistry() void {
+    window_registry_mutex.unlock();
 }
 
-fn focusRunnerRef() ?*Runner {
-    if (main_runner_ref) |runner| {
-        if (runner.keyboard_focused) return runner;
-    }
-    lockSpawnMutex();
-    defer spawn_mutex.unlock();
-    for (&spawn_entries) |*entry| {
-        if (!entry.active) continue;
-        if (entry.runner) |r| {
-            if (r.keyboard_focused) return r;
-        }
+/// 按 view_id 查窗口 (隐式 view 0 返回 null)。
+fn findWindowEntryByViewId(view_id: i64) ?*WindowEntry {
+    for (&window_registry) |*entry| {
+        if (entry.active and entry.view_id == view_id) return entry;
     }
     return null;
 }
 
+fn findHostBySurface(surface: ?*wl.Surface) ?*egl.Host {
+    const s = surface orelse return null;
+    for (&window_registry) |*entry| {
+        if (!entry.active) continue;
+        if (entry.host.surface == s) return &entry.host;
+    }
+    return null;
+}
+
+/// 主线程 dispatch 键盘事件: enter/leave 更新焦点窗口, 事件交给引擎
+/// (单引擎: xkb/text_input 为引擎级状态, 焦点窗口由 surface 路由派生)。
+fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surface) void {
+    const runner = engine_runner orelse return;
+    switch (event) {
+        .enter => runner.focused_host = findHostBySurface(surface),
+        .leave => runner.focused_host = null,
+        else => {},
+    }
+    runner.handleKeyboardEvent(event);
+}
+
+/// IME 事件路由: 投给键盘焦点窗口 (IME 是全局对象, 事件随焦点窗口)。
+/// text_input.Client 的 send_fn: 发 updateEditingState 到引擎。
+fn textInputSendCallback(client_id: i64, msg: []const u8) void {
+    _ = client_id;
+    const runner = engine_runner orelse return;
+    runner.sendToEngine("flutter/textinput", msg);
+}
+
 fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
     _ = ctx;
-    // enter/leave 事件带 surface → 精确路由到对应窗口的 runner。
+    // enter/leave 事件带 surface → 精确路由到对应窗口。
     // (不能依赖 keyboard_focused: text_input enter 可能先于 wl_keyboard.enter 到达)
     var surface: ?*wl.Surface = null;
     switch (event) {
@@ -131,123 +145,36 @@ fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
         .leave => |e| surface = e.surface,
         else => {},
     }
+    const runner = engine_runner orelse return;
     if (surface) |s| {
-        if (findRunnerBySurface(s)) |r| {
-            r.handleImeEvent(event);
-            return;
-        }
+        // 事件属于某窗口 surface: 只有焦点窗口才处理 (非焦点窗口的 enter
+        // 意味着焦点切换, 真正生效的是新焦点窗口)。
+        if (findHostBySurface(s)) |host| {
+            if (runner.focused_host != host and event == .enter) {
+                runner.focused_host = host;
+            }
+        } else return;
     }
-    // 无 surface 或找不到: 回退主 runner。
-    if (main_runner_ref) |runner| {
-        runner.handleImeEvent(event);
-        return;
-    }
-}
-
-fn findRunnerBySurface(surface: ?*wl.Surface) ?*Runner {
-    const s = surface orelse return null;
-    if (main_runner_ref) |runner| {
-        if (main_runner_host) |host| {
-            if (host.surface == s) return runner;
-        }
-    }
-    lockSpawnMutex();
-    defer spawn_mutex.unlock();
-    for (&spawn_entries) |*entry| {
-        if (!entry.active) continue;
-        if (entry.host) |host| {
-            if (host.surface == s) return entry.runner;
-        }
-    }
-    return null;
+    runner.handleImeEvent(event);
 }
 
 /// 指针路由: 事件 surface → 目标窗口 host → handlePointerEvent。
-/// 由主窗口线程调用 (pointer 绑主 queue)。spawn 窗口的指针状态跨线程写入,
-/// 但 spawn 线程不读指针状态 (其事件循环只处理自己的 surface 事件), 竞态可接受。
+/// 主线程单线程调用 (pointer 绑共享 queue)。
 fn displayPointerRouter(event: wl.Pointer.Event, surface: ?*wl.Surface) void {
     const target = findHostBySurface(surface) orelse return;
     target.handlePointerEvent(event);
-}
-
-fn findHostBySurface(surface: ?*wl.Surface) ?*egl.Host {
-    const s = surface orelse return null;
-    if (main_runner_host) |host| {
-        if (host.surface == s) return host;
-    }
-    for (&spawn_entries) |*entry| {
-        if (!entry.active) continue;
-        if (entry.host) |host| {
-            if (host.surface == s) return host;
-        }
-    }
-    return null;
-}
-
-/// atomic.Mutex (0.16) 无 lock(), 统一用自旋 tryLock 封装。
-fn lockSpawnMutex() void {
-    while (!spawn_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn lockDisplayStateMutex() void {
     while (!display_state_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
-fn unlockSpawnMutex() void {
-    spawn_mutex.unlock();
-}
-
-/// 停止所有活跃子窗口的事件循环并 join 其线程。
-/// 必须在主引擎 FlutterEngineShutdown (销毁共享 VM) 之前调用。
-fn shutdownSpawnedWindows() void {
-    lockSpawnMutex();
-    var threads: [max_spawned_windows]?std.Thread = undefined;
-    for (&spawn_entries, 0..) |*entry, i| {
-        if (entry.active) {
-            if (entry.host) |host| host.running = false;
-            threads[i] = entry.thread;
-        } else if (entry.finished) {
-            // 已结束未回收的线程: join 立即返回, 回收资源
-            threads[i] = entry.thread;
-            entry.finished = false;
-        } else {
-            threads[i] = null;
-        }
-    }
-    unlockSpawnMutex();
-
-    for (threads) |maybe_thread| {
-        if (maybe_thread) |thread| thread.join();
-    }
-    std.debug.print("all spawned windows shut down.\n", .{});
-}
-
-pub const Role = enum {
-    /// 主窗口: 创建共享 DisplayState, runEventLoop 结束后关闭所有 spawn 窗口, 销毁 VM。
-    primary,
-    /// spawn 窗口: 共享主窗口的 DisplayState 与 Dart VM, 不负责 VM 生命周期。
-    spawned,
-};
-
 pub const Options = struct {
     engine_library: []const u8,
     bundle_path: []const u8,
-    /// 窗口角色 (primary/spawned), 派生 VM 生命周期与共享状态管理。
-    role: Role = .primary,
-    /// 自定义 Dart entrypoint (custom_dart_entrypoint), 空则用 main。
-    entrypoint: ?[]const u8 = null,
-    /// 传给 entrypoint 的命令行参数 (dart_entrypoint_argv)。
-    entrypoint_argv: ?[]const []const u8 = null,
-    /// 外部提供的 Host (spawn 窗口): 主线程需要访问它以触发退出。
-    external_host: ?*egl.Host = null,
     /// 启动 VM service (热重载用, 仅 debug/JIT 引擎支持):
     /// 传 --enable-vm-service --vm-service-port=0, URI 从引擎日志解析。
     enable_vm_service: bool = false,
-
-    /// VM 生命周期由角色派生: primary 负责销毁, spawned 共享。
-    pub fn shutdownVmWhenDone(self: Options) bool {
-        return self.role == .primary;
-    }
 };
 
 const Bundle = struct {
@@ -286,7 +213,10 @@ const PendingFlutterTask = struct {
 
 const Runner = struct {
     gpa: std.mem.Allocator,
-    host: *egl.Host,
+    /// 进程级共享显示状态 (窗口创建 / IME / 剪贴板用)。
+    state: *display_state.DisplayState,
+    /// 进程级共享 render context (raster + 全部窗口呈现)。
+    render_context: *egl.RenderContext,
     api: *flutter.Api,
     engine_library: []const u8,
     bundle_path: []const u8,
@@ -303,20 +233,25 @@ const Runner = struct {
     bootstrap_present_logged: bool = false,
     first_present_logged: bool = false,
 
+    // ── compositor 呈现路径 ────────────────────────
+    /// backing store 纹理 → 窗口 surface 的 GLES2 blit 模块。
+    blitter: gl_blit.Blitter = .{},
+    compositor_first_present_logged: bool = false,
+
     // ── 输入 / 文本 / 剪贴板 ──────────────────────
     text_client: text_input.Client = undefined,
     clipboard: clipboard.Clipboard = undefined,
     ime: ?*ime_v3.ImeV3 = null,
     xkb_state: xkb.Xkb = .{},
-    keyboard_focused: bool = false,
+    /// 键盘焦点窗口 (wl_keyboard.enter 的 surface → 窗口注册表)。
+    /// null = 无焦点窗口 (键盘事件被丢弃)。
+    focused_host: ?*egl.Host = null,
     // 键盘长按重复 (wl_keyboard.repeat_info): delay 后按 rate 模拟 keydown。
     repeat_delay_ms: u32 = 500,
     repeat_rate_per_sec: u32 = 25,
     repeat_active_key: ?u32 = null,
     repeat_next_time_ns: u64 = 0,
     last_modifiers: u32 = 0,
-    input_mutex: std.atomic.Mutex = .unlocked,
-    input_events: std.ArrayListUnmanaged(InputEvent) = .empty,
 
     fn now(self: *Runner) u64 {
         return self.api.get_current_time();
@@ -330,28 +265,8 @@ const Runner = struct {
         self.rendering_generation.store(self.metrics_generation.load(.acquire), .release);
     }
 
-    /// 主线程调用: 投递键盘事件到本窗口线程的输入队列。
-    fn queueInputEvent(self: *Runner, event: display_state.KeyboardEvent) !void {
-        while (!self.input_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.input_mutex.unlock();
-        switch (event) {
-            .keymap => |km| {
-                const copy = try self.gpa.dupe(u8, km.data);
-                try self.input_events.append(self.gpa, .{ .keymap = copy });
-            },
-            .key => |k| try self.input_events.append(self.gpa, .{ .key = .{ .keycode = k.key, .pressed = k.state == .pressed } }),
-            .modifiers => |m| try self.input_events.append(self.gpa, .{ .modifiers = .{ .depressed = m.depressed, .latched = m.latched, .locked = m.locked, .group = m.group } }),
-            .enter => try self.input_events.append(self.gpa, .{ .focus = true }),
-            .leave => try self.input_events.append(self.gpa, .{ .focus = false }),
-            .repeat => |r| {
-                self.repeat_delay_ms = @intCast(@max(r.delay_ms, 0));
-                self.repeat_rate_per_sec = @intCast(@max(r.rate_per_sec, 0));
-            },
-        }
-    }
-
-    /// 窗口线程调用 (事件循环 tick): 处理全部积压的键盘事件。
-    /// 键盘长按重复: 到达 repeat 时间点则模拟一次 keydown。
+    /// 键盘长按重复 (wl_keyboard.repeat_info): 到达 repeat 时间点则模拟一次
+    /// keydown。主线程事件循环 tick 调用 (单线程模型, 无跨线程队列)。
     fn checkKeyRepeat(self: *Runner) void {
         const key = self.repeat_active_key orelse return;
         const now_ns = nowNs();
@@ -362,65 +277,49 @@ const Runner = struct {
         else
             100 * 1_000_000;
         self.repeat_next_time_ns = now_ns + interval;
-        if (self.keyboard_focused and self.text_client.active) {
+        if (self.focused_host != null and self.text_client.active) {
             _ = self.xkb_state.updateKey(key, true);
             self.sendKeyboardEvent(key, true);
             self.handleKey(key);
         }
     }
 
-    fn drainInputEvents(self: *Runner) void {
-        while (true) {
-            while (!self.input_mutex.tryLock()) std.atomic.spinLoopHint();
-            if (self.input_events.items.len == 0) {
-                self.input_mutex.unlock();
-                return;
-            }
-            const event = self.input_events.orderedRemove(0);
-            self.input_mutex.unlock();
-            defer if (event == .keymap) self.gpa.free(event.keymap);
-            self.handleInputEvent(event);
-        }
-    }
-
-    fn handleInputEvent(self: *Runner, event: InputEvent) void {
+    /// 主线程直接处理键盘事件 (单线程模型, 无队列)。
+    fn handleKeyboardEvent(self: *Runner, event: display_state.KeyboardEvent) void {
         switch (event) {
             .keymap => |km| {
                 self.xkb_state.deinit();
-                self.xkb_state = xkb.Xkb.init(self.gpa, km) catch |err| {
+                self.xkb_state = xkb.Xkb.init(self.gpa, km.data) catch |err| {
                     std.debug.print("[error] xkb keymap init failed: {s}\n", .{@errorName(err)});
                     self.xkb_state = .{};
                     return;
                 };
-                {
-                    const path_z: [:0]const u8 = "/tmp/fushell-keymap.xkb";
-                    const rc = std.os.linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-                    const fd: i32 = @intCast(@min(rc, 1 << 30));
-                    if (fd > 0) {
-                        _ = std.os.linux.write(fd, km.ptr, km.len);
-                        _ = std.os.linux.close(fd);
-                    }
-                }
             },
             .modifiers => |m| {
                 self.last_modifiers = m.depressed;
                 self.xkb_state.updateModifiers(m.depressed, m.latched, m.locked, m.group, m.group, m.group);
             },
-            .focus => |focused| self.keyboard_focused = focused,
+            .enter => self.focused_host = null, // 由 displayKeyboardRouter 设置 (surface → host)
+            .leave => self.focused_host = null,
+            .repeat => |r| {
+                self.repeat_delay_ms = @intCast(@max(r.delay_ms, 0));
+                self.repeat_rate_per_sec = @intCast(@max(r.rate_per_sec, 0));
+            },
             .key => |k| {
                 // 按下/松开都更新 xkb 状态 (修饰键跟踪依赖它)。
-                _ = self.xkb_state.updateKey(k.keycode, k.pressed);
+                _ = self.xkb_state.updateKey(k.key, k.state == .pressed);
                 // 无论焦点/文本客户端, 都向 Flutter 发送 RawKeyEvent
                 // (EditableText 靠它实现 Ctrl+C/V/A 等快捷键)。
-                self.sendKeyboardEvent(k.keycode, k.pressed);
-                if (!self.keyboard_focused or !self.text_client.active) return;
-                if (k.pressed) {
+                self.sendKeyboardEvent(k.key, k.state == .pressed);
+                if (self.focused_host == null or !self.text_client.active) return;
+                const pressed = k.state == .pressed;
+                if (pressed) {
                     // 启动长按重复计时 (repeat_info 的 delay 后按 rate 重复)。
-                    self.repeat_active_key = k.keycode;
+                    self.repeat_active_key = k.key;
                     self.repeat_next_time_ns = nowNs() + @as(u64, self.repeat_delay_ms) * 1_000_000;
-                    self.handleKey(k.keycode);
+                    self.handleKey(k.key);
                 } else {
-                    if (self.repeat_active_key == k.keycode) self.repeat_active_key = null;
+                    if (self.repeat_active_key == k.key) self.repeat_active_key = null;
                 }
             },
         }
@@ -471,14 +370,16 @@ const Runner = struct {
                         const y = self.text_client.marked_rect_x * t[1] + self.text_client.marked_rect_y * t[5] + t[13];
                         std.debug.print("[diag] submit rect (enter-geom) ({d:.0},{d:.0})\n", .{ x, y });
                         ime.setCursorRect(@intFromFloat(x), @intFromFloat(y), 4, @intFromFloat(@max(self.text_client.marked_rect_h, 16)));
-                    } else {
-                        std.debug.print("[diag] submit rect (enter-pointer) ({d:.0},{d:.0})\n", .{ self.host.pointer_x, self.host.pointer_y });
+                    } else if (self.focused_host) |focused| {
+                        std.debug.print("[diag] submit rect (enter-pointer) ({d:.0},{d:.0})\n", .{ focused.pointer_x, focused.pointer_y });
                         ime.setCursorRect(
-                            @intFromFloat(@max(self.host.pointer_x, 0)),
-                            @intFromFloat(@max(self.host.pointer_y, 0)),
+                            @intFromFloat(@max(focused.pointer_x, 0)),
+                            @intFromFloat(@max(focused.pointer_y, 0)),
                             4,
-                            @intFromFloat(@max(@as(f64, 24) * self.host.activeScale(), 16)),
+                            @intFromFloat(@max(@as(f64, 24) * focused.activeScale(), 16)),
                         );
+                    } else {
+                        ime.setCursorRect(0, 0, 4, 16);
                     }
                     const sel: i32 = @intCast(@max(self.text_client.state.selection_base, 0));
                     ime.setSurrounding(self.text_client.state.text.items, sel, sel);
@@ -711,54 +612,68 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     // 先让 host.deinit 触发 state.deinit 释放 Wayland/EGL, 再回收入口对象。
     // ⚠️ defer 必须是【函数级】, 不能放在 if 块内 — Zig 的 defer 在词法块结束
     // (包括 if 的 }) 时执行, 若放 if 内会在 attach 之前就 destroy state (悬垂引用).
-    defer if (options.role == .primary and global_display_state == state) {
+    defer if (global_display_state == state) {
         gpa.destroy(state);
         global_display_state = null;
     };
     var local_host: egl.Host = .{};
-    const host: *egl.Host = options.external_host orelse &local_host;
-    defer if (options.external_host == null) local_host.deinit();
-    try host.attach(state, options.role == .primary);
-    if (options.role == .primary) {
-        main_runner_host = host;
-        display_state.setPointerEventCallback(displayPointerRouter, null);
-        display_state.setKeyboardEventCallback(displayKeyboardRouter, null);
-        // 系统剪贴板 (data-control): 主窗口负责绑定, 共享给所有窗口。
-        if (global_data_control == null) {
-            const dc = gpa.create(data_control.DataControl) catch null;
-            if (dc) |d| {
-                d.* = data_control.DataControl.init(gpa, state);
-                global_data_control = d;
-                state.data_control = d;
-                // 若 registry 已发现 manager (attachPrimary 前), 补绑定
-                if (state.data_control_manager_name != 0) {
-                    if (state.registry) |reg| d.bindManager(reg, state.data_control_manager_name, state.data_control_manager_version);
-                }
+    // 无头基座: 这个 host 不初始化任何 surface 角色, 仅作为进程级连接的所有者
+    // 与事件循环载体 (单引擎模型下窗口全部由注册表内 Host 承载)。
+    const host: *egl.Host = &local_host;
+    defer local_host.deinit();
+
+    // 进程级初始化: attach (acquire → 建连接) 后绑单一 event queue 到全部对象。
+    try host.attach(state);
+    try state.bindGlobals();
+    // 进程级单一 EGL render context (raster + 呈现)。
+    var render_context: egl.RenderContext = .{};
+    defer render_context.deinit();
+    try render_context.init(state);
+    display_state.setPointerEventCallback(displayPointerRouter, null);
+    display_state.setKeyboardEventCallback(displayKeyboardRouter, null);
+    // output scale 变化 → 重算全部窗口 scale (注册表遍历)。
+    display_state.scale_change_callback = struct {
+        fn cb() void {
+            lockWindowRegistry();
+            defer unlockWindowRegistry();
+            for (&window_registry) |*entry| {
+                if (entry.active) entry.host.recomputeScale();
             }
         }
-        // IME (text-input-v3): 主窗口创建, 共享 DisplayState; registry 绑定在 attachPrimary 后由 registryListener 完成。
-        if (state.ime == null) {
-            const ime = gpa.create(ime_v3.ImeV3) catch null;
-            if (ime) |i| {
-                i.* = .{};
-                state.ime = i;
-            }
-        }
-        // registry 事件可能在 ime 创建前已处理 (attachPrimary 先于创建) — 补绑定。
-        if (state.ime) |ime| {
-            ime.primary_queue = state.primary_queue;
-            ime.setCallback(imeEventRouter, null);
-            if (state.ime_manager_name != 0) {
-                if (state.registry) |reg| {
-                    if (state.seat) |seat| ime.bindManager(reg, state.ime_manager_name, state.ime_manager_version, seat);
-                }
+    }.cb;
+    // 系统剪贴板 (data-control): 引擎级单例, 共享 display。
+    if (global_data_control == null) {
+        const dc = gpa.create(data_control.DataControl) catch null;
+        if (dc) |d| {
+            d.* = data_control.DataControl.init(gpa, state);
+            global_data_control = d;
+            state.data_control = d;
+            // 若 registry 已发现 manager (bindGlobals 前), 补绑定
+            if (state.data_control_manager_name != 0) {
+                if (state.registry) |reg| d.bindManager(reg, state.data_control_manager_name, state.data_control_manager_version);
             }
         }
     }
-    try host.initEglBootstrap();
-    std.debug.print("Wayland display connected and EGL bootstrap context is ready. Waiting for Dart surface initialization.\n", .{});
+    // IME (text-input-v3): 引擎级单例, registry 绑定由 registryListener 完成。
+    if (state.ime == null) {
+        const ime = gpa.create(ime_v3.ImeV3) catch null;
+        if (ime) |i| {
+            i.* = .{};
+            state.ime = i;
+        }
+    }
+    if (state.ime) |ime| {
+        ime.shared_queue = state.shared_queue;
+        ime.setCallback(imeEventRouter, null);
+        if (state.ime_manager_name != 0) {
+            if (state.registry) |reg| {
+                if (state.seat) |seat| ime.bindManager(reg, state.ime_manager_name, state.ime_manager_version, seat);
+            }
+        }
+    }
+    std.debug.print("Wayland display connected and EGL bootstrap context is ready (headless shell).\n", .{});
 
-    var runner: Runner = .{ .gpa = gpa, .host = host, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .engine_library = options.engine_library, .bundle_path = options.bundle_path };
+    var runner: Runner = .{ .gpa = gpa, .state = state, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .engine_library = options.engine_library, .bundle_path = options.bundle_path };
     runner.ime = state.ime;
     runner.text_client = text_input.Client.init(gpa);
     runner.text_client.send_fn = textInputSendCallback;
@@ -766,40 +681,9 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     defer runner.text_client.deinit();
     defer runner.clipboard.deinit();
     defer runner.xkb_state.deinit();
-    defer {
-        // input_events.deinit 只释放容器: 残留未消费的 keymap 载荷需逐个释放
-        for (runner.input_events.items) |ev| {
-            if (ev == .keymap) runner.gpa.free(ev.keymap);
-        }
-        runner.input_events.deinit(gpa);
-    }
-    if (options.role == .primary) {
-        main_runner_ref = &runner;
-    } else if (options.external_host) |external| {
-        // 注册 spawn runner (键盘路由目标), 退出时注销。
-        lockSpawnMutex();
-        for (&spawn_entries) |*entry| {
-            if (entry.host == external) {
-                entry.runner = &runner;
-            }
-        }
-        unlockSpawnMutex();
-    }
-    defer {
-        if (options.role == .primary) {
-            main_runner_ref = null;
-        } else if (options.external_host) |external| {
-            lockSpawnMutex();
-            for (&spawn_entries) |*entry| {
-                if (entry.host == external) {
-                    entry.runner = null;
-                }
-            }
-            unlockSpawnMutex();
-        }
-    }
-    host.setMetricsCallback(metricsCallback, &runner);
-    host.setPointerCallback(pointerCallback, &runner);
+    defer runner.blitter.deinit();
+    engine_runner = &runner;
+    defer engine_runner = null;
 
     var renderer: c.FlutterRendererConfig = std.mem.zeroes(c.FlutterRendererConfig);
     renderer.type = c.kOpenGL;
@@ -832,7 +716,8 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     project_args.vsync_callback = vsyncCallback;
     project_args.custom_task_runners = &custom_task_runners;
     project_args.platform_message_callback = platformMessageCallback;
-    project_args.shutdown_dart_vm_when_done = options.shutdownVmWhenDone();
+    // 单引擎: 本引擎是进程唯一引擎, 负责销毁 VM。
+    project_args.shutdown_dart_vm_when_done = true;
     project_args.log_message_callback = logMessageCallback;
     project_args.log_tag = "fushell";
     if (is_aot) project_args.aot_data = aot_data;
@@ -850,53 +735,22 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
         std.debug.print("VM service requested (hot reload); waiting for engine to report the service URI.\n", .{});
     }
 
-    // 自定义 entrypoint + argv (多窗口 spawn 用): 分配在 run 的 gpa 上,
-    // run 阻塞期间 (engine 运行中) 有效, engine 启动时已消费。
-    // argv 独立于 entrypoint 注入: 新窗口用 main 入口, 窗口标识通过 argv 传递
-    // (Dart 侧 main(List<String> args) 接收)。
-    // run 返回后释放 — 引擎只读这些指针 (消费≠释放), 不负责 free。
-    // 注意: defer 必须放在函数级 (不能放 if/for 块内) — Zig 的 defer 是词法块作用域,
-    // 放在块内会在块结束(})即释放, 导致 api.run 读到已释放指针 (UAF, 0xaa poison)。
-    var entrypoint_arg_z: ?[:0]u8 = null;
-    defer if (entrypoint_arg_z) |z| gpa.free(z);
-    var entrypoint_argv_z: ?[]?[*:0]const u8 = null;
-    defer if (entrypoint_argv_z) |z| gpa.free(z);
-    var argv_elem_zs: ?[][:0]u8 = null;
-    defer if (argv_elem_zs) |zs| {
-        for (zs) |z| gpa.free(z); // 每个元素 dupeZ 的内容
-        gpa.free(zs); // 结构体数组本身 ([:0]u8 = ptr+len)
-    };
-
-    if (options.entrypoint) |entrypoint| {
-        const z = try gpa.dupeZ(u8, entrypoint);
-        entrypoint_arg_z = z;
-        project_args.custom_dart_entrypoint = z.ptr;
-    }
-    if (options.entrypoint_argv) |argv| {
-        // 容器用普通 alloc(len+1) + 手动末尾 null: allocSentinel 返回的 slice 用普通
-        // []T free 时与 DebugAllocator 的 alignment/bucket 定位不一致 (Invalid free)。
-        const z = try gpa.alloc(?[*:0]const u8, argv.len + 1);
-        entrypoint_argv_z = z;
-        z[argv.len] = null; // C 数组末尾 null (const char* const* sentinel)
-        // 元素类型必须 [:0]u8 (与 dupeZ 返回同型) — 同上, allocSentinel 分配与 []u8 free 不匹配。
-        const elems = try gpa.alloc([:0]u8, argv.len);
-        argv_elem_zs = elems;
-        for (argv, 0..) |arg, i| {
-            const az = try gpa.dupeZ(u8, arg);
-            elems[i] = az;
-            z[i] = az.ptr;
-        }
-        project_args.dart_entrypoint_argc = @intCast(argv.len);
-        project_args.dart_entrypoint_argv = @ptrCast(z.ptr);
-    }
+    // compositor 渲染路径 (multi-view 基础): 引擎产出 layer tree,
+    // embedder 负责 backing store 创建/回收与 per-view 呈现。renderer 的
+    // present 回调为 no-op (见 presentCallback)。
+    var compositor: c.FlutterCompositor = std.mem.zeroes(c.FlutterCompositor);
+    compositor.struct_size = @sizeOf(c.FlutterCompositor);
+    compositor.user_data = &runner;
+    compositor.create_backing_store_callback = createBackingStoreCallback;
+    compositor.collect_backing_store_callback = collectBackingStoreCallback;
+    compositor.present_view_callback = presentViewCallback;
+    project_args.compositor = &compositor;
 
     std.debug.print("Starting Flutter engine with bundle assets: {s}\n", .{bundle.assets_path});
     var engine: c.FlutterEngine = null;
     const run_result = api.run(c.FLUTTER_ENGINE_VERSION, &renderer, &project_args, &runner, &engine);
     try flutter.ensureSuccess(run_result, "FlutterEngineRun");
     runner.engine = engine;
-    try sendMetrics(&runner, host.metrics());
-    std.debug.print("Sent bootstrap Flutter metrics while waiting for Dart surface initialization.\n", .{});
     errdefer if (runner.engine != null) {
         const shutdown_result = api.shutdown(runner.engine);
         if (shutdown_result != c.kSuccess) {
@@ -904,21 +758,17 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
         }
     };
 
-    std.debug.print("Flutter engine is running. Dart must call FushellSurface.init before rendering.\n", .{});
-    try host.runEventLoop("Flutter first-frame mode is active.", flutterTaskPumpCallback, &runner);
+    std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
+    try host.runEventLoop(&quit_requested, "Engine event loop active (headless shell).", flutterTaskPumpCallback, &runner);
 
-    // 主窗口关闭: 先关闭所有子窗口引擎 (它们共享 VM), 再销毁 VM。
-    // 否则子引擎仍在使用 VM 时销毁 → 崩溃。
-    if (options.role == .primary) {
-        shutdownSpawnedWindows();
-        // 显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全; 不再依赖 defer 时序)。
-        shutdownShared(gpa, state);
-    }
-
+    // 退出序列: 先关引擎 (join 引擎线程 → 不再有 present 回调),
+    // 再销毁剩余窗口与共享 dc/ime (此刻 state Wayland 连接仍有效)。
     std.debug.print("Shutting down Flutter engine.\n", .{});
     try flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown");
     runner.engine = null;
-    std.debug.print("engine window thread exited.\n", .{});
+    shutdownAllWindows();
+    shutdownShared(gpa, state);
+    std.debug.print("engine event loop exited.\n", .{});
 }
 
 fn validateJitBundle(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
@@ -1277,12 +1127,13 @@ fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_dat
 
 fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     const runner = fromUserData(user_data);
-    runner.drainInputEvents();
+    processViewLifecycleResults(runner);
+    processCompositorCloseRequests(runner);
     runner.checkKeyRepeat();
     try runner.runDueFlutterTasks();
 }
 
-fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics) !void {
+fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics, view_id: i64) !void {
     if (runner.engine == null) return;
     const generation = runner.beginMetricsUpdate();
     var metrics: c.FlutterWindowMetricsEvent = std.mem.zeroes(c.FlutterWindowMetricsEvent);
@@ -1292,23 +1143,23 @@ fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics) !void {
     metrics.pixel_ratio = host_metrics.pixel_ratio;
     metrics.left = 0;
     metrics.top = 0;
-    metrics.view_id = 0;
+    metrics.view_id = view_id;
     _ = generation;
     try flutter.ensureSuccess(runner.api.send_window_metrics(runner.engine, &metrics), "FlutterEngineSendWindowMetricsEvent");
     try flutter.ensureSuccess(runner.api.schedule_frame(runner.engine), "FlutterEngineScheduleFrame");
 }
 
 fn metricsCallback(context: ?*anyopaque, host_metrics: egl.Metrics) void {
-    const runner = fromUserData(context);
-    // 窗口 shutdown 中 (引擎销毁): 主线程 dispatch 的 scale 事件可能触达,
-    // 引擎句柄已失效 → 发送即 UAF。
-    if (runner.engine == null or runner.host.state == .shutting_down) return;
-    sendMetrics(runner, host_metrics) catch |err| {
+    const host: *egl.Host = @ptrCast(@alignCast(context.?));
+    const runner = engine_runner orelse return;
+    // 窗口关闭中: 引擎可能已不认这个 view, 发送即 UAF。
+    if (runner.engine == null or host.state == .shutting_down) return;
+    sendMetrics(runner, host_metrics, host.view_id) catch |err| {
         std.debug.print("[error] Flutter metrics callback failed: {s}\n", .{@errorName(err)});
     };
 }
 
-fn sendPointerEvent(runner: *Runner, host_event: egl.PointerEvent) !void {
+fn sendPointerEvent(runner: *Runner, host_event: egl.PointerEvent, view_id: i64) !void {
     if (runner.engine == null) return;
     var event: c.FlutterPointerEvent = std.mem.zeroes(c.FlutterPointerEvent);
     event.struct_size = @sizeOf(c.FlutterPointerEvent);
@@ -1330,13 +1181,14 @@ fn sendPointerEvent(runner: *Runner, host_event: egl.PointerEvent) !void {
     event.scroll_delta_y = host_event.scroll_delta_y;
     event.device_kind = @intCast(c.kFlutterPointerDeviceKindMouse);
     event.buttons = host_event.buttons;
-    event.view_id = 0;
+    event.view_id = view_id;
     try flutter.ensureSuccess(runner.api.send_pointer_event(runner.engine, &event, 1), "FlutterEngineSendPointerEvent");
 }
 
 fn pointerCallback(context: ?*anyopaque, host_event: egl.PointerEvent) void {
-    const runner = fromUserData(context);
-    sendPointerEvent(runner, host_event) catch |err| {
+    const host: *egl.Host = @ptrCast(@alignCast(context.?));
+    const runner = engine_runner orelse return;
+    sendPointerEvent(runner, host_event, host.view_id) catch |err| {
         std.debug.print("[error] Flutter pointer callback failed: {s}\n", .{@errorName(err)});
     };
 }
@@ -1426,14 +1278,16 @@ fn handleTextInputMessage(runner: *Runner, message: c.FlutterPlatformMessage, pa
         if (runner.ime) |ime| {
             if (runner.text_client.has_transform and runner.text_client.has_marked_rect) {
                 runner.updateImeCursorPosition();
-            } else {
-                // fallback: 指针位置 (引擎几何未到)。
+            } else if (runner.focused_host) |focused| {
+                // fallback: 焦点窗口的指针位置 (引擎几何未到)。
                 ime.setCursorRect(
-                    @intFromFloat(@max(runner.host.pointer_x, 0)),
-                    @intFromFloat(@max(runner.host.pointer_y, 0)),
+                    @intFromFloat(@max(focused.pointer_x, 0)),
+                    @intFromFloat(@max(focused.pointer_y, 0)),
                     4,
                     24,
                 );
+            } else {
+                ime.setCursorRect(0, 0, 4, 24);
             }
             ime.enable(0, 1);
         }
@@ -1654,146 +1508,267 @@ fn handleSurfaceChannelMessage(runner: *Runner, message: c.FlutterPlatformMessag
     };
     defer request.deinit(runner.gpa);
 
-    handleSurfaceRequest(runner, request) catch |err| {
+    handleSurfaceRequest(runner, message.response_handle, request) catch |err| {
         const code = surfaceRequestErrorCode(err);
         std.debug.print("[error] Fushell surface request failed: {s}\n", .{code});
         sendSurfaceError(runner, message.response_handle, request.id(), code, "fushell surface request failed");
         return;
     };
-    sendSurfaceSuccess(runner, message.response_handle, request.id());
 }
 
-fn handleSurfaceRequest(runner: *Runner, request: surface_channel.Request) !void {
+fn handleSurfaceRequest(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.Request) !void {
     switch (request) {
-        .init => |init_request| try initializeSurfaceRole(runner, init_request),
-        .update_layer => |update_request| try updateLayerSurface(runner, update_request),
-        .update_window => |update_request| try updateWindowSurface(runner, update_request),
-        .spawn_window => |spawn_request| try spawnWindow(runner, spawn_request),
+        .open_window => |req| try openWindow(runner, response_handle, req),
+        .close_window => |req| try closeWindow(runner, response_handle, req),
+        .update_window => |req| try updateWindowSurface(runner, response_handle, req),
+        .update_layer => |req| try updateLayerSurface(runner, response_handle, req),
+        .exit => |req| try exitProcess(runner, response_handle, req),
     }
 }
 
-fn initializeSurfaceRole(runner: *Runner, request: surface_channel.InitRequest) !void {
-    switch (request.role) {
-        .window => |window| {
-            try runner.host.initializeWindowRole(window);
-            std.debug.print("Fushell surface initialized: window role.\n", .{});
-        },
-        .layer => |layer| {
-            try runner.host.initializeLayerRole(layer);
-            std.debug.print("Fushell surface initialized: layer role.\n", .{});
-        },
-    }
-    try sendMetrics(runner, runner.host.metrics());
-}
+/// window.open: 创建新窗口 (Wayland role + EGL surface + Flutter view)。
+/// 回复在 add_view_callback 确认 added 后发出 (保证 Dart 收到 windowId 时
+/// view 已在引擎注册、PlatformDispatcher.views 即将可见)。
+fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.OpenWindowRequest) !void {
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
 
-fn updateLayerSurface(runner: *Runner, request: surface_channel.LayerSurfaceUpdateRequest) !void {
-    _ = try runner.host.updateLayerRole(request.update);
-}
+    // 父窗口解析: 持锁拿父 toplevel (防止父窗口被并发关闭)。
+    const parent_toplevel = if (request.parent) |parent_id| blk: {
+        const parent_entry = findWindowEntryByViewId(parent_id) orelse return error.ParentWindowNotFound;
+        break :blk parent_entry.host.toplevel;
+    } else null;
 
-fn updateWindowSurface(runner: *Runner, request: surface_channel.WindowSurfaceUpdateRequest) !void {
-    _ = try runner.host.updateWindowRole(request.update);
-}
-
-/// window.spawn: 以指定 Dart entrypoint + argv 创建新 engine + 新窗口。
-/// 上下文从调用方 gpa 分配 (线程生命周期由 run 的 join 保证)。
-fn spawnWindow(runner: *Runner, request: surface_channel.SpawnRequest) !void {
-    // 分配注册表槽位 (线程不 detach, 主窗口退出时 join)
-    lockSpawnMutex();
     var slot: ?usize = null;
-    for (&spawn_entries, 0..) |*entry, i| {
+    for (&window_registry, 0..) |*entry, i| {
         if (!entry.active) {
-            // 复用槽位前回收上一个已结束的线程 (join 已结束线程立即返回)
-            if (entry.finished) {
-                entry.thread.join();
-                entry.finished = false;
-            }
-            entry.active = true;
             slot = i;
             break;
         }
     }
-    unlockSpawnMutex();
-    const slot_index = slot orelse {
-        std.debug.print("[error] too many spawned windows (max {d})\n", .{max_spawned_windows});
-        return error.TooManySpawnedWindows;
-    };
+    const slot_index = slot orelse return error.TooManyWindows;
+    const view_id = next_view_id;
+    next_view_id += 1;
+    const entry = &window_registry[slot_index];
+    entry.active = true;
+    entry.view_id = view_id;
+    entry.parent_view_id = request.parent;
+    entry.add_pending = true;
+    entry.pending_open_response = response_handle;
+    entry.pending_open_request_id = request.id;
 
-    const context = runner.gpa.create(SpawnContext) catch return error.OutOfMemory;
-    errdefer runner.gpa.destroy(context);
-
-    context.engine_library = runner.gpa.dupe(u8, runner.engine_library) catch return error.OutOfMemory;
-    errdefer runner.gpa.free(context.engine_library);
-    context.bundle_path = runner.gpa.dupe(u8, runner.bundle_path) catch return error.OutOfMemory;
-    errdefer runner.gpa.free(context.bundle_path);
-    context.entrypoint = runner.gpa.dupe(u8, request.entrypoint) catch return error.OutOfMemory;
-    errdefer runner.gpa.free(context.entrypoint);
-    context.args = runner.gpa.alloc([]const u8, request.args.len + 1) catch return error.OutOfMemory;
-    errdefer runner.gpa.free(context.args);
-    // argv[0] = 窗口身份 (entrypoint 名), 之后是请求的 args。
-    // 新窗口用 main 入口启动 (main 永远在 AOT 快照中), 通过 dart_entrypoint_argv 区分。
-    context.args[0] = runner.gpa.dupe(u8, request.entrypoint) catch return error.OutOfMemory;
-    for (request.args, 0..) |arg, i| {
-        context.args[i + 1] = runner.gpa.dupe(u8, arg) catch return error.OutOfMemory;
+    // 初始化窗口 (Wayland role + EGL surface)。失败回收槽位。
+    const host = &entry.host;
+    host.view_id = view_id;
+    host.render_context = runner.render_context;
+    errdefer {
+        host.deinit();
+        entry.* = .{};
     }
-    context.slot = slot_index;
+    try host.attach(runner.state);
+    switch (request.role) {
+        .window => |w| try host.initializeWindowRole(w, parent_toplevel),
+        .layer => |l| try host.initializeLayerRole(l),
+    }
+    host.setMetricsCallback(metricsCallback, host);
+    host.setPointerCallback(pointerCallback, host);
 
-    const thread = std.Thread.spawn(.{}, spawnThreadMain, .{ runner.gpa, context }) catch |err| {
-        lockSpawnMutex();
-        spawn_entries[slot_index].active = false;
-        unlockSpawnMutex();
-        std.debug.print("[error] failed to spawn window thread: {s}\n", .{@errorName(err)});
-        return error.WindowSpawnFailed;
-    };
-    lockSpawnMutex();
-    spawn_entries[slot_index].thread = thread;
-    unlockSpawnMutex();
-    std.debug.print("spawned window engine (entrypoint: {s})\n", .{request.entrypoint});
+    // FlutterEngineAddView: added 回调 (平台线程) 后回复 Dart。
+    const m = host.metrics();
+    var view_metrics: c.FlutterWindowMetricsEvent = std.mem.zeroes(c.FlutterWindowMetricsEvent);
+    view_metrics.struct_size = @sizeOf(c.FlutterWindowMetricsEvent);
+    view_metrics.width = m.width;
+    view_metrics.height = m.height;
+    view_metrics.pixel_ratio = m.pixel_ratio;
+    view_metrics.view_id = view_id;
+    var add_info: c.FlutterAddViewInfo = std.mem.zeroes(c.FlutterAddViewInfo);
+    add_info.struct_size = @sizeOf(c.FlutterAddViewInfo);
+    add_info.view_id = view_id;
+    add_info.view_metrics = &view_metrics;
+    add_info.user_data = entry;
+    add_info.add_view_callback = addViewCallback;
+    try flutter.ensureSuccess(runner.api.add_view(runner.engine, &add_info), "FlutterEngineAddView");
+    std.debug.print("window.open: view {d} (parent {any})\n", .{ view_id, request.parent });
 }
 
-/// spawn 线程的上下文 (gpa 持有, 线程 join 后由 run 返回前释放)。
-const SpawnContext = struct {
-    engine_library: []u8,
-    bundle_path: []u8,
-    entrypoint: []u8,
-    args: [][]const u8,
-    slot: usize,
-};
+/// Engine-managed thread callback: 仅记录 AddView 结果，资源与 Dart 响应由
+/// 平台线程 processViewLifecycleResults 完成。
+fn addViewCallback(result: [*c]const c.FlutterAddViewResult) callconv(.c) void {
+    const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    if (!entry.active or !entry.add_pending) return;
+    entry.add_result_added = result.*.added;
+    entry.add_result_ready = true;
+}
 
-fn spawnThreadMain(gpa: std.mem.Allocator, context: *SpawnContext) void {
-    var host: egl.Host = .{};
-    // 注册 host: 主线程用它触发退出 (running = false)
-    lockSpawnMutex();
-    spawn_entries[context.slot].host = &host;
-    unlockSpawnMutex();
-    defer {
-        // 先注销注册表 (需要 context.slot), 再释放 context — 顺序反了会 use-after-free
-        lockSpawnMutex();
-        spawn_entries[context.slot].active = false;
-        spawn_entries[context.slot].host = null;
-        // 标记线程已结束: 下次复用该槽位 (或主窗口退出) 时 join 回收资源。
-        // 不能在这里 detach — join 一个已 detach 的线程是未定义行为。
-        spawn_entries[context.slot].finished = true;
-        unlockSpawnMutex();
-        host.deinit();
-        gpa.free(context.engine_library);
-        gpa.free(context.bundle_path);
-        gpa.free(context.entrypoint);
-        for (context.args) |arg| gpa.free(arg);
-        gpa.free(context.args);
-        gpa.destroy(context);
+/// 提交异步 RemoveView。调用方必须持有窗口注册表锁；失败时回滚 pending 状态。
+fn beginWindowRemoval(
+    runner: *Runner,
+    entry: *WindowEntry,
+    response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+    request_id: i64,
+) !void {
+    if (entry.remove_pending) return error.WindowClosePending;
+    entry.remove_pending = true;
+    entry.pending_close_response = response_handle;
+    entry.pending_close_request_id = request_id;
+    errdefer {
+        entry.remove_pending = false;
+        entry.pending_close_response = null;
+        entry.pending_close_request_id = 0;
     }
-    run(gpa, .{
-        .engine_library = context.engine_library,
-        .bundle_path = context.bundle_path,
-        .role = .spawned,
-        // 新窗口用 main 入口 (main 是 AOT tree-shaker 的根, 永远保留);
-        // 窗口身份通过 argv[0] 传递, Dart 侧用 PlatformDispatcher.instance.args 区分。
-        .entrypoint = null,
-        .entrypoint_argv = context.args,
-        .external_host = &host,
-    }) catch |err| {
-        std.debug.print("[error] spawned window engine failed: {s}\n", .{@errorName(err)});
-    };
+
+    var remove_info: c.FlutterRemoveViewInfo = std.mem.zeroes(c.FlutterRemoveViewInfo);
+    remove_info.struct_size = @sizeOf(c.FlutterRemoveViewInfo);
+    remove_info.view_id = entry.view_id;
+    remove_info.user_data = entry;
+    remove_info.remove_view_callback = removeViewCallback;
+    try flutter.ensureSuccess(runner.api.remove_view(runner.engine, &remove_info), "FlutterEngineRemoveView");
+}
+
+/// window.close: RemoveView → removed 回调确认后才销毁 surface。
+fn closeWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.CloseWindowRequest) !void {
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    const entry = findWindowEntryByViewId(request.window_id) orelse return error.WindowNotFound;
+    try beginWindowRemoval(runner, entry, response_handle, request.id);
+    std.debug.print("window.close: view {d} (remove pending)\n", .{request.window_id});
+}
+
+/// Wayland close listener 只置位；下一次平台线程 tick 在 listener 栈外提交
+/// RemoveView，避免回调派发期间销毁 xdg/layer 对象。
+fn processCompositorCloseRequests(runner: *Runner) void {
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    for (&window_registry) |*entry| {
+        if (!entry.active or entry.add_pending or entry.remove_pending or !entry.host.takeCloseRequest()) continue;
+        const view_id = entry.view_id;
+        beginWindowRemoval(runner, entry, null, 0) catch |err| {
+            std.debug.print("[error] compositor close failed for view {d}: {s}\n", .{ view_id, @errorName(err) });
+            continue;
+        };
+        std.debug.print("compositor close: view {d} (remove pending)\n", .{view_id});
+    }
+}
+
+/// Engine-managed thread callback: 仅记录 RemoveView 结果。即使 removed=true，
+/// 也不得在这里触碰 Wayland/EGL；平台线程 tick 才执行销毁。
+fn removeViewCallback(result: [*c]const c.FlutterRemoveViewResult) callconv(.c) void {
+    const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    if (!entry.active or !entry.remove_pending) return;
+    entry.remove_result_removed = result.*.removed;
+    entry.remove_result_ready = true;
+}
+
+fn processViewLifecycleResults(runner: *Runner) void {
+    const Completion = enum { none, add_succeeded, add_failed, remove_succeeded, remove_failed };
+
+    for (0..window_registry.len) |index| {
+        var completion: Completion = .none;
+        var handle: ?*const c.FlutterPlatformMessageResponseHandle = null;
+        var request_id: i64 = 0;
+        var view_id: i64 = 0;
+
+        lockWindowRegistry();
+        const entry = &window_registry[index];
+        if (entry.active and entry.add_result_ready) {
+            handle = entry.pending_open_response;
+            request_id = entry.pending_open_request_id;
+            view_id = entry.view_id;
+            entry.add_result_ready = false;
+            entry.add_pending = false;
+            entry.pending_open_response = null;
+            entry.pending_open_request_id = 0;
+            if (entry.add_result_added) {
+                completion = .add_succeeded;
+            } else {
+                entry.host.deinit();
+                entry.* = .{};
+                completion = .add_failed;
+            }
+        } else if (entry.active and entry.remove_result_ready) {
+            handle = entry.pending_close_response;
+            request_id = entry.pending_close_request_id;
+            view_id = entry.view_id;
+            entry.remove_result_ready = false;
+            entry.pending_close_response = null;
+            entry.pending_close_request_id = 0;
+            if (entry.remove_result_removed) {
+                if (runner.focused_host == &entry.host) runner.focused_host = null;
+                entry.host.deinit();
+                for (&window_registry) |*child| {
+                    if (child.active and child.parent_view_id == view_id) child.parent_view_id = null;
+                }
+                entry.* = .{};
+                completion = .remove_succeeded;
+            } else {
+                entry.remove_pending = false;
+                completion = .remove_failed;
+            }
+        }
+        unlockWindowRegistry();
+
+        switch (completion) {
+            .none => {},
+            .add_succeeded => {
+                const response = surface_channel.openSuccessResponse(runner.gpa, request_id, view_id) catch |err| {
+                    std.debug.print("[error] Failed to encode window.open response: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                defer runner.gpa.free(response);
+                if (handle) |h| sendPlatformResponse(runner, h, response);
+            },
+            .add_failed => {
+                std.debug.print("[error] FlutterEngineAddView reported added=false for view {d}\n", .{view_id});
+                if (handle) |h| sendSurfaceError(runner, h, request_id, "AddViewFailed", "engine rejected the new view");
+            },
+            .remove_succeeded => {
+                if (handle) |h| sendSurfaceSuccess(runner, h, request_id);
+                std.debug.print("window.close: view {d} removed and surface destroyed.\n", .{view_id});
+            },
+            .remove_failed => {
+                std.debug.print("[error] FlutterEngineRemoveView reported removed=false for view {d}\n", .{view_id});
+                if (handle) |h| sendSurfaceError(runner, h, request_id, "RemoveViewFailed", "engine could not remove the view");
+            },
+        }
+    }
+}
+
+fn updateLayerSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.LayerUpdateRequest) !void {
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    const entry = findWindowEntryByViewId(request.window_id) orelse return error.WindowNotFound;
+    _ = try entry.host.updateLayerRole(request.update);
+    sendSurfaceSuccess(runner, response_handle, request.id);
+}
+
+fn updateWindowSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.WindowUpdateRequest) !void {
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    const entry = findWindowEntryByViewId(request.window_id) orelse return error.WindowNotFound;
+    _ = try entry.host.updateWindowRole(request.update);
+    sendSurfaceSuccess(runner, response_handle, request.id);
+}
+
+/// process.exit: 停止事件循环 → run() 退出序列 (关引擎 → 毁窗口 → 断连接)。
+fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.ExitRequest) !void {
+    sendSurfaceSuccess(runner, response_handle, request.id);
+    quit_requested.store(true, .release);
+    std.debug.print("process.exit({d}) requested; stopping event loop.\n", .{request.code});
+}
+
+/// 退出序列: 引擎已关闭 (无 present), 销毁全部剩余窗口。
+fn shutdownAllWindows() void {
+    lockWindowRegistry();
+    defer unlockWindowRegistry();
+    for (&window_registry) |*entry| {
+        if (!entry.active) continue;
+        entry.host.deinit();
+        entry.* = .{};
+    }
 }
 
 fn surfaceRequestErrorCode(err: anyerror) []const u8 {
@@ -1847,23 +1822,19 @@ fn sendEmptyPlatformResponse(runner: *Runner, response_handle: ?*const c.Flutter
 
 fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
-    const ready = runner.host.isReady();
-    if (!ready and !runner.bootstrap_render_logged) {
-        std.debug.print("Flutter requested rendering before FushellSurface.init completed; using EGL bootstrap pbuffer until Dart selects a surface role.\n", .{});
-        runner.bootstrap_render_logged = true;
-    }
-    runner.host.makeCurrent() catch |err| {
+    // raster 渲染目标永远是 bootstrap pbuffer (compositor 路径: 引擎渲进 backing
+    // store 纹理, 窗口 surface 只用于呈现)。
+    runner.render_context.makeCurrent() catch |err| {
         std.debug.print("[error] Flutter make_current callback failed: {s}\n", .{@errorName(err)});
         return false;
     };
-    if (ready) runner.beginRender();
+    runner.beginRender();
     return true;
 }
 
 fn clearCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
-    if (!runner.host.isReady()) return true;
-    runner.host.clearCurrent() catch |err| {
+    runner.render_context.clearCurrent() catch |err| {
         std.debug.print("[error] Flutter clear_current callback failed: {s}\n", .{@errorName(err)});
         return false;
     };
@@ -1872,50 +1843,142 @@ fn clearCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
 
 fn presentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
-    if (!runner.host.isReady()) {
-        if (!runner.bootstrap_present_logged) {
-            std.debug.print("[error] Flutter requested present before FushellSurface.init completed; dropping bootstrap frame until Dart selects a surface role.\n", .{});
-            runner.bootstrap_present_logged = true;
-        }
-        return true;
-    }
-    if (!runner.shouldPresentRenderedFrame()) {
-        const skipped = runner.skipped_resize_presents.fetchAdd(1, .monotonic) + 1;
-        if (skipped <= 5 or skipped % 30 == 0) {
-            std.debug.print("Skipping stale Flutter frame during resize/scale transition ({d} skipped); scheduling fresh frame.\n", .{skipped});
-        }
-        const schedule_result = runner.api.schedule_frame(runner.engine);
-        if (schedule_result != c.kSuccess) {
-            std.debug.print("[error] FlutterEngineScheduleFrame after stale resize frame failed: {s}\n", .{flutter.resultName(schedule_result)});
-        }
-        return true;
-    }
-    runner.host.swapBuffers() catch |err| {
-        std.debug.print("[error] Flutter present callback failed: {s}\n", .{@errorName(err)});
-        return false;
-    };
+    // compositor 路径下呈现由 present_view_callback 接管 (官方 GTK 嵌入器同款 no-op)。
     if (!runner.first_present_logged) {
-        std.debug.print("Flutter presented first frame on initialized Fushell surface.\n", .{});
+        std.debug.print("renderer present invoked; presentation handled by compositor present_view_callback.\n", .{});
         runner.first_present_logged = true;
     }
     return true;
 }
 
-fn fboCallback(user_data: ?*anyopaque) callconv(.c) u32 {
-    const runner = fromUserData(user_data);
-    if (!runner.host.isReady()) {
-        std.debug.print("Flutter requested FBO before FushellSurface.init completed.\n", .{});
-        return 0;
+/// compositor: 为引擎 layer 创建 GL 纹理 backing store (kFlutterBackingStoreTypeOpenGL)。
+/// 在 raster 线程调用, GL context 已 current。
+fn createBackingStoreCallback(config_ptr: [*c]const c.FlutterBackingStoreConfig, backing_store_ptr: [*c]c.FlutterBackingStore, user_data: ?*anyopaque) callconv(.c) bool {
+    const config: *const c.FlutterBackingStoreConfig = @ptrCast(config_ptr);
+    const backing_store_out: *c.FlutterBackingStore = @ptrCast(backing_store_ptr);
+    _ = fromUserData(user_data);
+    const width: c.GLsizei = @intFromFloat(@ceil(@max(config.size.width, 1.0)));
+    const height: c.GLsizei = @intFromFloat(@ceil(@max(config.size.height, 1.0)));
+    var texture: c.GLuint = 0;
+    c.glGenTextures(1, &texture);
+    if (texture == 0) {
+        std.debug.print("[error] glGenTextures failed for backing store {d}x{d}\n", .{ width, height });
+        return false;
     }
-    return runner.host.defaultFramebuffer();
+    c.glBindTexture(c.GL_TEXTURE_2D, texture);
+    // internalformat 与 format 报告都用 GL_RGBA8 (0x8058): 引擎按 FlutterOpenGLTexture.format
+    // 映射 SkColorType, GL_RGBA (6408) 不被支持 ("Cannot convert format 6408")。
+    const GL_RGBA8: c.GLint = 0x8058;
+    c.glTexImage2D(c.GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, null);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+    c.glBindTexture(c.GL_TEXTURE_2D, 0);
+
+    backing_store_out.* = std.mem.zeroes(c.FlutterBackingStore);
+    backing_store_out.struct_size = @sizeOf(c.FlutterBackingStore);
+    backing_store_out.type = c.kFlutterBackingStoreTypeOpenGL;
+    backing_store_out.unnamed_0.open_gl.type = c.kFlutterOpenGLTargetTypeTexture;
+    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.target = c.GL_TEXTURE_2D;
+    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.name = texture;
+    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.format = 0x8058; // GL_RGBA8
+    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.width = @intCast(width);
+    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.height = @intCast(height);
+    return true;
+}
+
+/// compositor: 回收 backing store 纹理。
+fn collectBackingStoreCallback(backing_store_ptr: [*c]const c.FlutterBackingStore, user_data: ?*anyopaque) callconv(.c) bool {
+    const backing_store: *const c.FlutterBackingStore = @ptrCast(backing_store_ptr);
+    _ = user_data;
+    if (backing_store.type != c.kFlutterBackingStoreTypeOpenGL) return true;
+    const texture = backing_store.unnamed_0.open_gl.unnamed_0.texture;
+    if (texture.name != 0) {
+        const name = texture.name;
+        c.glDeleteTextures(1, &name);
+    }
+    return true;
+}
+
+/// compositor: 将 view 的 layer tree blit 到对应窗口 EGL surface 并 swap。
+/// view 0 (implicit, 无头) no-op; 其余按注册表查窗口。
+fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c) bool {
+    const info: *const c.FlutterPresentViewInfo = @ptrCast(info_ptr);
+    if (info.view_id == 0) return true; // 无头 implicit view: 丢弃
+    const runner = fromUserData(info.user_data);
+    lockWindowRegistry();
+    const entry = findWindowEntryByViewId(info.view_id) orelse {
+        unlockWindowRegistry();
+        return true; // 窗口已关闭
+    };
+    if (entry.remove_pending) {
+        unlockWindowRegistry();
+        return true;
+    }
+    const host = &entry.host;
+    const lock_ok = host.present_mutex.tryLock();
+    unlockWindowRegistry();
+    if (!lock_ok) {
+        return true; // resize 中: 跳帧 (引擎会重试下一帧)
+    }
+    defer host.present_mutex.unlock();
+
+    if (!host.isReady()) return true;
+    runner.render_context.makeSurfaceCurrent(host.egl_surface) catch |err| {
+        std.debug.print("[error] present_view makeSurfaceCurrent failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    const blitter = &runner.blitter;
+    blitter.init() catch |err| {
+        std.debug.print("[error] blit init failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    const metrics = host.metrics();
+    const vp_w: f32 = @floatFromInt(metrics.width);
+    const vp_h: f32 = @floatFromInt(metrics.height);
+    for (0..info.layers_count) |i| {
+        const layer: *const c.FlutterLayer = @ptrCast(info.layers[i]);
+        switch (layer.type) {
+            c.kFlutterLayerContentTypeBackingStore => {
+                const bs: *const c.FlutterBackingStore = @ptrCast(layer.unnamed_0.backing_store);
+                const texture = bs.unnamed_0.open_gl.unnamed_0.texture;
+                blitter.blitLayer(texture.name, @floatCast(layer.offset.x), @floatCast(layer.offset.y), @floatCast(layer.size.width), @floatCast(layer.size.height), vp_w, vp_h);
+            },
+            else => {
+                std.debug.print("unsupported layer type in present: {}\n", .{layer.type});
+            },
+        }
+    }
+    runner.render_context.swapBuffers(host.egl_surface) catch |err| {
+        std.debug.print("[error] present_view swapBuffers failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    if (!runner.compositor_first_present_logged) {
+        std.debug.print("Flutter presented first frame via compositor (view {d}).\n", .{info.view_id});
+        runner.compositor_first_present_logged = true;
+    }
+    return true;
+}
+
+fn fboCallback(user_data: ?*anyopaque) callconv(.c) u32 {
+    _ = user_data;
+    // compositor 路径不使用 embedder FBO (引擎渲进 backing store 纹理)。
+    return 0;
 }
 
 fn glProcResolverCallback(user_data: ?*anyopaque, name: [*c]const u8) callconv(.c) ?*anyopaque {
     const runner = fromUserData(user_data);
     const name_z: [*:0]const u8 = @ptrCast(name);
-    const proc = runner.host.resolveGlProc(name_z);
-    if (proc == null) std.debug.print("Flutter GL proc resolver could not resolve: {s}\n", .{name_z});
-    return proc;
+    // eglGetProcAddress → GLES library fallback (与旧 Host.resolveGlProc 同逻辑,
+    // 现由引擎级 state 提供)。
+    const proc = c.eglGetProcAddress(name_z);
+    if (proc != null) return @ptrCast(@constCast(proc));
+    if (runner.state.gles_library) |*gles_library| {
+        if (gles_library.lookup(?*anyopaque, std.mem.span(name_z))) |symbol| return symbol;
+    }
+    std.debug.print("Flutter GL proc resolver could not resolve: {s}\n", .{name_z});
+    return null;
 }
 
 fn vsyncCallback(user_data: ?*anyopaque, baton: isize) callconv(.c) void {

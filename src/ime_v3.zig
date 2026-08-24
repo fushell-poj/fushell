@@ -32,7 +32,7 @@ pub const ImeV3 = struct {
     manager: ?*zwp.TextInputManagerV3 = null,
     callback: ?ImeCallback = null,
     callback_ctx: ?*anyopaque = null,
-    primary_queue: ?*wl.EventQueue = null,
+    shared_queue: ?*wl.EventQueue = null,
     // cursor rect 持久状态: hyprland 的 box.updated 只在带 cursor rect 的 commit 里为 true,
     // 后续 commit (surrounding/preedit) 会清掉 → 候选框 fallback 到窗口左下角。
     // 所有 commit 前重发 cursor rect 保持状态。
@@ -58,7 +58,7 @@ pub const ImeV3 = struct {
         // 事件绑定: listener + primary queue (否则事件进 default queue 无人 dispatch)。
         if (self.text_input) |ti| {
             ti.setListener(*ImeV3, listener, self);
-            if (self.primary_queue) |q| ti.setQueue(q);
+            if (self.shared_queue) |q| ti.setQueue(q);
         }
     }
 
@@ -75,7 +75,7 @@ pub const ImeV3 = struct {
         self.callback_ctx = ctx;
         if (self.text_input) |ti| {
             ti.setListener(*ImeV3, listener, self);
-            if (self.primary_queue) |q| ti.setQueue(q);
+            if (self.shared_queue) |q| ti.setQueue(q);
         }
     }
 

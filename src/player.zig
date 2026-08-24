@@ -9,7 +9,7 @@ comptime {
     _ = @import("surface_channel.zig");
 }
 
-/// 播放一个 bundle (阻塞直到窗口关闭)。
+/// 播放一个 bundle (阻塞直到程序退出)。
 /// enable_vm_service: 启动 VM service (热重载, 仅 debug/JIT 引擎)。
 pub fn runPlayer(gpa: std.mem.Allocator, bundle_path: []const u8, enable_vm_service: bool) !void {
     const engine_library = try resolveBundleEngineLibrary(gpa, bundle_path);
@@ -18,7 +18,6 @@ pub fn runPlayer(gpa: std.mem.Allocator, bundle_path: []const u8, enable_vm_serv
     try flutter_runner.run(gpa, .{
         .engine_library = engine_library,
         .bundle_path = bundle_path,
-        .role = .primary,
         .enable_vm_service = enable_vm_service,
     });
 }
