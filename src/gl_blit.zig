@@ -102,8 +102,8 @@ pub const Blitter = struct {
         const x1 = (x + w) / vp_w * 2.0 - 1.0;
         const y0 = 1.0 - y / vp_h * 2.0;
         const y1 = 1.0 - (y + h) / vp_h * 2.0;
-        // 纹理方向 (由 /tmp/fushell-layer.ppm dump 实证): 内容在纹理 UV 空间中
-        // 上下颠倒 — 内容顶部位于 v=1, 底部位于 v=0 (Skia 渲染进 FBO 的约定)。
+        // Skia renders backing-store textures with the framebuffer convention:
+        // content top is v=1 and content bottom is v=0.
         // 故屏幕 TL ← tex(u=0,v=1), 屏幕 BR ← tex(u=1,v=0): u 正常, v 翻转。
         const verts = [6]Vertex{
             .{ .x = x0, .y = y0, .u = 0.0, .v = 1.0 }, // TL

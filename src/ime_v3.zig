@@ -1,5 +1,6 @@
 //! text-input-v3 输入法客户端 (IME v3)。
-//! 通过 DisplayState 共享的 manager 创建, 每个窗口一个实例。
+//! 通过 DisplayState 共享的 manager 创建，单引擎共享一个实例。
+//! Wayland listener 在 bindManager 时安装一次；setCallback 只更新事件接收方。
 //! 生命周期: enable(聚焦) / disable(失焦) / commit(状态生效)。
 
 const std = @import("std");
@@ -70,13 +71,11 @@ pub const ImeV3 = struct {
         self.manager = null;
     }
 
+    /// 更新 IME 事件接收方。Wayland proxy 的 listener 由 bindManager 独占安装；
+    /// 重复为同一 proxy 注册 listener 会违反 zig-wayland 的单 listener 约束。
     pub fn setCallback(self: *ImeV3, callback: ImeCallback, ctx: ?*anyopaque) void {
         self.callback = callback;
         self.callback_ctx = ctx;
-        if (self.text_input) |ti| {
-            ti.setListener(*ImeV3, listener, self);
-            if (self.shared_queue) |q| ti.setQueue(q);
-        }
     }
 
     /// TextField 聚焦。

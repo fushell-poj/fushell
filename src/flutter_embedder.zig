@@ -107,3 +107,12 @@ pub fn ensureSuccess(result: c.FlutterEngineResult, step: []const u8) !void {
     std.debug.print("{s} failed: {s} ({d})\n", .{ step, resultName(result), result });
     return error.FlutterEngineCallFailed;
 }
+
+test "required engine symbols fail deterministically when absent" {
+    const libc = std.c.dlopen("libc.so.6", .{ .LAZY = true }) orelse return error.LibcUnavailable;
+    defer _ = std.c.dlclose(libc);
+    try std.testing.expectError(
+        error.FlutterEngineSymbolMissing,
+        loadSymbol(Api.EngineShutdownFn, libc, "FushellDefinitelyMissingEngineSymbol"),
+    );
+}

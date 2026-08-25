@@ -65,15 +65,13 @@ pub const VmService = struct {
         var request_buf: [512]u8 = undefined;
         // WebSocket 端点是 /TOKEN/ws (实测: 根路径返回 200 文本, /ws 才升级 101)
         // HTTP 头必须以 \r\n 结尾 (VM service 严格解析, 只发 \n 会不响应)
-        const request = try std.fmt.bufPrint(&request_buf,
-            "GET /{s}/ws HTTP/1.1\r\n" ++
-                "Host: 127.0.0.1:{d}\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Key: {s}\r\n" ++
-                "Sec-WebSocket-Version: 13\r\n" ++
-                "\r\n",
-            .{ uri.token, uri.port, key });
+        const request = try std.fmt.bufPrint(&request_buf, "GET /{s}/ws HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1:{d}\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: {s}\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n", .{ uri.token, uri.port, key });
         try vm.writeAll(request);
 
         // 读响应头 (直到 \r\n\r\n)
@@ -156,9 +154,7 @@ pub const VmService = struct {
     /// root_lib_uri: file:///path/to/new.kernel.dill (完整 kernel 即可, 非 delta)。
     pub fn reloadSources(self: *VmService, isolate_id: []const u8, root_lib_uri: []const u8, out: []u8) ![]const u8 {
         var params_buf: [4096]u8 = undefined;
-        const params = try std.fmt.bufPrint(&params_buf,
-            "{{\"isolateId\":\"{s}\",\"pause\":false,\"rootLibUri\":\"{s}\"}}",
-            .{ isolate_id, root_lib_uri });
+        const params = try std.fmt.bufPrint(&params_buf, "{{\"isolateId\":\"{s}\",\"pause\":false,\"rootLibUri\":\"{s}\"}}", .{ isolate_id, root_lib_uri });
         return self.call("reloadSources", params, out);
     }
 

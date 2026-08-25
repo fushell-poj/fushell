@@ -10,7 +10,7 @@ const display_state = @import("wl_display_state.zig");
 
 const default_width = 800;
 const default_height = 600;
-const max_outputs = 16;
+const max_outputs = display_state.max_outputs;
 
 const btn_left = 0x110;
 const btn_right = 0x111;
@@ -42,9 +42,19 @@ pub const PointerEvent = struct {
     time_ms: ?u32 = null,
 };
 
-pub const MetricsCallback = *const fn (context: ?*anyopaque, metrics: Metrics) void;
-pub const PointerCallback = *const fn (context: ?*anyopaque, event: PointerEvent) void;
-pub const EventLoopTickCallback = *const fn (context: ?*anyopaque) anyerror!void;
+pub const MetricsCallback = *const fn (host: *Host, context: ?*anyopaque, metrics: Metrics) void;
+pub const PointerCallback = *const fn (host: *Host, context: ?*anyopaque, event: PointerEvent) void;
+pub const EventLoopSource = struct {
+    fd: c_int,
+    context: ?*anyopaque,
+    tick: *const fn (context: ?*anyopaque) anyerror!void,
+    timeout_ms: *const fn (context: ?*anyopaque) i32,
+    consume_wake: *const fn (context: ?*anyopaque) void,
+    /// Optional dynamically-owned descriptor. A negative descriptor disables it.
+    /// The next loop tick consumes readiness, keeping subsystem state on the
+    /// platform thread instead of introducing worker-thread completion races.
+    auxiliary_fd: ?*const fn (context: ?*anyopaque) c_int = null,
+};
 
 pub const State = enum {
     uninitialized,
@@ -54,12 +64,50 @@ pub const State = enum {
     shutting_down,
 };
 
-const OutputState = struct {
-    name: u32 = 0,
-    output: ?*wl.Output = null,
-    scale: i32 = 1,
-    entered: bool = false,
+const OutputMembership = struct {
+    names: [max_outputs]u32 = [_]u32{0} ** max_outputs,
+
+    fn enter(self: *OutputMembership, name: u32) void {
+        if (name == 0 or self.contains(name)) return;
+        for (&self.names) |*slot| {
+            if (slot.* == 0) {
+                slot.* = name;
+                return;
+            }
+        }
+        std.debug.print("[warn] window output membership capacity exhausted.\n", .{});
+    }
+
+    fn leave(self: *OutputMembership, name: u32) void {
+        for (&self.names) |*slot| {
+            if (slot.* == name) {
+                slot.* = 0;
+                return;
+            }
+        }
+    }
+
+    fn contains(self: *const OutputMembership, name: u32) bool {
+        for (self.names) |entered_name| {
+            if (entered_name == name) return true;
+        }
+        return false;
+    }
 };
+
+fn initialLayerDimension(requested: ?i32) i32 {
+    return requested orelse 0;
+}
+
+fn integerScaleForMembership(membership: *const OutputMembership, outputs: []const display_state.OutputState) i32 {
+    var scale: i32 = 1;
+    for (outputs) |output_state| {
+        if (output_state.name != 0 and membership.contains(output_state.name) and output_state.scale > scale) {
+            scale = output_state.scale;
+        }
+    }
+    return scale;
+}
 
 /// 进程级单一 EGL render context: raster 渲染 (bootstrap pbuffer) 与全部
 /// 窗口的呈现共用 (compositor 路径下两者同在引擎 raster 线程, 无跨线程
@@ -69,6 +117,8 @@ pub const RenderContext = struct {
     egl_config: c.EGLConfig = null,
     egl_context: c.EGLContext = null,
     bootstrap_surface: c.EGLSurface = null,
+    resource_context: c.EGLContext = null,
+    resource_surface: c.EGLSurface = null,
 
     pub fn init(self: *RenderContext, state: *display_state.DisplayState) !void {
         self.display_state = state;
@@ -104,6 +154,14 @@ pub const RenderContext = struct {
         self.bootstrap_surface = c.eglCreatePbufferSurface(state.egl_display, self.egl_config, &pbuffer_attribs);
         if (self.bootstrap_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(bootstrap)");
 
+        // Flutter performs asynchronous texture uploads on its resource thread.
+        // Give that thread a dedicated pbuffer/context sharing the raster context's
+        // object namespace, so it never contends for the raster EGL context.
+        self.resource_context = c.eglCreateContext(state.egl_display, self.egl_config, self.egl_context, &context_attribs);
+        if (self.resource_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext(resource)");
+        self.resource_surface = c.eglCreatePbufferSurface(state.egl_display, self.egl_config, &pbuffer_attribs);
+        if (self.resource_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(resource)");
+
         state.openGlesLibrary();
         try self.makeCurrent();
         try self.clearCurrent();
@@ -111,6 +169,8 @@ pub const RenderContext = struct {
 
     pub fn deinit(self: *RenderContext) void {
         if (self.display_state.egl_display != null and self.display_state.egl_display != c.EGL_NO_DISPLAY) {
+            if (self.resource_surface != null and self.resource_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.resource_surface);
+            if (self.resource_context != null and self.resource_context != c.EGL_NO_CONTEXT) _ = c.eglDestroyContext(self.display_state.egl_display, self.resource_context);
             if (self.bootstrap_surface != null and self.bootstrap_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.bootstrap_surface);
             if (self.egl_context != null and self.egl_context != c.EGL_NO_CONTEXT) _ = c.eglDestroyContext(self.display_state.egl_display, self.egl_context);
         }
@@ -121,6 +181,12 @@ pub const RenderContext = struct {
     pub fn makeCurrent(self: *RenderContext) !void {
         if (c.eglMakeCurrent(self.display_state.egl_display, self.bootstrap_surface, self.bootstrap_surface, self.egl_context) != c.EGL_TRUE) {
             return eglError("eglMakeCurrent");
+        }
+    }
+
+    pub fn makeResourceCurrent(self: *RenderContext) !void {
+        if (c.eglMakeCurrent(self.display_state.egl_display, self.resource_surface, self.resource_surface, self.resource_context) != c.EGL_TRUE) {
+            return eglError("eglMakeCurrent(resource)");
         }
     }
 
@@ -166,8 +232,10 @@ pub const Host = struct {
     egl_surface: c.EGLSurface = null,
     /// 本窗口的 Flutter view_id (0 = 非窗口/implicit)。
     view_id: i64 = 0,
-    /// resize (主线程) 与 present (引擎线程) 互斥: resize 持锁, present 拿不到则跳帧。
-    present_mutex: std.atomic.Mutex = .unlocked,
+    /// resize (主线程) 与 present (引擎线程) 互斥。
+    /// 使用阻塞 mutex，避免高负载下的无界自旋。
+    io: std.Io = undefined,
+    present_mutex: std.Io.Mutex = .init,
     configured: bool = false,
     /// Wayland compositor 请求关闭该窗口。平台线程下一次 tick 消费并提交
     /// FlutterEngineRemoveView；不得在协议 listener 栈内直接销毁 Wayland 对象。
@@ -178,6 +246,7 @@ pub const Host = struct {
     pending_height: i32 = 0,
     scale: i32 = 1,
     fractional_scale_120: u32 = 0,
+    entered_outputs: OutputMembership = .{},
 
     pointer_focused: bool = false,
     pointer_x: f64 = 0,
@@ -194,8 +263,9 @@ pub const Host = struct {
     /// 都 bind 到这个共享 queue (单线程事件循环模型)。
     /// attach 先于 bindGlobals/render_context.init (attach 触发连接建立),
     /// 故 queue 引用在角色初始化前刷新, render_context 由 run() 注入。
-    pub fn attach(self: *Host, state: *display_state.DisplayState) !void {
+    pub fn attach(self: *Host, state: *display_state.DisplayState, io: std.Io) !void {
         self.display_state = state;
+        self.io = io;
         _ = try state.acquire();
         self.event_queue = state.shared_queue;
         self.adoptProvisionalScaleFromOutputs();
@@ -230,7 +300,7 @@ pub const Host = struct {
 
         self.applyBufferScale();
         self.surface.?.commit();
-        self.display_state.flushLocked();
+        self.display_state.flush();
         try self.waitForInitialConfigure();
         try self.attachEglWindowSurface();
         self.state = .ready;
@@ -241,8 +311,10 @@ pub const Host = struct {
         errdefer self.state = .failed;
         if (self.display_state.layer_shell == null) return error.LayerShellUnavailable;
 
-        if (layer.width) |width| self.width = width;
-        if (layer.height) |height| self.height = height;
+        // layer-shell 以 0 表示由相对两侧 anchor 决定尺寸；不能沿用
+        // xdg window Host 的默认宽高，否则 left+right/top+bottom 不会拉伸。
+        self.width = initialLayerDimension(layer.width);
+        self.height = initialLayerDimension(layer.height);
 
         try self.createBaseSurface();
         const namespace_z = try std.heap.c_allocator.dupeZ(u8, layer.namespace);
@@ -258,7 +330,7 @@ pub const Host = struct {
 
         self.applyBufferScale();
         self.surface.?.commit();
-        self.display_state.flushLocked();
+        self.display_state.flush();
         try self.waitForInitialConfigure();
         try self.attachEglWindowSurface();
         self.state = .ready;
@@ -269,8 +341,8 @@ pub const Host = struct {
         if (update.isEmpty()) return false;
         // 布局变更时与 present 互斥 (同 resizeWindow)。
         if (update.affectsLayout()) {
-            while (!self.present_mutex.tryLock()) std.atomic.spinLoopHint();
-            defer self.present_mutex.unlock();
+            self.present_mutex.lock(self.io) catch unreachable;
+            defer self.present_mutex.unlock(self.io);
         }
 
         const layer_surface = self.layer_surface.?;
@@ -303,7 +375,7 @@ pub const Host = struct {
         self.applyBufferScale();
         if (layout_changed) self.configured = false;
         self.surface.?.commit();
-        self.display_state.flushLocked();
+        self.display_state.flush();
         if (layout_changed) {
             const got_configure = try self.waitForUpdateConfigure();
             if (!got_configure) self.emitMetrics();
@@ -327,14 +399,14 @@ pub const Host = struct {
             defer std.heap.c_allocator.free(app_id_z);
             toplevel.setAppId(app_id_z);
         }
-        self.display_state.flushLocked();
+        self.display_state.flush();
         return false;
     }
 
     pub fn waitForInitialConfigure(self: *Host) !void {
         while (!self.configured) {
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
-            self.display_state.flushLocked();
+            self.display_state.flush();
             var fds = [_]c.struct_pollfd{.{
                 .fd = self.display_state.display.?.getFd(),
                 .events = c.POLLIN,
@@ -390,8 +462,8 @@ pub const Host = struct {
 
     pub fn resizeWindow(self: *Host) void {
         // resize (主线程) 与 present (引擎线程) 互斥: present 侧 tryLock 跳帧。
-        while (!self.present_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.present_mutex.unlock();
+        self.present_mutex.lock(self.io) catch unreachable;
+        defer self.present_mutex.unlock(self.io);
         self.applyBufferScale();
         const physical_width = self.physicalWidthI32();
         const physical_height = self.physicalHeightI32();
@@ -405,26 +477,43 @@ pub const Host = struct {
         return self.state == .ready;
     }
 
-    pub fn runEventLoop(self: *Host, quit: *const std.atomic.Value(bool), message: []const u8, tick_callback: ?EventLoopTickCallback, tick_context: ?*anyopaque) !void {
+    pub fn runEventLoop(self: *Host, quit: *const std.atomic.Value(bool), message: []const u8, source: EventLoopSource) !void {
         std.debug.print("{s}\n", .{message});
         while (!quit.load(.acquire)) {
-            if (tick_callback) |callback| try callback(tick_context);
+            try source.tick(source.context);
+            if (quit.load(.acquire)) break;
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
-            self.display_state.flushLocked();
+            if (quit.load(.acquire)) break;
+            self.display_state.flush();
 
-            var fds = [_]c.struct_pollfd{.{
-                .fd = self.display_state.display.?.getFd(),
-                .events = c.POLLIN,
-                .revents = 0,
-            }};
-            const poll_result = c.poll(&fds, fds.len, 8);
-            if (poll_result < 0) return error.WaylandDispatchFailed;
-            if (poll_result > 0 and (fds[0].revents & c.POLLIN) != 0) {
+            var fds = [_]std.posix.pollfd{
+                .{
+                    .fd = self.display_state.display.?.getFd(),
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+                .{
+                    .fd = source.fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+                .{
+                    .fd = if (source.auxiliary_fd) |get_fd| get_fd(source.context) else -1,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+            };
+            _ = std.posix.poll(&fds, source.timeout_ms(source.context)) catch return error.EventLoopPollFailed;
+            if ((fds[1].revents & std.posix.POLL.IN) != 0) source.consume_wake(source.context);
+            if ((fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.TaskWakePollFailed;
+            if ((fds[2].revents & std.posix.POLL.NVAL) != 0) return error.AuxiliaryPollFailed;
+            if ((fds[0].revents & std.posix.POLL.IN) != 0) {
                 // 单线程模型: 主线程唯一预约读 (无需多线程原子读竞争处理)。
                 if (self.display_state.display.?.prepareReadQueue(self.sharedQueue())) {
                     if (self.display_state.display.?.readEvents() != .SUCCESS) return error.WaylandDispatchFailed;
                 }
             }
+            if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.WaylandDisplayPollFailed;
         }
     }
 
@@ -452,7 +541,7 @@ pub const Host = struct {
         if (self.surface) |surface| surface.destroy();
         // 关键: 显式 flush, 否则 destroy 请求只进本地队列, compositor 收不到
         // → 窗口变成幽灵窗口 (线程已死但窗口还在, hyprland ping 无应答 → 未响应)。
-        self.display_state.flushLocked();
+        self.display_state.flush();
         // event_queue 是进程级共享 queue (由 DisplayState.deinit 统一销毁),
         // 这里只清引用。
         self.event_queue = null;
@@ -491,7 +580,7 @@ pub const Host = struct {
         while (!self.configured and attempts < 64) : (attempts += 1) {
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
             if (self.configured) return true;
-            self.display_state.flushLocked();
+            self.display_state.flush();
             var fds = [_]c.struct_pollfd{.{
                 .fd = self.display_state.display.?.getFd(),
                 .events = c.POLLIN,
@@ -552,7 +641,7 @@ pub const Host = struct {
         // 是全局对象, 绑主 queue)。此时引擎句柄已失效, 再发 metrics 会 UAF。
         if (self.state == .shutting_down or self.state == .failed) return;
         self.resizeWindow();
-        if (self.metrics_callback) |callback| callback(self.metrics_context, self.metrics());
+        if (self.metrics_callback) |callback| callback(self, self.metrics_context, self.metrics());
     }
 
     fn applyPendingConfigure(self: *Host) void {
@@ -573,27 +662,13 @@ pub const Host = struct {
     fn emitPointer(self: *Host, event: PointerEvent) void {
         // 同 emitMetrics: 主线程 dispatch 可能触达关闭中的窗口。
         if (self.state == .shutting_down or self.state == .failed) return;
-        if (self.pointer_callback) |callback| callback(self.pointer_context, event);
+        if (self.pointer_callback) |callback| callback(self, self.pointer_context, event);
     }
 
-    fn outputSlotByName(self: *Host, name: u32) ?*OutputState {
-        for (&self.display_state.outputs) |*output_state| {
-            if (output_state.name == name and output_state.output != null) return output_state;
-        }
-        return null;
-    }
-
-    fn outputSlotByObject(self: *Host, output: ?*wl.Output) ?*display_state.OutputState {
+    fn outputName(self: *const Host, output: ?*wl.Output) ?u32 {
         if (output == null) return null;
-        for (&self.display_state.outputs) |*output_state| {
-            if (output_state.output == output) return output_state;
-        }
-        return null;
-    }
-
-    fn emptyOutputSlot(self: *Host) ?*display_state.OutputState {
-        for (&self.display_state.outputs) |*output_state| {
-            if (output_state.output == null) return output_state;
+        for (self.display_state.outputs) |output_state| {
+            if (output_state.output == output) return output_state.name;
         }
         return null;
     }
@@ -614,10 +689,7 @@ pub const Host = struct {
 
     pub fn recomputeScale(self: *Host) void {
         if (self.fractional_scale_120 > 0) return;
-        var next_scale: i32 = 1;
-        for (self.display_state.outputs) |output_state| {
-            if (output_state.entered and output_state.scale > next_scale) next_scale = output_state.scale;
-        }
+        const next_scale = integerScaleForMembership(&self.entered_outputs, &self.display_state.outputs);
         if (next_scale == self.scale) return;
         const old_scale = self.scale;
         self.scale = next_scale;
@@ -816,14 +888,14 @@ fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSu
 fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, self: *Host) void {
     switch (event) {
         .enter => |enter| {
-            if (self.outputSlotByObject(enter.output)) |slot| {
-                slot.entered = true;
+            if (self.outputName(enter.output)) |name| {
+                self.entered_outputs.enter(name);
                 self.recomputeScale();
             }
         },
         .leave => |leave| {
-            if (self.outputSlotByObject(leave.output)) |slot| {
-                slot.entered = false;
+            if (self.outputName(leave.output)) |name| {
+                self.entered_outputs.leave(name);
                 self.recomputeScale();
             }
         },
@@ -865,4 +937,35 @@ fn openGlesLibrary() ?std.DynLib {
 fn eglError(comptime step: []const u8) error{EglFailed} {
     std.debug.print("{s} failed: EGL error 0x{x}\n", .{ step, c.eglGetError() });
     return error.EglFailed;
+}
+
+test "unspecified layer dimensions remain compositor-controlled" {
+    try std.testing.expectEqual(@as(i32, 0), initialLayerDimension(null));
+    try std.testing.expectEqual(@as(i32, 32), initialLayerDimension(32));
+}
+
+test "output membership is isolated per window" {
+    const outputs = [_]display_state.OutputState{
+        .{ .name = 11, .scale = 1 },
+        .{ .name = 22, .scale = 2 },
+    };
+    var first: OutputMembership = .{};
+    var second: OutputMembership = .{};
+    first.enter(11);
+    second.enter(22);
+
+    try std.testing.expectEqual(@as(i32, 1), integerScaleForMembership(&first, &outputs));
+    try std.testing.expectEqual(@as(i32, 2), integerScaleForMembership(&second, &outputs));
+}
+
+test "output membership uses global names rather than reusable slots" {
+    var membership: OutputMembership = .{};
+    membership.enter(11);
+
+    const after_removal = [_]display_state.OutputState{.{ .name = 22, .scale = 2 }};
+    try std.testing.expectEqual(@as(i32, 1), integerScaleForMembership(&membership, &after_removal));
+
+    membership.leave(11);
+    membership.enter(22);
+    try std.testing.expectEqual(@as(i32, 2), integerScaleForMembership(&membership, &after_removal));
 }

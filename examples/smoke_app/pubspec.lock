@@ -70,7 +70,7 @@ packages:
   fushell:
     dependency: "direct main"
     description:
-      path: "vendor/fushell"
+      path: "../../packages/fushell"
       relative: true
     source: path
     version: "0.1.0"

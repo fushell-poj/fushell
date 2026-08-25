@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
                 break :blk null;
             };
         }
-        player.runPlayer(gpa, options.bundle_dir, enable_vm_service) catch |err| {
+        player.runPlayer(gpa, io, options.bundle_dir, enable_vm_service) catch |err| {
             std.debug.print("[error] fushell-build run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -210,7 +210,7 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
     var waited: usize = 0;
     var uri_buf: [512]u8 = undefined;
     const uri = while (true) {
-        if (flutter_runner.vm_service.get(&uri_buf)) |u| break u;
+        if (flutter_runner.vm_service.get(io, &uri_buf)) |u| break u;
         if (waited > 20_000) {
             std.debug.print("[hot-reload] timeout waiting for VM service URI.\n", .{});
             return;
@@ -257,12 +257,14 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
     const project_dir = std.process.currentPathAlloc(io, gpa) catch return;
     defer gpa.free(project_dir);
 
-    const kernel_path = "/tmp/fushell-hotreload-kernel.dill";
+    var kernel_path_buf: [128]u8 = undefined;
+    const kernel_path = std.fmt.bufPrint(&kernel_path_buf, "/tmp/fushell-hotreload-kernel-{d}.dill", .{std.os.linux.getpid()}) catch return;
+    defer std.Io.Dir.cwd().deleteFile(io, kernel_path) catch {};
     var main_uri_buf: [4096]u8 = undefined;
     const main_uri = std.fmt.bufPrint(&main_uri_buf, "file://{s}/lib/main.dart", .{project_dir}) catch return;
     var err_buf: [4096]u8 = undefined;
 
-    // 常驻 frontend_server (诊断模式: 查退出根因)
+    // Keep one frontend_server alive for incremental compilation.
     var fs = frontend_server.FrontendServer.start(gpa, io, flutter_root, project_dir, kernel_path, main_uri) catch |err| {
         std.debug.print("[hot-reload] frontend_server start failed: {s}\n", .{@errorName(err)});
         return;
@@ -512,9 +514,16 @@ fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []
     defer gpa.free(assemble_target);
     const build_mode_arg = try std.fmt.allocPrint(gpa, "-dBuildMode={s}", .{@tagName(mode)});
     defer gpa.free(build_mode_arg);
+    const split_debug_dir = "build/fushell_debug_info";
+    const split_debug_arg = "-dSplitDebugInfo=" ++ split_debug_dir;
+    // Flutter's assemble cache does not track deletion of split debug-info
+    // outputs. Invalidate its AOT graph so every release build regenerates the
+    // mandatory symbols artifact rather than reusing a stale app.so cache hit.
+    try runCommand(gpa, io, &.{ "rm", "-rf", split_debug_dir, ".dart_tool/flutter_build" });
     try runCommand(gpa, io, &.{
-        "flutter",    "assemble",     "--no-version-check", "--output=build",
-        platform_arg, build_mode_arg, target_file_arg,      assemble_target,
+        "flutter",       "assemble",     "--no-version-check", "--output=build",
+        platform_arg,    build_mode_arg, target_file_arg,      split_debug_arg,
+        assemble_target,
     });
 
     // 2. 校验 libapp.so (gen_snapshot 产物, 与自编引擎同 commit 配对)
@@ -525,6 +534,15 @@ fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []
         std.debug.print("`flutter assemble -dBuildMode={s} {s}` should have produced it (gen_snapshot AOT output).\n", .{ @tagName(mode), assemble_target });
         std.debug.print("Verify the Flutter SDK engine commit matches the embedded engine (42d3d75a).\n", .{});
         return error.MissingLibAppSo;
+    }
+
+    const debug_info_name = try std.fmt.allocPrint(gpa, "app.{s}.symbols", .{target_platform});
+    defer gpa.free(debug_info_name);
+    const debug_info = try std.fs.path.join(gpa, &.{ split_debug_dir, debug_info_name });
+    defer gpa.free(debug_info);
+    if (!try pathExists(gpa, debug_info)) {
+        std.debug.print("AOT debug info not found at {s}\n", .{debug_info});
+        return error.MissingAotDebugInfo;
     }
 
     // 3. 组装 AOT bundle
@@ -540,12 +558,15 @@ fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []
     defer gpa.free(engine_library);
     const app_so_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so" });
     defer gpa.free(app_so_dest);
+    const debug_info_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so.symbols" });
+    defer gpa.free(debug_info_dest);
 
     try runCommand(gpa, io, &.{ "rm", "-rf", bundle_dir });
     try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
     try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
     try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
     try runCommand(gpa, io, &.{ "cp", app_so, app_so_dest });
+    try runCommand(gpa, io, &.{ "cp", debug_info, debug_info_dest });
     try writeEmbeddedEngine(io, mode, engine_library);
     try writeBundleEntry(gpa, io, bundle_dir);
 
@@ -685,6 +706,46 @@ fn releaseSdk(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     std.debug.print("  dependencies:\n", .{});
     std.debug.print("    fushell:\n", .{});
     std.debug.print("      path: {s}\n", .{target});
+}
+
+test "released SDK matches the canonical embedded package byte-for-byte" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const output_root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(output_root);
+
+    try releaseSdk(std.testing.allocator, std.testing.io, output_root);
+
+    const pubspec = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "fushell/pubspec.yaml",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(pubspec);
+    const library = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "fushell/lib/fushell.dart",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(library);
+    const readme = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "fushell/README.md",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(readme);
+
+    try std.testing.expectEqualSlices(u8, embedded_sdk_pubspec, pubspec);
+    try std.testing.expectEqualSlices(u8, embedded_sdk_lib, library);
+    try std.testing.expectEqualSlices(u8, embedded_sdk_readme, readme);
 }
 
 /// 解析 pubspec.yaml 的第一层 name (无缩进的 "name:" 行)。

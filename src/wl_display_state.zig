@@ -5,17 +5,13 @@
 //!   - 单一 wl_display 连接 (唯一 fd)
 //!   - 单一 EGLDisplay (由 wl_display 派生)
 //!   - 全局对象 (registry/compositor/wm_base/.../seat/pointer) 唯一
-//!   - 引用计数: 主窗口 + 每个 spawn 窗口各持有 1, 归零时完整清理
+//!   - 引用计数: Runner 与窗口 Host 持有引用, 归零时完整清理
 //!
-//! 线程模型: 全局对象绑定主窗口的 event queue, 由主窗口线程 dispatch;
-//! 每个窗口的 surface 对象绑自己的 queue。连接级 flush 用互斥锁保护。
+//! 线程模型: 全局对象与所有窗口对象绑定同一 event queue,由平台线程统一
+//! dispatch。raster 线程仅通过受控回调访问呈现资源。
 
 const std = @import("std");
 
-/// atomic.Mutex (0.16) 无 lock(), 统一用自旋 tryLock 封装。
-fn lockMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.atomic.spinLoopHint();
-}
 const wayland = @import("wayland");
 const data_control = @import("data_control.zig");
 const ime_v3 = @import("ime_v3.zig");
@@ -28,10 +24,24 @@ const c = @import("c");
 
 pub const max_outputs = 16;
 
+/// Input and scale callbacks carry explicit owner context so DisplayState does
+/// not depend on process-global runner pointers.
+pub const KeyboardEvent = union(enum) {
+    keymap: struct { format: wl.Keyboard.KeymapFormat, data: []const u8 },
+    enter: struct { surface: ?*wl.Surface, keys: ?*wl.Array },
+    leave: struct { surface: ?*wl.Surface },
+    key: struct { serial: u32, time: u32, key: u32, state: wl.Keyboard.KeyState },
+    modifiers: struct { depressed: u32, latched: u32, locked: u32, group: u32 },
+    repeat: struct { delay_ms: i32, rate_per_sec: i32 },
+};
+
+pub const KeyboardEventCallback = *const fn (event: KeyboardEvent, surface: ?*wl.Surface, context: ?*anyopaque) void;
+pub const PointerEventCallback = *const fn (event: wl.Pointer.Event, surface: ?*wl.Surface, context: ?*anyopaque) void;
+pub const ScaleChangeCallback = *const fn (context: ?*anyopaque) void;
+
 pub const OutputState = struct {
     name: u32 = 0,
     output: ?*wl.Output = null,
-    entered: bool = false,
     scale: i32 = 1,
 };
 
@@ -49,6 +59,15 @@ pub const DisplayState = struct {
     /// — 无头 compositor (cage + 无输入设备) 下 seat 无 pointer/keyboard,
     /// 无条件调用会触发协议错误 (wl_seat.get_pointer called when no pointer capability)。
     seat_capabilities: wl.Seat.Capability = .{},
+
+    keyboard_event_callback: ?KeyboardEventCallback = null,
+    keyboard_event_context: ?*anyopaque = null,
+    current_keyboard_surface: ?*wl.Surface = null,
+    pointer_event_callback: ?PointerEventCallback = null,
+    pointer_event_context: ?*anyopaque = null,
+    current_pointer_surface: ?*wl.Surface = null,
+    scale_change_callback: ?ScaleChangeCallback = null,
+    scale_change_context: ?*anyopaque = null,
     pointer: ?*wl.Pointer = null,
     keyboard: ?*wl.Keyboard = null,
     data_control: ?*data_control.DataControl = null,
@@ -66,9 +85,6 @@ pub const DisplayState = struct {
     /// 进程级单一 event queue — 全部对象 (全局 + 所有窗口 surface/xdg) 绑定它,
     /// 由主线程单一事件循环 dispatch (单线程模型, 无 per-window queue)。
     shared_queue: ?*wl.EventQueue = null,
-    /// 连接级 flush 互斥 (多个窗口线程共享同一连接写)。
-    flush_mutex: std.atomic.Mutex = .unlocked,
-
     // ── 初始化 / 生命周期 ──────────────────────────────
 
     /// 首次获取时建立连接。返回是否首次 (新连接)。
@@ -224,14 +240,6 @@ pub const DisplayState = struct {
 
     // ── 输出 / scale ──────────────────────────────────
 
-    pub fn activeScale120(self: *const DisplayState) u32 {
-        var scale: u32 = 0;
-        for (&self.outputs) |*output_state| {
-            if (output_state.entered and output_state.scale > scale) scale = @intCast(output_state.scale);
-        }
-        return if (scale == 0) 120 else scale * 120;
-    }
-
     pub fn emptyOutputSlot(self: *DisplayState) ?*OutputState {
         for (&self.outputs) |*slot| {
             if (slot.output == null) return slot;
@@ -253,21 +261,11 @@ pub const DisplayState = struct {
         return null;
     }
 
-    // ── flush (连接级互斥) ────────────────────────────
+    // ── flush ──────────────────────────────────────────
 
-    pub fn flushLocked(self: *DisplayState) void {
-        self.lockFlush();
-        defer self.unlockFlush();
+    /// All Wayland protocol operations run on the platform thread.
+    pub fn flush(self: *DisplayState) void {
         if (self.display) |display| _ = display.flush();
-    }
-
-    /// 手动锁/解锁 flush 互斥 (跨多次 marshal 时用, 如 data-control receive)。
-    pub fn lockFlush(self: *DisplayState) void {
-        lockMutex(&self.flush_mutex);
-    }
-
-    pub fn unlockFlush(self: *DisplayState) void {
-        self.flush_mutex.unlock();
     }
 
     // ── GL 库 (共享) ──────────────────────────────────
@@ -347,7 +345,7 @@ fn outputListener(output: *wl.Output, event: wl.Output.Event, self: *DisplayStat
             const factor = @max(scale.factor, 1);
             if (slot.scale != factor) {
                 slot.scale = factor;
-                if (scale_change_callback) |callback| callback();
+                if (self.scale_change_callback) |callback| callback(self.scale_change_context);
             }
         },
         .done => {},
@@ -362,7 +360,7 @@ fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, self: *DisplayS
     switch (event) {
         .ping => |ping| {
             wm_base.pong(ping.serial);
-            self.flushLocked();
+            self.flush();
         },
     }
 }
@@ -385,42 +383,26 @@ fn seatListener(_: *wl.Seat, event: wl.Seat.Event, self: *DisplayState) void {
 
 // ── 键盘事件 ──────────────────────────────────────
 
-/// 键盘事件由主窗口线程 dispatch (keyboard 绑主 queue)。
-/// enter 事件带 surface → 目标窗口由 runner 层路由 (同 pointer)。
-/// keymap 事件的 fd 需要 mmap 读取 (生命周期: 回调内处理完毕即 munmap)。
-pub const KeyboardEvent = union(enum) {
-    keymap: struct { format: wl.Keyboard.KeymapFormat, data: []const u8 },
-    enter: struct { surface: ?*wl.Surface, keys: ?*wl.Array },
-    leave: struct { surface: ?*wl.Surface },
-    key: struct { serial: u32, time: u32, key: u32, state: wl.Keyboard.KeyState },
-    modifiers: struct { depressed: u32, latched: u32, locked: u32, group: u32 },
-    repeat: struct { delay_ms: i32, rate_per_sec: i32 },
-};
-
-pub const KeyboardEventCallback = *const fn (event: KeyboardEvent, surface: ?*wl.Surface) void;
-
-var keyboard_event_callback: ?KeyboardEventCallback = null;
-var keyboard_event_context: ?*anyopaque = null;
-
-pub fn setKeyboardEventCallback(callback: KeyboardEventCallback, context: ?*anyopaque) void {
-    keyboard_event_callback = callback;
-    keyboard_event_context = context;
+/// enter 事件带 surface → 目标窗口由 runner 层路由。keymap 的 fd 在
+/// 回调内完成 mmap/读取并立即释放。
+pub fn setKeyboardEventCallback(self: *DisplayState, callback: KeyboardEventCallback, context: ?*anyopaque) void {
+    self.keyboard_event_callback = callback;
+    self.keyboard_event_context = context;
 }
 
-var current_keyboard_surface: ?*wl.Surface = null;
-fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, _: *DisplayState) void {
+fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *DisplayState) void {
     const surface = switch (event) {
         .enter => |enter| blk: {
-            current_keyboard_surface = enter.surface;
+            self.current_keyboard_surface = enter.surface;
             break :blk enter.surface;
         },
         .leave => |leave| blk: {
-            current_keyboard_surface = null;
+            self.current_keyboard_surface = null;
             break :blk leave.surface;
         },
-        else => current_keyboard_surface,
+        else => self.current_keyboard_surface,
     };
-    if (keyboard_event_callback) |callback| {
+    if (self.keyboard_event_callback) |callback| {
         switch (event) {
             .keymap => |km| {
                 // fd 是 MAP_PRIVATE 只读映射 (v7+)。读取后立即关闭/解除。
@@ -437,56 +419,49 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, _: *DisplayState)
                         _ = std.os.linux.close(fd);
                         return;
                     };
-                    callback(.{ .keymap = .{ .format = km.format, .data = map } }, surface);
+                    callback(.{ .keymap = .{ .format = km.format, .data = map } }, surface, self.keyboard_event_context);
                     _ = std.posix.munmap(map);
                 }
                 _ = std.os.linux.close(fd);
             },
-            .enter => |enter| callback(.{ .enter = .{ .surface = enter.surface, .keys = enter.keys } }, surface),
-            .leave => |leave| callback(.{ .leave = .{ .surface = leave.surface } }, surface),
+            .enter => |enter| callback(.{ .enter = .{ .surface = enter.surface, .keys = enter.keys } }, surface, self.keyboard_event_context),
+            .leave => |leave| callback(.{ .leave = .{ .surface = leave.surface } }, surface, self.keyboard_event_context),
             .key => |key| callback(.{
                 .key = .{ .serial = key.serial, .time = key.time, .key = key.key, .state = key.state },
-            }, surface),
+            }, surface, self.keyboard_event_context),
             .modifiers => |mods| callback(.{
                 .modifiers = .{ .depressed = mods.mods_depressed, .latched = mods.mods_latched, .locked = mods.mods_locked, .group = mods.group },
-            }, surface),
+            }, surface, self.keyboard_event_context),
             .repeat_info => |ri| {
-                callback(.{ .repeat = .{ .delay_ms = ri.delay, .rate_per_sec = ri.rate } }, surface);
+                callback(.{ .repeat = .{ .delay_ms = ri.delay, .rate_per_sec = ri.rate } }, surface, self.keyboard_event_context);
             },
         }
     }
 }
 
-/// 指针事件由主窗口线程 dispatch (pointer 绑主 queue)。
-/// 事件里的 surface 决定目标窗口: 主窗口 or spawn 窗口 (由 runner 层路由)。
-var current_pointer_surface: ?*wl.Surface = null;
-fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, _: *DisplayState) void {
+fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *DisplayState) void {
     const surface = switch (event) {
         .enter => |enter| blk: {
-            current_pointer_surface = enter.surface;
+            self.current_pointer_surface = enter.surface;
             break :blk enter.surface;
         },
         .leave => |leave| blk: {
-            current_pointer_surface = null;
+            self.current_pointer_surface = null;
             break :blk leave.surface;
         },
-        else => current_pointer_surface,
+        else => self.current_pointer_surface,
     };
-    if (pointer_event_callback) |callback| callback(event, surface);
+    if (self.pointer_event_callback) |callback| callback(event, surface, self.pointer_event_context);
 }
 
-pub const PointerEventCallback = *const fn (event: wl.Pointer.Event, surface: ?*wl.Surface) void;
+pub fn setPointerEventCallback(self: *DisplayState, callback: PointerEventCallback, context: ?*anyopaque) void {
+    self.pointer_event_callback = callback;
+    self.pointer_event_context = context;
+}
 
-var pointer_event_callback: ?PointerEventCallback = null;
-var pointer_event_context: ?*anyopaque = null;
-
-/// output scale 变化回调 (主窗口 Host 注册: recomputeScale)。
-pub var scale_change_callback: ?*const fn () void = null;
-
-/// 主窗口线程设置: 指针事件转发目标 (runner 层路由)。
-pub fn setPointerEventCallback(callback: PointerEventCallback, context: ?*anyopaque) void {
-    pointer_event_callback = callback;
-    pointer_event_context = context;
+pub fn setScaleChangeCallback(self: *DisplayState, callback: ScaleChangeCallback, context: ?*anyopaque) void {
+    self.scale_change_callback = callback;
+    self.scale_change_context = context;
 }
 
 fn bindGlobal(registry: *wl.Registry, global: @FieldType(wl.Registry.Event, "global"), comptime T: type) ?*T {

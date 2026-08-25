@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    player.runPlayer(gpa, bundle_root, false) catch |err| {
+    player.runPlayer(gpa, init.io, bundle_root, false) catch |err| {
         std.debug.print("fushell-runner failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -49,5 +49,5 @@ fn printUsage() void {
     std.debug.print("  <dir>/lib/libflutter_engine.so\n", .{});
     std.debug.print("  <dir>/data/icudtl.dat\n", .{});
     std.debug.print("  debug/JIT: <dir>/data/flutter_assets/kernel_blob.bin\n", .{});
-    std.debug.print("  release/AOT: <dir>/lib/libapp.so\n", .{});
+    std.debug.print("  release/AOT: <dir>/lib/libapp.so + lib/libapp.so.symbols\n", .{});
 }

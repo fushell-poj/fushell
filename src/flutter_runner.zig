@@ -1,43 +1,28 @@
 const std = @import("std");
-// build-verify
 const c = @import("c");
 const egl = @import("wayland_egl_host.zig");
 const flutter = @import("flutter_embedder.zig");
 const surface_channel = @import("surface_channel.zig");
 const display_state = @import("wl_display_state.zig");
 const text_input = @import("text_input.zig");
-const clipboard = @import("clipboard.zig");
+const platform_channels = @import("platform_channels.zig");
+const clipboard_service = @import("clipboard_service.zig");
 const data_control = @import("data_control.zig");
 const ime_v3 = @import("ime_v3.zig");
 const gl_blit = @import("gl_blit.zig");
 const xkb = @import("xkb.zig");
+const flutter_task_queue = @import("flutter_task_queue.zig");
+const flutter_compositor = @import("flutter_compositor.zig");
+const window_registry = @import("window_registry.zig");
+const bundle_loader = @import("bundle_loader.zig");
+const WindowEntry = window_registry.Entry;
+const WindowRegistry = window_registry.Registry;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 
 /// 默认帧间隔 (60Hz)。引擎的 vsync 回调携带实际时间戳, 此值仅用于
 /// 无 vsync 驱动的兜底计算; 真实刷新率由 compositor 通过 frame 事件驱动。
 const frame_interval_nanos: u64 = 16_666_667;
-/// 平台线程任务队列上限。引擎任务突发时临时积压, 满时入队方自旋等待
-/// (见 queueFlutterTask), 不会丢任务。1024 足够覆盖单帧引擎任务量。
-const max_pending_flutter_tasks = 1024;
-const flutter_default_font_family = "Roboto";
-
-/// 进程级共享 DisplayState (单例): 引擎启动时创建, 与引擎同生命周期。
-/// 引用计数由 Host.attach/release 管理; 归零时 DisplayState 完整清理。
-var global_display_state: ?*display_state.DisplayState = null;
-var display_state_mutex: std.atomic.Mutex = .unlocked;
-
-fn getDisplayState(gpa: std.mem.Allocator) !*display_state.DisplayState {
-    lockDisplayStateMutex();
-    defer display_state_mutex.unlock();
-    if (global_display_state == null) {
-        const state = try gpa.create(display_state.DisplayState);
-        state.* = .{};
-        global_display_state = state;
-    }
-    return global_display_state.?;
-}
-
 /// 进程退出时显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全)。
 /// ImeV3 持有 Wayland 对象 (text_input 等), 由 state 的 disconnect 统一收尾;
 /// 这里只回收 gpa.create 的对象内存 + DataControl 内部 buffer。
@@ -46,8 +31,6 @@ fn shutdownShared(gpa: std.mem.Allocator, state: *display_state.DisplayState) vo
         dc.deinit();
         gpa.destroy(dc);
         state.data_control = null;
-        if (global_data_control == state.data_control) global_data_control = null;
-        global_data_control = null;
     }
     if (state.ime) |ime| {
         ime.deinit();
@@ -56,71 +39,25 @@ fn shutdownShared(gpa: std.mem.Allocator, state: *display_state.DisplayState) vo
     }
 }
 
-/// 进程级 data-control (系统剪贴板): 引擎级单例, 绑定到共享 display。
-var global_data_control: ?*data_control.DataControl = null;
-
-/// 引擎单例 (输入路由 / host 回调的目标)。由 run() 设置。
-var engine_runner: ?*Runner = null;
-
-/// 进程退出请求 (process.exit 平台消息设置): 事件循环检查后退出。
-var quit_requested: std.atomic.Value(bool) = .init(false);
-
-/// 进程级窗口注册表: view_id → Host (单引擎多视图)。implicit view (id 0)
-/// 不在表内 (无窗口)。槽位内联 Host (稳定地址, 跨线程引用安全)。
-const max_windows = 64;
-const WindowEntry = struct {
-    active: bool = false,
-    view_id: i64 = 0,
-    parent_view_id: ?i64 = null,
-    /// AddView / RemoveView completion 由 engine-managed thread 回调；回调只在
-    /// 注册表锁内记录结果，平台线程 tick 才响应 Dart 或销毁 Wayland/EGL 资源。
-    add_pending: bool = false,
-    add_result_ready: bool = false,
-    add_result_added: bool = false,
-    remove_pending: bool = false,
-    remove_result_ready: bool = false,
-    remove_result_removed: bool = false,
-    pending_open_response: ?*const c.FlutterPlatformMessageResponseHandle = null,
-    pending_open_request_id: i64 = 0,
-    pending_close_response: ?*const c.FlutterPlatformMessageResponseHandle = null,
-    pending_close_request_id: i64 = 0,
-    host: egl.Host = .{},
-};
-var window_registry: [max_windows]WindowEntry = undefined;
-var window_registry_mutex: std.atomic.Mutex = .unlocked;
-var next_view_id: i64 = 1;
-
-fn lockWindowRegistry() void {
-    while (!window_registry_mutex.tryLock()) std.atomic.spinLoopHint();
+fn applyPhysicalKeyTransition(state: anytype, keycode: u32, pressed: bool) u32 {
+    return state.updateKey(keycode, pressed);
 }
 
-fn unlockWindowRegistry() void {
-    window_registry_mutex.unlock();
+fn dispatchKeyRepeat(handler: anytype, key: u32) void {
+    handler.sendKeyboardEvent(key, true);
+    handler.applyTextKey(key);
 }
 
-/// 按 view_id 查窗口 (隐式 view 0 返回 null)。
-fn findWindowEntryByViewId(view_id: i64) ?*WindowEntry {
-    for (&window_registry) |*entry| {
-        if (entry.active and entry.view_id == view_id) return entry;
-    }
-    return null;
-}
-
-fn findHostBySurface(surface: ?*wl.Surface) ?*egl.Host {
-    const s = surface orelse return null;
-    for (&window_registry) |*entry| {
-        if (!entry.active) continue;
-        if (entry.host.surface == s) return &entry.host;
-    }
-    return null;
+fn runnerFromContext(context: ?*anyopaque) *Runner {
+    return @ptrCast(@alignCast(context orelse @panic("runner callback context is null")));
 }
 
 /// 主线程 dispatch 键盘事件: enter/leave 更新焦点窗口, 事件交给引擎
 /// (单引擎: xkb/text_input 为引擎级状态, 焦点窗口由 surface 路由派生)。
-fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surface) void {
-    const runner = engine_runner orelse return;
+fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surface, context: ?*anyopaque) void {
+    const runner = runnerFromContext(context);
     switch (event) {
-        .enter => runner.focused_host = findHostBySurface(surface),
+        .enter => runner.focused_host = runner.registry.findHostBySurfaceLocked(surface),
         .leave => runner.focused_host = null,
         else => {},
     }
@@ -129,14 +66,12 @@ fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surfa
 
 /// IME 事件路由: 投给键盘焦点窗口 (IME 是全局对象, 事件随焦点窗口)。
 /// text_input.Client 的 send_fn: 发 updateEditingState 到引擎。
-fn textInputSendCallback(client_id: i64, msg: []const u8) void {
+fn textInputSendCallback(client_id: i64, msg: []const u8, context: ?*anyopaque) void {
     _ = client_id;
-    const runner = engine_runner orelse return;
-    runner.sendToEngine("flutter/textinput", msg);
+    runnerFromContext(context).sendToEngine("flutter/textinput", msg);
 }
 
 fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
-    _ = ctx;
     // enter/leave 事件带 surface → 精确路由到对应窗口。
     // (不能依赖 keyboard_focused: text_input enter 可能先于 wl_keyboard.enter 到达)
     var surface: ?*wl.Surface = null;
@@ -145,11 +80,11 @@ fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
         .leave => |e| surface = e.surface,
         else => {},
     }
-    const runner = engine_runner orelse return;
+    const runner = runnerFromContext(ctx);
     if (surface) |s| {
         // 事件属于某窗口 surface: 只有焦点窗口才处理 (非焦点窗口的 enter
         // 意味着焦点切换, 真正生效的是新焦点窗口)。
-        if (findHostBySurface(s)) |host| {
+        if (runner.registry.findHostBySurfaceLocked(s)) |host| {
             if (runner.focused_host != host and event == .enter) {
                 runner.focused_host = host;
             }
@@ -160,16 +95,20 @@ fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
 
 /// 指针路由: 事件 surface → 目标窗口 host → handlePointerEvent。
 /// 主线程单线程调用 (pointer 绑共享 queue)。
-fn displayPointerRouter(event: wl.Pointer.Event, surface: ?*wl.Surface) void {
-    const target = findHostBySurface(surface) orelse return;
+fn displayPointerRouter(event: wl.Pointer.Event, surface: ?*wl.Surface, context: ?*anyopaque) void {
+    const runner = runnerFromContext(context);
+    const target = runner.registry.findHostBySurfaceLocked(surface) orelse return;
     target.handlePointerEvent(event);
 }
 
-fn lockDisplayStateMutex() void {
-    while (!display_state_mutex.tryLock()) std.atomic.spinLoopHint();
-}
+const PendingClipboardRead = struct {
+    destination: enum { platform, text_input },
+    response_handle: ?*const c.FlutterPlatformMessageResponseHandle = null,
+    deadline_ns: u64,
+};
 
 pub const Options = struct {
+    io: std.Io,
     engine_library: []const u8,
     bundle_path: []const u8,
     /// 启动 VM service (热重载用, 仅 debug/JIT 引擎支持):
@@ -177,44 +116,12 @@ pub const Options = struct {
     enable_vm_service: bool = false,
 };
 
-const Bundle = struct {
-    assets_path: [:0]u8,
-    icu_data_path: [:0]u8,
-    app_so_path: ?[:0]u8 = null,
-    overlay_assets_path: ?[]u8 = null,
-
-    fn deinit(self: Bundle, gpa: std.mem.Allocator) void {
-        if (self.overlay_assets_path) |overlay_path| {
-            deleteTreeBestEffort(overlay_path);
-            gpa.free(overlay_path);
-        }
-        if (self.app_so_path) |app_so| {
-            gpa.free(app_so);
-        }
-        gpa.free(self.assets_path);
-        gpa.free(self.icu_data_path);
-    }
-};
-
-const FontconfigFont = struct {
-    family: []u8,
-    path: []u8,
-
-    fn deinit(self: FontconfigFont, gpa: std.mem.Allocator) void {
-        gpa.free(self.family);
-        gpa.free(self.path);
-    }
-};
-
-const PendingFlutterTask = struct {
-    task: c.FlutterTask,
-    target_time_nanos: u64,
-};
-
 const Runner = struct {
     gpa: std.mem.Allocator,
     /// 进程级共享显示状态 (窗口创建 / IME / 剪贴板用)。
     state: *display_state.DisplayState,
+    registry: *WindowRegistry,
+    quit_requested: std.atomic.Value(bool) = .init(false),
     /// 进程级共享 render context (raster + 全部窗口呈现)。
     render_context: *egl.RenderContext,
     api: *flutter.Api,
@@ -225,13 +132,13 @@ const Runner = struct {
     rendering_generation: std.atomic.Value(u64) = .init(0),
     skipped_resize_presents: std.atomic.Value(u32) = .init(0),
     platform_thread_id: std.Thread.Id = undefined,
-    task_mutex: std.atomic.Mutex = .unlocked,
-    pending_tasks: [max_pending_flutter_tasks]PendingFlutterTask = undefined,
-    pending_task_count: usize = 0,
+    task_queue: *flutter_task_queue.TaskQueue,
     bootstrap_render_logged: bool = false,
     bootstrap_resource_logged: bool = false,
     bootstrap_present_logged: bool = false,
     first_present_logged: bool = false,
+    /// Stack-owned guard for the synchronous platform message currently being dispatched.
+    active_platform_response: ?*platform_channels.Response = null,
 
     // ── compositor 呈现路径 ────────────────────────
     /// backing store 纹理 → 窗口 surface 的 GLES2 blit 模块。
@@ -240,7 +147,8 @@ const Runner = struct {
 
     // ── 输入 / 文本 / 剪贴板 ──────────────────────
     text_client: text_input.Client = undefined,
-    clipboard: clipboard.Clipboard = undefined,
+    clipboard: clipboard_service.Service = undefined,
+    pending_clipboard_read: ?PendingClipboardRead = null,
     ime: ?*ime_v3.ImeV3 = null,
     xkb_state: xkb.Xkb = .{},
     /// 键盘焦点窗口 (wl_keyboard.enter 的 surface → 窗口注册表)。
@@ -278,9 +186,9 @@ const Runner = struct {
             100 * 1_000_000;
         self.repeat_next_time_ns = now_ns + interval;
         if (self.focused_host != null and self.text_client.active) {
-            _ = self.xkb_state.updateKey(key, true);
-            self.sendKeyboardEvent(key, true);
-            self.handleKey(key);
+            // Repeat reuses the already-pressed key state. A repeat is not another
+            // physical XKB transition and must not call updateKey again.
+            dispatchKeyRepeat(self, key);
         }
     }
 
@@ -307,7 +215,7 @@ const Runner = struct {
             },
             .key => |k| {
                 // 按下/松开都更新 xkb 状态 (修饰键跟踪依赖它)。
-                _ = self.xkb_state.updateKey(k.key, k.state == .pressed);
+                _ = applyPhysicalKeyTransition(&self.xkb_state, k.key, k.state == .pressed);
                 // 无论焦点/文本客户端, 都向 Flutter 发送 RawKeyEvent
                 // (EditableText 靠它实现 Ctrl+C/V/A 等快捷键)。
                 self.sendKeyboardEvent(k.key, k.state == .pressed);
@@ -317,7 +225,7 @@ const Runner = struct {
                     // 启动长按重复计时 (repeat_info 的 delay 后按 rate 重复)。
                     self.repeat_active_key = k.key;
                     self.repeat_next_time_ns = nowNs() + @as(u64, self.repeat_delay_ms) * 1_000_000;
-                    self.handleKey(k.key);
+                    self.applyTextKey(k.key);
                 } else {
                     if (self.repeat_active_key == k.key) self.repeat_active_key = null;
                 }
@@ -368,10 +276,8 @@ const Runner = struct {
                         const t = self.text_client.transform;
                         const x = self.text_client.marked_rect_x * t[0] + self.text_client.marked_rect_y * t[4] + t[12];
                         const y = self.text_client.marked_rect_x * t[1] + self.text_client.marked_rect_y * t[5] + t[13];
-                        std.debug.print("[diag] submit rect (enter-geom) ({d:.0},{d:.0})\n", .{ x, y });
                         ime.setCursorRect(@intFromFloat(x), @intFromFloat(y), 4, @intFromFloat(@max(self.text_client.marked_rect_h, 16)));
                     } else if (self.focused_host) |focused| {
-                        std.debug.print("[diag] submit rect (enter-pointer) ({d:.0},{d:.0})\n", .{ focused.pointer_x, focused.pointer_y });
                         ime.setCursorRect(
                             @intFromFloat(@max(focused.pointer_x, 0)),
                             @intFromFloat(@max(focused.pointer_y, 0)),
@@ -396,7 +302,7 @@ const Runner = struct {
     /// 用引擎提供的 EditableText 几何 (transform + marked rect) 计算光标在
     /// surface (窗口) 中的逻辑坐标, 更新 IME 候选框位置。仿官方 GTK 嵌入器
     /// update_im_cursor_position (fl_text_input_handler.cc)。
-    fn updateImeCursorPosition(self: *Runner) void {
+    pub fn updateImeCursorPosition(self: *Runner) void {
         const client = &self.text_client;
         if (!client.has_transform) return;
         if (self.ime == null) return;
@@ -428,9 +334,10 @@ const Runner = struct {
         );
     }
 
-    fn handleKey(self: *Runner, keycode: u32) void {
-        const sym = self.xkb_state.updateKey(keycode, true);
-        _ = self.xkb_state.ctrl;
+    /// Applies the text-editing effect of a key whose physical XKB transition
+    /// was already processed by handleKeyboardEvent.
+    fn applyTextKey(self: *Runner, keycode: u32) void {
+        const sym = self.xkb_state.getSym(keycode);
 
         // 注意: Ctrl 组合键 (Ctrl+C/V/A 等) 不在此处处理 — keyboard 事件已
         // 发送给 Flutter, 由 EditableText 的快捷键处理 (宿主重复处理会与
@@ -485,22 +392,30 @@ const Runner = struct {
     }
 
     fn pasteClipboard(self: *Runner) void {
-        const text = self.clipboard.getText();
-        if (text.len == 0) return;
-        self.text_client.insertText(text) catch |err| {
-            std.debug.print("[error] paste failed: {s}\n", .{@errorName(err)});
+        if (self.pending_clipboard_read != null) return;
+        const start = self.clipboard.beginReadText() catch |err| {
+            std.debug.print("[error] clipboard read failed: {s}\n", .{@errorName(err)});
             return;
         };
-        self.sendTextInputUpdate();
+        switch (start) {
+            .immediate => |text| {
+                defer self.gpa.free(text);
+                if (text.len == 0) return;
+                self.text_client.insertText(text) catch |err| {
+                    std.debug.print("[error] paste failed: {s}\n", .{@errorName(err)});
+                    return;
+                };
+                self.sendTextInputUpdate();
+            },
+            .pending => self.pending_clipboard_read = .{
+                .destination = .text_input,
+                .deadline_ns = nowNs() + clipboard_service.read_timeout_ns,
+            },
+        }
     }
 
     fn sendTextInputUpdate(self: *Runner) void {
-        if (!self.text_client.active) return;
-        var buf: [8192]u8 = undefined;
-        const escaped = text_input.jsonEscape(self.gpa, self.text_client.state.text.items) catch return;
-        defer self.gpa.free(escaped);
-        const msg = self.text_client.buildUpdateMessageEscaped(&buf, escaped) catch return;
-        self.sendToEngine("flutter/textinput", msg);
+        if (self.text_client.active) self.text_client.sendUpdate();
     }
 
     fn sendActionMessage(self: *Runner) !void {
@@ -529,54 +444,117 @@ const Runner = struct {
     }
 
     fn queueFlutterTask(self: *Runner, task: c.FlutterTask, target_time_nanos: u64) void {
-        // 引擎 post_task_callback 契约: 必须接受任务 (void 返回)。
-        // 队列满时不能丢 — 释放锁让消费方 (主事件循环) 有机会出队, 然后重试。
-        while (true) {
-            self.lockTaskQueue();
-            if (self.pending_task_count < self.pending_tasks.len) {
-                self.pending_tasks[self.pending_task_count] = .{ .task = task, .target_time_nanos = target_time_nanos };
-                self.pending_task_count += 1;
-                self.task_mutex.unlock();
-                return;
-            }
-            self.task_mutex.unlock();
-            std.Thread.yield() catch {};
-        }
-    }
-
-    fn popDueFlutterTask(self: *Runner) ?c.FlutterTask {
-        const now_nanos = self.now();
-        self.lockTaskQueue();
-        defer self.task_mutex.unlock();
-
-        var selected: ?usize = null;
-        var selected_target: u64 = 0;
-        for (self.pending_tasks[0..self.pending_task_count], 0..) |pending, index| {
-            if (pending.target_time_nanos > now_nanos) continue;
-            if (selected == null or pending.target_time_nanos < selected_target) {
-                selected = index;
-                selected_target = pending.target_time_nanos;
-            }
-        }
-
-        const index = selected orelse return null;
-        const task = self.pending_tasks[index].task;
-        if (index + 1 < self.pending_task_count) {
-            std.mem.copyForwards(PendingFlutterTask, self.pending_tasks[index .. self.pending_task_count - 1], self.pending_tasks[index + 1 .. self.pending_task_count]);
-        }
-        self.pending_task_count -= 1;
-        return task;
+        self.task_queue.post(task, target_time_nanos);
     }
 
     fn runDueFlutterTasks(self: *Runner) !void {
-        while (self.popDueFlutterTask()) |task| {
+        if (self.task_queue.hasFailed()) return error.FlutterTaskQueueFailed;
+        try self.pumpClipboardRead();
+        while (self.task_queue.popDue(self.now())) |task| {
             if (self.engine == null) return;
             try flutter.ensureSuccess(self.api.run_task(self.engine, &task), "FlutterEngineRunTask");
         }
     }
 
-    fn lockTaskQueue(self: *Runner) void {
-        while (!self.task_mutex.tryLock()) std.atomic.spinLoopHint();
+    fn completeClipboardRead(self: *Runner, pending: PendingClipboardRead, text: ?[]const u8, failure: ?anyerror) void {
+        switch (pending.destination) {
+            .text_input => if (failure == null) {
+                if (text) |content| {
+                    if (content.len > 0) {
+                        self.text_client.insertText(content) catch |err| {
+                            std.debug.print("[error] clipboard paste failed: {s}\n", .{@errorName(err)});
+                            return;
+                        };
+                        self.sendTextInputUpdate();
+                    }
+                }
+            },
+            .platform => {
+                if (failure) |err| {
+                    const message_text = std.fmt.allocPrint(self.gpa, "clipboard read failed: {s}", .{@errorName(err)}) catch {
+                        self.sendEmptyPlatformResponse(pending.response_handle);
+                        return;
+                    };
+                    defer self.gpa.free(message_text);
+                    self.sendPlatformMethodError(pending.response_handle, "ClipboardReadFailed", message_text);
+                    return;
+                }
+                const response = platform_channels.encodeClipboardText(self.gpa, text orelse "") catch |err| {
+                    std.debug.print("[error] clipboard getData response allocation failed: {s}\n", .{@errorName(err)});
+                    self.sendEmptyPlatformResponse(pending.response_handle);
+                    return;
+                };
+                defer self.gpa.free(response);
+                self.sendPlatformResponse(pending.response_handle, response);
+            },
+        }
+    }
+
+    fn pumpClipboardRead(self: *Runner) !void {
+        const pending = self.pending_clipboard_read orelse return;
+        const progress = self.clipboard.pumpReadText() catch |err| {
+            self.pending_clipboard_read = null;
+            self.completeClipboardRead(pending, null, err);
+            return;
+        };
+        switch (progress) {
+            .pending => {
+                if (nowNs() < pending.deadline_ns) return;
+                self.clipboard.cancelReadText();
+                self.pending_clipboard_read = null;
+                self.completeClipboardRead(pending, null, error.ClipboardReadTimedOut);
+            },
+            .complete => |text| {
+                defer if (text) |content| self.gpa.free(content);
+                self.pending_clipboard_read = null;
+                self.completeClipboardRead(pending, text, null);
+            },
+        }
+    }
+
+    pub fn handleSurfaceRequest(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.Request) !void {
+        return runnerHandleSurfaceRequest(self, response_handle, request);
+    }
+
+    pub fn surfaceRequestErrorCode(self: *Runner, err: anyerror) []const u8 {
+        return runnerSurfaceRequestErrorCode(self, err);
+    }
+
+    pub fn sendSurfaceError(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: ?i64, code: []const u8, message: []const u8) void {
+        runnerSendSurfaceError(self, response_handle, id, code, message);
+    }
+
+    pub fn sendPlatformMethodError(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, code: []const u8, message: []const u8) void {
+        runnerSendPlatformMethodError(self, response_handle, code, message);
+    }
+
+    pub fn sendPlatformResponse(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
+        runnerSendPlatformResponse(self, response_handle, response);
+    }
+
+    pub fn sendEmptyPlatformResponse(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle) void {
+        runnerSendEmptyPlatformResponse(self, response_handle);
+    }
+
+    fn nextPollTimeoutMs(self: *Runner) i32 {
+        var timeout = self.task_queue.timeoutMs(self.now());
+        if (self.pending_clipboard_read) |pending| {
+            const now_nanos = nowNs();
+            const clipboard_timeout: i32 = if (pending.deadline_ns <= now_nanos)
+                0
+            else
+                @intCast(@min((pending.deadline_ns - now_nanos + 999_999) / 1_000_000, @as(u64, std.math.maxInt(i32))));
+            if (timeout < 0 or clipboard_timeout < timeout) timeout = clipboard_timeout;
+        }
+        if (self.repeat_active_key != null) {
+            const now_nanos = nowNs();
+            const repeat_timeout: i32 = if (self.repeat_next_time_ns <= now_nanos)
+                0
+            else
+                @intCast(@min((self.repeat_next_time_ns - now_nanos + 999_999) / 1_000_000, @as(u64, std.math.maxInt(i32))));
+            if (timeout < 0 or repeat_timeout < timeout) timeout = repeat_timeout;
+        }
+        return timeout;
     }
 };
 
@@ -593,13 +571,13 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
 
     const bundle = if (is_aot) blk: {
         std.debug.print("Flutter engine reports AOT-only execution; using AOT launch path (libapp.so).\n", .{});
-        const aot_bundle = try validateAotBundle(gpa, options.bundle_path);
+        const aot_bundle = try bundle_loader.loadAot(gpa, options.bundle_path);
         aot_source = std.mem.zeroes(c.FlutterEngineAOTDataSource);
         aot_source.type = c.kFlutterEngineAOTDataSourceTypeElfPath;
         aot_source.unnamed_0.elf_path = aot_bundle.app_so_path.?.ptr;
         try flutter.ensureSuccess(api.create_aot_data(&aot_source, &aot_data), "FlutterEngineCreateAOTData");
         break :blk aot_bundle;
-    } else try validateJitBundle(gpa, options.bundle_path);
+    } else try bundle_loader.loadJit(gpa, options.bundle_path);
     defer bundle.deinit(gpa);
     defer if (aot_data != null) {
         flutter.ensureSuccess(api.collect_aot_data(aot_data), "FlutterEngineCollectAOTData") catch |err| {
@@ -607,15 +585,10 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
         };
     };
 
-    const state = try getDisplayState(gpa);
-    // state 对象销毁必须在 host.deinit 之后 (defer LIFO: 后注册者先执行),
-    // 先让 host.deinit 触发 state.deinit 释放 Wayland/EGL, 再回收入口对象。
-    // ⚠️ defer 必须是【函数级】, 不能放在 if 块内 — Zig 的 defer 在词法块结束
-    // (包括 if 的 }) 时执行, 若放 if 内会在 attach 之前就 destroy state (悬垂引用).
-    defer if (global_display_state == state) {
-        gpa.destroy(state);
-        global_display_state = null;
-    };
+    var state_storage: display_state.DisplayState = .{};
+    const state = &state_storage;
+    var registry = WindowRegistry.init(gpa, options.io);
+    defer registry.deinit();
     var local_host: egl.Host = .{};
     // 无头基座: 这个 host 不初始化任何 surface 角色, 仅作为进程级连接的所有者
     // 与事件循环载体 (单引擎模型下窗口全部由注册表内 Host 承载)。
@@ -623,48 +596,27 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     defer local_host.deinit();
 
     // 进程级初始化: attach (acquire → 建连接) 后绑单一 event queue 到全部对象。
-    try host.attach(state);
+    try host.attach(state, options.io);
     try state.bindGlobals();
     // 进程级单一 EGL render context (raster + 呈现)。
     var render_context: egl.RenderContext = .{};
     defer render_context.deinit();
     try render_context.init(state);
-    display_state.setPointerEventCallback(displayPointerRouter, null);
-    display_state.setKeyboardEventCallback(displayKeyboardRouter, null);
-    // output scale 变化 → 重算全部窗口 scale (注册表遍历)。
-    display_state.scale_change_callback = struct {
-        fn cb() void {
-            lockWindowRegistry();
-            defer unlockWindowRegistry();
-            for (&window_registry) |*entry| {
-                if (entry.active) entry.host.recomputeScale();
-            }
-        }
-    }.cb;
     // 系统剪贴板 (data-control): 引擎级单例, 共享 display。
-    if (global_data_control == null) {
-        const dc = gpa.create(data_control.DataControl) catch null;
-        if (dc) |d| {
-            d.* = data_control.DataControl.init(gpa, state);
-            global_data_control = d;
-            state.data_control = d;
-            // 若 registry 已发现 manager (bindGlobals 前), 补绑定
-            if (state.data_control_manager_name != 0) {
-                if (state.registry) |reg| d.bindManager(reg, state.data_control_manager_name, state.data_control_manager_version);
-            }
-        }
+    const dc = try gpa.create(data_control.DataControl);
+    dc.* = data_control.DataControl.init(gpa, state);
+    state.data_control = dc;
+    if (state.data_control_manager_name != 0) {
+        if (state.registry) |reg| dc.bindManager(reg, state.data_control_manager_name, state.data_control_manager_version);
     }
     // IME (text-input-v3): 引擎级单例, registry 绑定由 registryListener 完成。
     if (state.ime == null) {
-        const ime = gpa.create(ime_v3.ImeV3) catch null;
-        if (ime) |i| {
-            i.* = .{};
-            state.ime = i;
-        }
+        const ime = try gpa.create(ime_v3.ImeV3);
+        ime.* = .{};
+        state.ime = ime;
     }
     if (state.ime) |ime| {
         ime.shared_queue = state.shared_queue;
-        ime.setCallback(imeEventRouter, null);
         if (state.ime_manager_name != 0) {
             if (state.registry) |reg| {
                 if (state.seat) |seat| ime.bindManager(reg, state.ime_manager_name, state.ime_manager_version, seat);
@@ -673,17 +625,32 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     }
     std.debug.print("Wayland display connected and EGL bootstrap context is ready (headless shell).\n", .{});
 
-    var runner: Runner = .{ .gpa = gpa, .state = state, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .engine_library = options.engine_library, .bundle_path = options.bundle_path };
+    var task_queue = try flutter_task_queue.TaskQueue.init(gpa, options.io);
+    defer task_queue.deinit();
+    var runner: Runner = .{ .gpa = gpa, .state = state, .registry = &registry, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .task_queue = &task_queue, .engine_library = options.engine_library, .bundle_path = options.bundle_path };
     runner.ime = state.ime;
     runner.text_client = text_input.Client.init(gpa);
     runner.text_client.send_fn = textInputSendCallback;
-    runner.clipboard = clipboard.Clipboard.init(gpa);
+    runner.text_client.send_context = &runner;
+    display_state.setPointerEventCallback(state, displayPointerRouter, &runner);
+    display_state.setKeyboardEventCallback(state, displayKeyboardRouter, &runner);
+    display_state.setScaleChangeCallback(state, struct {
+        fn cb(context: ?*anyopaque) void {
+            const callback_runner = runnerFromContext(context);
+            callback_runner.registry.lock();
+            defer callback_runner.registry.unlock();
+            for (callback_runner.registry.entries.items) |entry| {
+                if (entry.lifecycle != .removing) entry.host.recomputeScale();
+            }
+        }
+    }.cb, &runner);
+    if (state.ime) |ime| ime.setCallback(imeEventRouter, &runner);
+    runner.clipboard = clipboard_service.Service.init(gpa, state);
     defer runner.text_client.deinit();
     defer runner.clipboard.deinit();
+    defer runner.clipboard.cancelReadText();
     defer runner.xkb_state.deinit();
     defer runner.blitter.deinit();
-    engine_runner = &runner;
-    defer engine_runner = null;
 
     var renderer: c.FlutterRendererConfig = std.mem.zeroes(c.FlutterRendererConfig);
     renderer.type = c.kOpenGL;
@@ -691,9 +658,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     renderer.unnamed_0.open_gl.struct_size = @sizeOf(c.FlutterOpenGLRendererConfig);
     renderer.unnamed_0.open_gl.make_current = makeCurrentCallback;
     renderer.unnamed_0.open_gl.clear_current = clearCurrentCallback;
-    // make_resource_current 设为 null: 引擎不做异步纹理上传 (用主 context 同步上传)。
-    // 共享 resource context 时 io 线程持锁无释放点 (无 present 回调), 会导致 raster 线程死锁。
-    renderer.unnamed_0.open_gl.make_resource_current = null;
+    renderer.unnamed_0.open_gl.make_resource_current = makeResourceCurrentCallback;
     renderer.unnamed_0.open_gl.present = presentCallback;
     renderer.unnamed_0.open_gl.fbo_callback = fboCallback;
     renderer.unnamed_0.open_gl.gl_proc_resolver = glProcResolverCallback;
@@ -759,349 +724,29 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     };
 
     std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
-    try host.runEventLoop(&quit_requested, "Engine event loop active (headless shell).", flutterTaskPumpCallback, &runner);
+    try host.runEventLoop(&runner.quit_requested, "Engine event loop active (headless shell).", .{
+        .fd = task_queue.wake_fd,
+        .context = &runner,
+        .tick = flutterTaskPumpCallback,
+        .timeout_ms = flutterTaskTimeoutCallback,
+        .consume_wake = flutterTaskWakeCallback,
+        .auxiliary_fd = clipboardReadFdCallback,
+    });
+
+    if (runner.pending_clipboard_read) |pending| {
+        runner.clipboard.cancelReadText();
+        runner.pending_clipboard_read = null;
+        runner.completeClipboardRead(pending, null, error.EngineShuttingDown);
+    }
 
     // 退出序列: 先关引擎 (join 引擎线程 → 不再有 present 回调),
     // 再销毁剩余窗口与共享 dc/ime (此刻 state Wayland 连接仍有效)。
     std.debug.print("Shutting down Flutter engine.\n", .{});
     try flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown");
     runner.engine = null;
-    shutdownAllWindows();
+    shutdownAllWindows(&runner);
     shutdownShared(gpa, state);
     std.debug.print("engine event loop exited.\n", .{});
-}
-
-fn validateJitBundle(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
-    if (!try pathExists(gpa, bundle_path)) {
-        std.debug.print("Flutter bundle path does not exist: {s}\n", .{bundle_path});
-        return error.InvalidFlutterBundle;
-    }
-
-    const gtk_assets = try std.fs.path.join(gpa, &.{ bundle_path, "data", "flutter_assets" });
-    defer gpa.free(gtk_assets);
-    const gtk_icu = try std.fs.path.join(gpa, &.{ bundle_path, "data", "icudtl.dat" });
-    defer gpa.free(gtk_icu);
-    if (try validateAssetsLayout(gpa, gtk_assets, gtk_icu)) {
-        return try prepareBundle(gpa, gtk_assets, gtk_icu, null);
-    }
-
-    const raw_assets = try std.fs.path.join(gpa, &.{ bundle_path, "flutter_assets" });
-    defer gpa.free(raw_assets);
-    const raw_icu = try std.fs.path.join(gpa, &.{ bundle_path, "icudtl.dat" });
-    defer gpa.free(raw_icu);
-    if (try validateAssetsLayout(gpa, raw_assets, raw_icu)) {
-        return try prepareBundle(gpa, raw_assets, raw_icu, null);
-    }
-
-    std.debug.print("Flutter debug/JIT bundle is incomplete. Expected either:\n", .{});
-    std.debug.print("  {s}/data/flutter_assets/kernel_blob.bin\n", .{bundle_path});
-    std.debug.print("  {s}/data/icudtl.dat\n", .{bundle_path});
-    std.debug.print("or:\n", .{});
-    std.debug.print("  {s}/flutter_assets/kernel_blob.bin\n", .{bundle_path});
-    std.debug.print("  {s}/icudtl.dat\n", .{bundle_path});
-    return error.InvalidFlutterBundle;
-}
-
-/// AOT bundle 校验: 要求 lib/libapp.so (ELF AOT 快照) + assets + icu。
-/// 与 JIT 布局相同支持 data/ 与裸两种变体。
-fn validateAotBundle(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
-    if (!try pathExists(gpa, bundle_path)) {
-        std.debug.print("Flutter bundle path does not exist: {s}\n", .{bundle_path});
-        return error.InvalidFlutterBundle;
-    }
-
-    const gtk_assets = try std.fs.path.join(gpa, &.{ bundle_path, "data", "flutter_assets" });
-    defer gpa.free(gtk_assets);
-    const gtk_icu = try std.fs.path.join(gpa, &.{ bundle_path, "data", "icudtl.dat" });
-    defer gpa.free(gtk_icu);
-    const gtk_app = try std.fs.path.join(gpa, &.{ bundle_path, "lib", "libapp.so" });
-    defer gpa.free(gtk_app);
-    if (try validateAotLayout(gpa, gtk_assets, gtk_icu, gtk_app)) {
-        return try prepareBundle(gpa, gtk_assets, gtk_icu, gtk_app);
-    }
-
-    const raw_assets = try std.fs.path.join(gpa, &.{ bundle_path, "flutter_assets" });
-    defer gpa.free(raw_assets);
-    const raw_icu = try std.fs.path.join(gpa, &.{ bundle_path, "icudtl.dat" });
-    defer gpa.free(raw_icu);
-    if (try validateAotLayout(gpa, raw_assets, raw_icu, gtk_app)) {
-        return try prepareBundle(gpa, raw_assets, raw_icu, gtk_app);
-    }
-
-    std.debug.print("Flutter AOT bundle is incomplete. Expected:\n", .{});
-    std.debug.print("  {s}/lib/libapp.so\n", .{bundle_path});
-    std.debug.print("  {s}/data/flutter_assets/\n", .{bundle_path});
-    std.debug.print("  {s}/data/icudtl.dat\n", .{bundle_path});
-    std.debug.print("Build it with: flutter build bundle --release (libapp.so via gen_snapshot).\n", .{});
-    return error.InvalidFlutterBundle;
-}
-
-fn validateAotLayout(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8, app_so_path: []const u8) !bool {
-    return try pathExists(gpa, assets_path) and try pathExists(gpa, icu_data_path) and try pathExists(gpa, app_so_path);
-}
-
-fn validateAssetsLayout(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8) !bool {
-    const kernel_blob = try std.fs.path.join(gpa, &.{ assets_path, "kernel_blob.bin" });
-    defer gpa.free(kernel_blob);
-    return try pathExists(gpa, assets_path) and try pathExists(gpa, icu_data_path) and try pathExists(gpa, kernel_blob);
-}
-
-fn prepareBundle(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8, app_so_path: ?[]const u8) !Bundle {
-    const injected_assets_path = prepareFontconfigAssetsOverlay(gpa, assets_path) catch |err| switch (err) {
-        error.SystemFontUnavailable, error.FontManifestAlreadyProvidesDefault => null,
-        else => fallback: {
-            std.debug.print("[error] System font asset injection failed: {s}; continuing with original bundle assets.\n", .{@errorName(err)});
-            break :fallback null;
-        },
-    };
-
-    if (injected_assets_path) |overlay_path| {
-        std.debug.print("Using fontconfig system font asset overlay: {s}\n", .{overlay_path});
-        return .{
-            .assets_path = try gpa.dupeZ(u8, overlay_path),
-            .icu_data_path = try gpa.dupeZ(u8, icu_data_path),
-            .app_so_path = if (app_so_path) |p| try gpa.dupeZ(u8, p) else null,
-            .overlay_assets_path = overlay_path,
-        };
-    }
-
-    return .{
-        .assets_path = try gpa.dupeZ(u8, assets_path),
-        .icu_data_path = try gpa.dupeZ(u8, icu_data_path),
-        .app_so_path = if (app_so_path) |p| try gpa.dupeZ(u8, p) else null,
-    };
-}
-
-fn pathExists(gpa: std.mem.Allocator, path: []const u8) !bool {
-    const path_z = try gpa.dupeZ(u8, path);
-    defer gpa.free(path_z);
-    return std.c.access(path_z.ptr, std.c.F_OK) == 0;
-}
-
-fn prepareFontconfigAssetsOverlay(gpa: std.mem.Allocator, assets_path: []const u8) ![]u8 {
-    const system_font = try resolveFontconfigSansFont(gpa);
-    defer system_font.deinit(gpa);
-
-    const manifest_path = try std.fs.path.join(gpa, &.{ assets_path, "FontManifest.json" });
-    defer gpa.free(manifest_path);
-
-    if (readFileAllocC(gpa, manifest_path)) |manifest| {
-        defer gpa.free(manifest);
-        if (manifestHasFontFamily(manifest, system_font.family) and manifestHasFontFamily(manifest, flutter_default_font_family)) {
-            return error.FontManifestAlreadyProvidesDefault;
-        }
-    } else |_| {}
-
-    const assets_abs = try realPathAlloc(gpa, assets_path);
-    defer gpa.free(assets_abs);
-
-    const overlay_path = try makeTempOverlayDir(gpa);
-    errdefer {
-        deleteTreeBestEffort(overlay_path);
-        gpa.free(overlay_path);
-    }
-
-    try symlinkTopLevelAssets(gpa, assets_abs, overlay_path);
-
-    const font_dir_name = "fushell_system_fonts";
-    const font_dir = try std.fs.path.joinZ(gpa, &.{ overlay_path, font_dir_name });
-    defer gpa.free(font_dir);
-    if (c.mkdir(font_dir.ptr, 0o700) != 0) return error.CreateOverlayFailed;
-
-    const font_basename = std.fs.path.basename(system_font.path);
-    const font_asset = try std.fs.path.join(gpa, &.{ font_dir_name, font_basename });
-    defer gpa.free(font_asset);
-    const font_link = try std.fs.path.joinZ(gpa, &.{ overlay_path, font_asset });
-    defer gpa.free(font_link);
-    const system_font_path_z = try gpa.dupeZ(u8, system_font.path);
-    defer gpa.free(system_font_path_z);
-    if (c.symlink(system_font_path_z.ptr, font_link.ptr) != 0) return error.CreateOverlayFailed;
-
-    try writeInjectedFontManifest(gpa, assets_path, overlay_path, system_font.family, font_asset);
-    std.debug.print("Resolved fontconfig sans font for Flutter text fallback: {s} ({s}); registering Flutter default alias {s}\n", .{ system_font.family, system_font.path, flutter_default_font_family });
-    return overlay_path;
-}
-
-fn resolveFontconfigSansFont(gpa: std.mem.Allocator) !FontconfigFont {
-    if (c.FcInit() == 0) return error.SystemFontUnavailable;
-    const pattern = c.FcNameParse("sans") orelse return error.SystemFontUnavailable;
-    defer c.FcPatternDestroy(pattern);
-
-    _ = c.FcConfigSubstitute(null, pattern, c.FcMatchPattern);
-    c.FcDefaultSubstitute(pattern);
-
-    var result: c.FcResult = undefined;
-    const match = c.FcFontMatch(null, pattern, &result) orelse return error.SystemFontUnavailable;
-    defer c.FcPatternDestroy(match);
-
-    var family_value: [*c]c.FcChar8 = null;
-    if (c.FcPatternGetString(match, c.FC_FAMILY, 0, &family_value) != c.FcResultMatch or family_value == null) {
-        return error.SystemFontUnavailable;
-    }
-
-    var file_value: [*c]c.FcChar8 = null;
-    if (c.FcPatternGetString(match, c.FC_FILE, 0, &file_value) != c.FcResultMatch or file_value == null) {
-        return error.SystemFontUnavailable;
-    }
-
-    return .{
-        .family = try gpa.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(family_value)))),
-        .path = try gpa.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(file_value)))),
-    };
-}
-
-fn makeTempOverlayDir(gpa: std.mem.Allocator) ![]u8 {
-    const tmp_dir = std.c.getenv("TMPDIR") orelse "/tmp";
-    var attempt: usize = 0;
-    while (attempt < 16) : (attempt += 1) {
-        const path = try std.fmt.allocPrint(gpa, "{s}/fushell-flutter-assets-{d}-{d}-{d}", .{ std.mem.span(tmp_dir), c.getpid(), c.time(null), attempt });
-        const path_z = try gpa.dupeZ(u8, path);
-        defer gpa.free(path_z);
-        if (c.mkdir(path_z.ptr, 0o700) == 0) return path;
-        gpa.free(path);
-    }
-    return error.CreateOverlayFailed;
-}
-
-fn symlinkTopLevelAssets(gpa: std.mem.Allocator, assets_abs: []const u8, overlay_path: []const u8) !void {
-    const assets_abs_z = try gpa.dupeZ(u8, assets_abs);
-    defer gpa.free(assets_abs_z);
-    const dir = c.opendir(assets_abs_z.ptr) orelse return error.CreateOverlayFailed;
-    defer _ = c.closedir(dir);
-
-    while (c.readdir(dir)) |entry| {
-        const name = direntName(entry);
-        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        if (std.mem.eql(u8, name, "FontManifest.json")) continue;
-        if (std.mem.eql(u8, name, "fushell_system_fonts")) continue;
-
-        const src = try std.fs.path.joinZ(gpa, &.{ assets_abs, name });
-        defer gpa.free(src);
-        const dst = try std.fs.path.joinZ(gpa, &.{ overlay_path, name });
-        defer gpa.free(dst);
-        if (c.symlink(src.ptr, dst.ptr) != 0) return error.CreateOverlayFailed;
-    }
-}
-
-fn writeInjectedFontManifest(gpa: std.mem.Allocator, original_assets_path: []const u8, overlay_path: []const u8, family: []const u8, asset: []const u8) !void {
-    const original_manifest_path = try std.fs.path.join(gpa, &.{ original_assets_path, "FontManifest.json" });
-    defer gpa.free(original_manifest_path);
-
-    // 区分"缺失"(无 FontManifest 的旧 bundle, 允许降级) 与"读取失败"(真实错误)。
-    var original_manifest: ?[]u8 = null;
-    if (readFileAllocC(gpa, original_manifest_path)) |manifest| {
-        original_manifest = manifest;
-    } else |err| {
-        if (err != error.FileUnavailable) {
-            std.debug.print("[warn] failed to read original FontManifest.json: {s}\n", .{@errorName(err)});
-        }
-    }
-    defer if (original_manifest) |manifest| gpa.free(manifest);
-
-    const generated = try buildFontManifest(gpa, original_manifest, family, asset);
-    defer gpa.free(generated);
-
-    const overlay_manifest_path = try std.fs.path.joinZ(gpa, &.{ overlay_path, "FontManifest.json" });
-    defer gpa.free(overlay_manifest_path);
-    try writeFileC(overlay_manifest_path, generated);
-}
-
-fn buildFontManifest(gpa: std.mem.Allocator, original_manifest: ?[]const u8, family: []const u8, asset: []const u8) ![]u8 {
-    try validateJsonStringFragment(family);
-    try validateJsonStringFragment(flutter_default_font_family);
-    try validateJsonStringFragment(asset);
-
-    const injected = if (std.mem.eql(u8, family, flutter_default_font_family))
-        try std.fmt.allocPrint(gpa, "{{\"family\":\"{s}\",\"fonts\":[{{\"asset\":\"{s}\",\"weight\":400}},{{\"asset\":\"{s}\",\"weight\":800}}]}}", .{ family, asset, asset })
-    else
-        try std.fmt.allocPrint(gpa, "{{\"family\":\"{s}\",\"fonts\":[{{\"asset\":\"{s}\",\"weight\":400}},{{\"asset\":\"{s}\",\"weight\":800}}]}},{{\"family\":\"{s}\",\"fonts\":[{{\"asset\":\"{s}\",\"weight\":400}},{{\"asset\":\"{s}\",\"weight\":800}}]}}", .{ family, asset, asset, flutter_default_font_family, asset, asset });
-    defer gpa.free(injected);
-
-    if (original_manifest == null) {
-        return try std.fmt.allocPrint(gpa, "[{s}]\n", .{injected});
-    }
-
-    const original = original_manifest.?;
-    var end = original.len;
-    while (end > 0 and std.ascii.isWhitespace(original[end - 1])) end -= 1;
-    if (end == 0 or original[end - 1] != ']') return try std.fmt.allocPrint(gpa, "[{s}]\n", .{injected});
-
-    var has_existing_entries = false;
-    for (original[0 .. end - 1]) |byte| {
-        if (!std.ascii.isWhitespace(byte) and byte != '[') {
-            has_existing_entries = true;
-            break;
-        }
-    }
-
-    const comma = if (has_existing_entries) "," else "";
-    return try std.fmt.allocPrint(gpa, "{s}{s}{s}]\n", .{ original[0 .. end - 1], comma, injected });
-}
-
-fn manifestHasFontFamily(manifest: []const u8, family: []const u8) bool {
-    const needle = std.fmt.allocPrint(std.heap.c_allocator, "\"family\":\"{s}\"", .{family}) catch return false;
-    defer std.heap.c_allocator.free(needle);
-    return std.mem.indexOf(u8, manifest, needle) != null;
-}
-
-fn validateJsonStringFragment(value: []const u8) !void {
-    for (value) |byte| {
-        if (byte < 0x20 or byte == '"' or byte == '\\') return error.InvalidFontManifestValue;
-    }
-}
-
-fn readFileAllocC(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const path_z = try gpa.dupeZ(u8, path);
-    defer gpa.free(path_z);
-    const file = c.fopen(path_z.ptr, "rb") orelse return error.FileUnavailable;
-    defer _ = c.fclose(file);
-
-    if (c.fseek(file, 0, c.SEEK_END) != 0) return error.FileUnavailable;
-    const length = c.ftell(file);
-    if (length < 0 or length > 1024 * 1024) return error.FileUnavailable;
-    if (c.fseek(file, 0, c.SEEK_SET) != 0) return error.FileUnavailable;
-
-    const buffer = try gpa.alloc(u8, @intCast(length));
-    errdefer gpa.free(buffer);
-    const read_count = c.fread(buffer.ptr, 1, buffer.len, file);
-    if (read_count != buffer.len) return error.FileUnavailable;
-    return buffer;
-}
-
-fn writeFileC(path_z: [:0]const u8, bytes: []const u8) !void {
-    const file = c.fopen(path_z.ptr, "wb") orelse return error.FileUnavailable;
-    defer _ = c.fclose(file);
-    if (c.fwrite(bytes.ptr, 1, bytes.len, file) != bytes.len) return error.FileUnavailable;
-}
-
-fn realPathAlloc(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const path_z = try gpa.dupeZ(u8, path);
-    defer gpa.free(path_z);
-    const resolved = c.realpath(path_z.ptr, null) orelse return error.FileUnavailable;
-    defer c.free(resolved);
-    return try gpa.dupe(u8, std.mem.span(resolved));
-}
-
-fn direntName(entry: *c.struct_dirent) []const u8 {
-    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.d_name)), 0);
-}
-
-fn deleteTreeBestEffort(path: []const u8) void {
-    const path_z = std.heap.c_allocator.dupeZ(u8, path) catch return;
-    defer std.heap.c_allocator.free(path_z);
-    const dir = c.opendir(path_z.ptr) orelse {
-        _ = c.unlink(path_z.ptr);
-        return;
-    };
-    while (c.readdir(dir)) |entry| {
-        const name = direntName(entry);
-        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        const child = std.fs.path.joinZ(std.heap.c_allocator, &.{ path, name }) catch continue;
-        defer std.heap.c_allocator.free(child);
-        if (c.unlink(child.ptr) != 0) deleteTreeBestEffort(child);
-    }
-    _ = c.closedir(dir);
-    _ = c.rmdir(path_z.ptr);
 }
 
 /// 单调时钟纳秒 (重复计时用)。
@@ -1116,13 +761,31 @@ fn fromUserData(user_data: ?*anyopaque) *Runner {
 }
 
 fn runsTaskOnCurrentThreadCallback(user_data: ?*anyopaque) callconv(.c) bool {
-    const runner = fromUserData(user_data);
+    const context = user_data orelse {
+        std.debug.print("[error] Flutter task-runner thread check received null context\n", .{});
+        return false;
+    };
+    const runner: *Runner = @ptrCast(@alignCast(context));
     return std.Thread.getCurrentId() == runner.platform_thread_id;
 }
 
+fn clipboardReadFdCallback(context: ?*anyopaque) c_int {
+    const runner = runnerFromContext(context);
+    return runner.clipboard.requestFd() orelse -1;
+}
+
 fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_data: ?*anyopaque) callconv(.c) void {
-    const runner = fromUserData(user_data);
+    const context = user_data orelse {
+        std.debug.print("[error] Flutter task post received null context\n", .{});
+        return;
+    };
+    const runner: *Runner = @ptrCast(@alignCast(context));
     runner.queueFlutterTask(task, target_time_nanos);
+}
+
+test "Flutter task callbacks reject null context" {
+    try std.testing.expect(!runsTaskOnCurrentThreadCallback(null));
+    postFlutterTaskCallback(std.mem.zeroes(c.FlutterTask), 0, null);
 }
 
 fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
@@ -1131,6 +794,14 @@ fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     processCompositorCloseRequests(runner);
     runner.checkKeyRepeat();
     try runner.runDueFlutterTasks();
+}
+
+fn flutterTaskTimeoutCallback(user_data: ?*anyopaque) i32 {
+    return fromUserData(user_data).nextPollTimeoutMs();
+}
+
+fn flutterTaskWakeCallback(user_data: ?*anyopaque) void {
+    fromUserData(user_data).task_queue.drainWake();
 }
 
 fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics, view_id: i64) !void {
@@ -1149,9 +820,8 @@ fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics, view_id: i64) !void {
     try flutter.ensureSuccess(runner.api.schedule_frame(runner.engine), "FlutterEngineScheduleFrame");
 }
 
-fn metricsCallback(context: ?*anyopaque, host_metrics: egl.Metrics) void {
-    const host: *egl.Host = @ptrCast(@alignCast(context.?));
-    const runner = engine_runner orelse return;
+fn metricsCallback(host: *egl.Host, context: ?*anyopaque, host_metrics: egl.Metrics) void {
+    const runner = runnerFromContext(context);
     // 窗口关闭中: 引擎可能已不认这个 view, 发送即 UAF。
     if (runner.engine == null or host.state == .shutting_down) return;
     sendMetrics(runner, host_metrics, host.view_id) catch |err| {
@@ -1185,9 +855,8 @@ fn sendPointerEvent(runner: *Runner, host_event: egl.PointerEvent, view_id: i64)
     try flutter.ensureSuccess(runner.api.send_pointer_event(runner.engine, &event, 1), "FlutterEngineSendPointerEvent");
 }
 
-fn pointerCallback(context: ?*anyopaque, host_event: egl.PointerEvent) void {
-    const host: *egl.Host = @ptrCast(@alignCast(context.?));
-    const runner = engine_runner orelse return;
+fn pointerCallback(host: *egl.Host, context: ?*anyopaque, host_event: egl.PointerEvent) void {
+    const runner = runnerFromContext(context);
     sendPointerEvent(runner, host_event, host.view_id) catch |err| {
         std.debug.print("[error] Flutter pointer callback failed: {s}\n", .{@errorName(err)});
     };
@@ -1203,320 +872,19 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
     const channel = if (message.channel == null) "" else std.mem.span(message.channel);
     const payload = if (message.message == null or message.message_size == 0) "" else message.message[0..message.message_size];
 
-    if (std.mem.eql(u8, channel, surface_channel.channel_name)) {
-        handleSurfaceChannelMessage(runner, message, payload);
-        return;
-    }
-    if (std.mem.eql(u8, channel, "flutter/textinput")) {
-        handleTextInputMessage(runner, message, payload);
-        return;
-    }
-    if (std.mem.eql(u8, channel, "flutter/platform")) {
-        handlePlatformChannelMessage(runner, message, payload);
-        return;
-    }
-    std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
-    sendEmptyPlatformResponse(runner, message.response_handle);
-}
-
-/// 解析 textinput 消息 (setClient/setEditingState/clearClient/show/hide)。
-fn handleTextInputMessage(runner: *Runner, message: c.FlutterPlatformMessage, payload: []const u8) void {
-    var parsed = std.json.parseFromSlice(std.json.Value, runner.gpa, payload, .{}) catch {
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    };
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |m| m,
-        else => {
-            sendEmptyPlatformResponse(runner, message.response_handle);
-            return;
+    switch (platform_channels.classify(channel)) {
+        .surface => platform_channels.handleSurfaceChannelMessage(runner, message, payload),
+        .text_input => platform_channels.handleTextInputMessage(runner, message, payload, sendGuardedPlatformResponse),
+        .platform => platform_channels.handlePlatformChannelMessage(runner, message, payload, sendGuardedPlatformResponse),
+        .unsupported => {
+            std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
+            runner.sendPlatformResponse(message.response_handle, "");
         },
-    };
-    const method = switch (root.get("method") orelse return) {
-        .string => |s| s,
-        else => return,
-    };
-    const args = root.get("args");
-
-    if (std.mem.eql(u8, method, "TextInput.setClient")) {
-        if (args == null or args.? != .array or args.?.array.items.len < 2) {
-            sendEmptyPlatformResponse(runner, message.response_handle);
-            return;
-        }
-        const id = switch (args.?.array.items[0]) {
-            .object => |o| switch (o.get("_clientId") orelse return) {
-                .integer => |i| i,
-                else => return,
-            },
-            .integer => |i| i,
-            else => return,
-        };
-        const config = args.?.array.items[1];
-        var multiline = false;
-        var action: []const u8 = "done";
-        if (config == .object) {
-            if (config.object.get("inputAction")) |ia| {
-                if (ia == .string) action = ia.string;
-            }
-            if (config.object.get("inputType")) |it| {
-                if (it == .object) {
-                    if (it.object.get("isMultiline")) |ml| {
-                        if (ml == .bool) multiline = ml.bool;
-                    }
-                }
-            }
-        }
-        runner.text_client.clear();
-        runner.text_client.client_id = id;
-        runner.text_client.active = true;
-        runner.text_client.multiline = multiline;
-        runner.text_client.input_action = action;
-        // TextField 聚焦: 启用 IME + 候选框定位。
-        // 优先用引擎提供的 EditableText 几何 (transform + marked rect → 真实光标),
-        // 避免 popup 先出现在点击处再跳到光标处的闪烁。
-        if (runner.ime) |ime| {
-            if (runner.text_client.has_transform and runner.text_client.has_marked_rect) {
-                runner.updateImeCursorPosition();
-            } else if (runner.focused_host) |focused| {
-                // fallback: 焦点窗口的指针位置 (引擎几何未到)。
-                ime.setCursorRect(
-                    @intFromFloat(@max(focused.pointer_x, 0)),
-                    @intFromFloat(@max(focused.pointer_y, 0)),
-                    4,
-                    24,
-                );
-            } else {
-                ime.setCursorRect(0, 0, 4, 24);
-            }
-            ime.enable(0, 1);
-        }
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
     }
-    if (std.mem.eql(u8, method, "TextInput.setEditableSizeAndTransform")) {
-        // EditableText 局部 → Flutter root 变换矩阵 (官方 GTK 嵌入器同款协议)。
-        if (args != null and args.? == .object) {
-            if (args.?.object.get("transform")) |tv| {
-                if (tv == .array and tv.array.items.len == 16) {
-                    var ok = true;
-                    for (tv.array.items, 0..) |item, i| {
-                        runner.text_client.transform[i] = switch (item) {
-                            .float => |f| f,
-                            .integer => |iv| @floatFromInt(iv),
-                            else => {
-                                ok = false;
-                                break;
-                            },
-                        };
-                    }
-                    if (ok) runner.text_client.has_transform = true;
-                }
-            }
-        }
-        // transform 到达不代表 rect 到达; 有 rect 时更新候选框位置。
-        if (runner.text_client.has_marked_rect) runner.updateImeCursorPosition();
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    }
-    if (std.mem.eql(u8, method, "TextInput.setMarkedTextRect")) {
-        // composing 区域 / 光标矩形 (局部坐标, 无 composing 时即光标)。
-        if (args != null and args.? == .object) {
-            const o = args.?.object;
-            const getF = struct {
-                fn getv(m: std.json.ObjectMap, key: []const u8) ?f64 {
-                    const v = m.get(key) orelse return null;
-                    return switch (v) {
-                        .float => |fv| fv,
-                        .integer => |iv| @floatFromInt(iv),
-                        else => null,
-                    };
-                }
-            }.getv;
-            if (getF(o, "x")) |x| {
-                runner.text_client.marked_rect_x = x;
-                runner.text_client.marked_rect_y = getF(o, "y") orelse 0;
-                runner.text_client.marked_rect_w = getF(o, "width") orelse 0;
-                runner.text_client.marked_rect_h = getF(o, "height") orelse 0;
-                runner.text_client.has_marked_rect = true;
-                runner.updateImeCursorPosition();
-            }
-        }
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    }
-    if (std.mem.eql(u8, method, "TextInput.setCaretRect")) {
-        // 光标矩形 (EditableText 光标移动时发送, Flutter 3.41 独立方法)。
-        if (args != null and args.? == .object) {
-            const o = args.?.object;
-            const getF = struct {
-                fn getv(m: std.json.ObjectMap, key: []const u8) ?f64 {
-                    const v = m.get(key) orelse return null;
-                    return switch (v) {
-                        .float => |fv| fv,
-                        .integer => |iv| @floatFromInt(iv),
-                        else => null,
-                    };
-                }
-            }.getv;
-            if (getF(o, "x")) |x| {
-                runner.text_client.caret_rect_x = x;
-                runner.text_client.caret_rect_y = getF(o, "y") orelse 0;
-                runner.text_client.has_caret_rect = true;
-                runner.updateImeCursorPosition();
-            }
-        }
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    }
-    if (std.mem.eql(u8, method, "TextInput.setEditingState")) {
-        // Flutter 端: invokeMethod('TextInput.setEditingState', value.toJSON())
-        // → args 直接是 object (不是 [object] array, 与 setClient 不同)。
-        if (args == null or args.? != .object) {
-            sendEmptyPlatformResponse(runner, message.response_handle);
-            return;
-        }
-        const state = args.?;
-        if (state == .object) {
-            var text: []const u8 = "";
-            var base: i64 = 0;
-            var extent: i64 = 0;
-            if (state.object.get("text")) |t| {
-                if (t == .string) text = t.string;
-            }
-            if (state.object.get("selectionBase")) |b| {
-                if (b == .integer) base = b.integer;
-            }
-            if (state.object.get("selectionExtent")) |e| {
-                if (e == .integer) extent = e.integer;
-            }
-            runner.text_client.applyEditingState(text, base, extent) catch |err| {
-                std.debug.print("[error] apply editing state failed: {s}\n", .{@errorName(err)});
-            };
-        }
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    }
-    if (std.mem.eql(u8, method, "TextInput.clearClient")) {
-        runner.text_client.clear();
-        if (runner.ime) |ime| ime.disable();
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    }
-    // show / hide / setCaretRect / requestAutofill 等: 空响应即可。
-    sendEmptyPlatformResponse(runner, message.response_handle);
 }
 
-/// flutter/platform 通道: Clipboard.setData / getData, 其余空响应。
-fn handlePlatformChannelMessage(runner: *Runner, message: c.FlutterPlatformMessage, payload: []const u8) void {
-    var parsed = std.json.parseFromSlice(std.json.Value, runner.gpa, payload, .{}) catch {
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    };
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |m| m,
-        else => {
-            sendEmptyPlatformResponse(runner, message.response_handle);
-            return;
-        },
-    };
-    const method = switch (root.get("method") orelse return) {
-        .string => |s| s,
-        else => return,
-    };
-    const args = root.get("args");
-
-    if (std.mem.eql(u8, method, "Clipboard.setData")) {
-        // args 形状: Flutter 的 Clipboard.setData 发的是 object {"text": ...}
-        // (部分版本是 [object] array) — 两种都兼容。
-        var text: ?[]const u8 = null;
-        if (args != null) {
-            switch (args.?) {
-                .object => |o| {
-                    if (o.get("text")) |t| {
-                        if (t == .string) text = t.string;
-                    }
-                },
-                .array => |a| {
-                    if (a.items.len >= 1 and a.items[0] == .object) {
-                        if (a.items[0].object.get("text")) |t| {
-                            if (t == .string) text = t.string;
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-        if (text) |t| {
-            runner.clipboard.setText(t) catch |err| {
-                std.debug.print("[error] clipboard set failed: {s}\n", .{@errorName(err)});
-            };
-            // 发布到系统剪贴板 (data-control), 供其他应用读取。
-            if (global_data_control) |dc| dc.publish(t);
-        } else {
-            std.debug.print("[error] Clipboard.setData: no text in args\n", .{});
-        }
-        sendEmptyPlatformResponse(runner, message.response_handle);
-        return;
-    }
-    if (std.mem.eql(u8, method, "Clipboard.hasStrings")) {
-        // Flutter 3.35+: Ctrl+V 前先查剪贴板是否有内容, 期待 {"value": bool}。
-        const local_has = runner.clipboard.getText().len > 0;
-        const sys_has = if (global_data_control) |dc| dc.hasText() else false;
-        const has = local_has or sys_has;
-        var buf: [64]u8 = undefined;
-        const resp = std.fmt.bufPrint(&buf, "[{{\"value\":{}}}]", .{has}) catch {
-            sendEmptyPlatformResponse(runner, message.response_handle);
-            return;
-        };
-        sendPlatformResponse(runner, message.response_handle, resp);
-        return;
-    }
-    if (std.mem.eql(u8, method, "Clipboard.getData")) {
-        // 系统剪贴板优先 (data-control), 无则回退进程内副本。
-        var sys_text: ?[]const u8 = null;
-        defer if (sys_text) |t| runner.gpa.free(t);
-        if (global_data_control) |dc| sys_text = dc.requestText(runner.gpa);
-        const text = sys_text orelse runner.clipboard.getText();
-        var buf: [4096]u8 = undefined;
-        const escaped = text_input.jsonEscape(runner.gpa, text) catch {
-            sendEmptyPlatformResponse(runner, message.response_handle);
-            return;
-        };
-        defer runner.gpa.free(escaped);
-        const response = if (text.len == 0)
-            "[{\"text\":\"\"}]"
-        else
-            std.fmt.bufPrint(&buf, "[{{\"text\":\"{s}\"}}]", .{escaped}) catch {
-                sendEmptyPlatformResponse(runner, message.response_handle);
-                return;
-            };
-        sendPlatformResponse(runner, message.response_handle, response);
-        return;
-    }
-    // SystemSound / HapticFeedback / SystemChrome 等: 空响应 (引擎不阻塞)。
-    sendEmptyPlatformResponse(runner, message.response_handle);
-}
-
-fn handleSurfaceChannelMessage(runner: *Runner, message: c.FlutterPlatformMessage, payload: []const u8) void {
-    const request = surface_channel.parseRequest(runner.gpa, payload) catch |err| {
-        const code = surface_channel.parseErrorCode(err);
-        std.debug.print("[error] Invalid fushell surface message: {s}\n", .{code});
-        sendSurfaceError(runner, message.response_handle, null, code, "invalid fushell surface request");
-        return;
-    };
-    defer request.deinit(runner.gpa);
-
-    handleSurfaceRequest(runner, message.response_handle, request) catch |err| {
-        const code = surfaceRequestErrorCode(err);
-        std.debug.print("[error] Fushell surface request failed: {s}\n", .{code});
-        sendSurfaceError(runner, message.response_handle, request.id(), code, "fushell surface request failed");
-        return;
-    };
-}
-
-fn handleSurfaceRequest(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.Request) !void {
+/// Execute one parsed fushell/window or fushell/process lifecycle request.
+fn runnerHandleSurfaceRequest(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.Request) !void {
     switch (request) {
         .open_window => |req| try openWindow(runner, response_handle, req),
         .close_window => |req| try closeWindow(runner, response_handle, req),
@@ -1529,51 +897,58 @@ fn handleSurfaceRequest(runner: *Runner, response_handle: ?*const c.FlutterPlatf
 /// window.open: 创建新窗口 (Wayland role + EGL surface + Flutter view)。
 /// 回复在 add_view_callback 确认 added 后发出 (保证 Dart 收到 windowId 时
 /// view 已在引擎注册、PlatformDispatcher.views 即将可见)。
-fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.OpenWindowRequest) !void {
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-
-    // 父窗口解析: 持锁拿父 toplevel (防止父窗口被并发关闭)。
+pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.OpenWindowRequest) !void {
+    runner.registry.lock();
     const parent_toplevel = if (request.parent) |parent_id| blk: {
-        const parent_entry = findWindowEntryByViewId(parent_id) orelse return error.ParentWindowNotFound;
+        const parent_entry = runner.registry.findByViewIdLocked(parent_id) orelse {
+            runner.registry.unlock();
+            return error.ParentWindowNotFound;
+        };
+        if (parent_entry.lifecycle != .active) {
+            runner.registry.unlock();
+            return error.ParentWindowNotFound;
+        }
         break :blk parent_entry.host.toplevel;
     } else null;
-
-    var slot: ?usize = null;
-    for (&window_registry, 0..) |*entry, i| {
-        if (!entry.active) {
-            slot = i;
-            break;
-        }
-    }
-    const slot_index = slot orelse return error.TooManyWindows;
-    const view_id = next_view_id;
-    next_view_id += 1;
-    const entry = &window_registry[slot_index];
-    entry.active = true;
-    entry.view_id = view_id;
-    entry.parent_view_id = request.parent;
-    entry.add_pending = true;
+    const entry = runner.registry.reserveLocked(request.parent) catch |err| {
+        runner.registry.unlock();
+        return err;
+    };
+    const view_id = entry.view_id;
+    entry.lifecycle_wake_context = runner.task_queue;
     entry.pending_open_response = response_handle;
     entry.pending_open_request_id = request.id;
+    runner.registry.unlock();
 
-    // 初始化窗口 (Wayland role + EGL surface)。失败回收槽位。
+    // Wayland lifecycle runs exclusively on the platform thread. Registry
+    // callbacks may run synchronously inside AddView, so never call engine APIs
+    // while holding the registry mutex.
     const host = &entry.host;
     host.view_id = view_id;
     host.render_context = runner.render_context;
     errdefer {
+        runner.registry.lock();
+        runner.registry.unindexSurfaceLocked(entry);
+        runner.registry.unlock();
         host.deinit();
-        entry.* = .{};
+        runner.registry.lock();
+        runner.registry.releaseLocked(entry);
+        runner.registry.unlock();
     }
-    try host.attach(runner.state);
+    try host.attach(runner.state, runner.task_queue.io);
     switch (request.role) {
         .window => |w| try host.initializeWindowRole(w, parent_toplevel),
         .layer => |l| try host.initializeLayerRole(l),
     }
-    host.setMetricsCallback(metricsCallback, host);
-    host.setPointerCallback(pointerCallback, host);
+    runner.registry.lock();
+    runner.registry.indexSurfaceLocked(entry) catch |err| {
+        runner.registry.unlock();
+        return err;
+    };
+    runner.registry.unlock();
+    host.setMetricsCallback(metricsCallback, runner);
+    host.setPointerCallback(pointerCallback, runner);
 
-    // FlutterEngineAddView: added 回调 (平台线程) 后回复 Dart。
     const m = host.metrics();
     var view_metrics: c.FlutterWindowMetricsEvent = std.mem.zeroes(c.FlutterWindowMetricsEvent);
     view_metrics.struct_size = @sizeOf(c.FlutterWindowMetricsEvent);
@@ -1591,59 +966,89 @@ fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessage
     std.debug.print("window.open: view {d} (parent {any})\n", .{ view_id, request.parent });
 }
 
-/// Engine-managed thread callback: 仅记录 AddView 结果，资源与 Dart 响应由
-/// 平台线程 processViewLifecycleResults 完成。
-fn addViewCallback(result: [*c]const c.FlutterAddViewResult) callconv(.c) void {
-    const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    if (!entry.active or !entry.add_pending) return;
-    entry.add_result_added = result.*.added;
-    entry.add_result_ready = true;
+fn notifyWindowLifecycle(entry: *WindowEntry) void {
+    const context = entry.lifecycle_wake_context orelse return;
+    const task_queue: *flutter_task_queue.TaskQueue = @ptrCast(@alignCast(context));
+    task_queue.notify();
 }
 
-/// 提交异步 RemoveView。调用方必须持有窗口注册表锁；失败时回滚 pending 状态。
+/// Engine-managed thread callback: only record the AddView result. The
+/// platform thread owns all Wayland/EGL and response work.
+fn addViewCallback(result: [*c]const c.FlutterAddViewResult) callconv(.c) void {
+    const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
+    entry.registry.lock();
+    if (entry.lifecycle != .adding or entry.add_result != null) {
+        entry.registry.unlock();
+        return;
+    }
+    entry.add_result = result.*.added;
+    entry.registry.unlock();
+    notifyWindowLifecycle(entry);
+}
+
+/// Mark a view as removing under the registry lock, then submit RemoveView
+/// without the lock because the engine callback may run synchronously.
 fn beginWindowRemoval(
     runner: *Runner,
     entry: *WindowEntry,
     response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
     request_id: i64,
 ) !void {
-    if (entry.remove_pending) return error.WindowClosePending;
-    entry.remove_pending = true;
+    runner.registry.lock();
+    if (entry.lifecycle == .removing) {
+        runner.registry.unlock();
+        return error.WindowClosePending;
+    }
+    if (entry.lifecycle != .active) {
+        runner.registry.unlock();
+        return error.WindowNotReady;
+    }
+    entry.lifecycle = .removing;
     entry.pending_close_response = response_handle;
     entry.pending_close_request_id = request_id;
-    errdefer {
-        entry.remove_pending = false;
-        entry.pending_close_response = null;
-        entry.pending_close_request_id = 0;
-    }
+    const view_id = entry.view_id;
+    runner.registry.unlock();
 
     var remove_info: c.FlutterRemoveViewInfo = std.mem.zeroes(c.FlutterRemoveViewInfo);
     remove_info.struct_size = @sizeOf(c.FlutterRemoveViewInfo);
-    remove_info.view_id = entry.view_id;
+    remove_info.view_id = view_id;
     remove_info.user_data = entry;
     remove_info.remove_view_callback = removeViewCallback;
-    try flutter.ensureSuccess(runner.api.remove_view(runner.engine, &remove_info), "FlutterEngineRemoveView");
+    flutter.ensureSuccess(runner.api.remove_view(runner.engine, &remove_info), "FlutterEngineRemoveView") catch |err| {
+        runner.registry.lock();
+        defer runner.registry.unlock();
+        if (entry.lifecycle == .removing and entry.remove_result == null) {
+            entry.lifecycle = .active;
+            entry.pending_close_response = null;
+            entry.pending_close_request_id = 0;
+        }
+        return err;
+    };
 }
 
 /// window.close: RemoveView → removed 回调确认后才销毁 surface。
-fn closeWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.CloseWindowRequest) !void {
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    const entry = findWindowEntryByViewId(request.window_id) orelse return error.WindowNotFound;
+pub fn closeWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.CloseWindowRequest) !void {
+    runner.registry.lock();
+    const entry = runner.registry.findByViewIdLocked(request.window_id) orelse {
+        runner.registry.unlock();
+        return error.WindowNotFound;
+    };
+    runner.registry.unlock();
     try beginWindowRemoval(runner, entry, response_handle, request.id);
     std.debug.print("window.close: view {d} (remove pending)\n", .{request.window_id});
 }
 
-/// Wayland close listener 只置位；下一次平台线程 tick 在 listener 栈外提交
-/// RemoveView，避免回调派发期间销毁 xdg/layer 对象。
+/// Wayland close listeners only set a flag. The next platform-thread tick
+/// submits RemoveView outside the listener stack.
 fn processCompositorCloseRequests(runner: *Runner) void {
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    for (&window_registry) |*entry| {
-        if (!entry.active or entry.add_pending or entry.remove_pending or !entry.host.takeCloseRequest()) continue;
+    for (0..runner.registry.entries.items.len) |index| {
+        runner.registry.lock();
+        const entry = runner.registry.entries.items[index];
+        const should_close = entry.lifecycle == .active and entry.host.takeCloseRequest();
         const view_id = entry.view_id;
+        runner.registry.unlock();
+        if (!should_close) continue;
+
         beginWindowRemoval(runner, entry, null, 0) catch |err| {
             std.debug.print("[error] compositor close failed for view {d}: {s}\n", .{ view_id, @errorName(err) });
             continue;
@@ -1652,64 +1057,82 @@ fn processCompositorCloseRequests(runner: *Runner) void {
     }
 }
 
-/// Engine-managed thread callback: 仅记录 RemoveView 结果。即使 removed=true，
-/// 也不得在这里触碰 Wayland/EGL；平台线程 tick 才执行销毁。
+/// Engine-managed thread callback: only record the RemoveView result. Even
+/// after success, the platform thread must perform all Wayland/EGL cleanup.
 fn removeViewCallback(result: [*c]const c.FlutterRemoveViewResult) callconv(.c) void {
     const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    if (!entry.active or !entry.remove_pending) return;
-    entry.remove_result_removed = result.*.removed;
-    entry.remove_result_ready = true;
+    entry.registry.lock();
+    if (entry.lifecycle != .removing or entry.remove_result != null) {
+        entry.registry.unlock();
+        return;
+    }
+    entry.remove_result = result.*.removed;
+    entry.registry.unlock();
+    notifyWindowLifecycle(entry);
 }
 
 fn processViewLifecycleResults(runner: *Runner) void {
     const Completion = enum { none, add_succeeded, add_failed, remove_succeeded, remove_failed };
 
-    for (0..window_registry.len) |index| {
+    var index: usize = 0;
+    while (true) {
         var completion: Completion = .none;
         var handle: ?*const c.FlutterPlatformMessageResponseHandle = null;
         var request_id: i64 = 0;
         var view_id: i64 = 0;
+        var release_entry = false;
 
-        lockWindowRegistry();
-        const entry = &window_registry[index];
-        if (entry.active and entry.add_result_ready) {
+        runner.registry.lock();
+        if (index >= runner.registry.entries.items.len) {
+            runner.registry.unlock();
+            break;
+        }
+        const entry = runner.registry.entries.items[index];
+        if (entry.lifecycle == .adding and entry.add_result != null) {
             handle = entry.pending_open_response;
             request_id = entry.pending_open_request_id;
             view_id = entry.view_id;
-            entry.add_result_ready = false;
-            entry.add_pending = false;
+            const added = entry.add_result.?;
+            entry.add_result = null;
             entry.pending_open_response = null;
             entry.pending_open_request_id = 0;
-            if (entry.add_result_added) {
+            if (added) {
+                entry.lifecycle = .active;
                 completion = .add_succeeded;
             } else {
-                entry.host.deinit();
-                entry.* = .{};
+                entry.lifecycle = .removing;
+                runner.registry.unindexSurfaceLocked(entry);
+                release_entry = true;
                 completion = .add_failed;
             }
-        } else if (entry.active and entry.remove_result_ready) {
+        } else if (entry.lifecycle == .removing and entry.remove_result != null) {
             handle = entry.pending_close_response;
             request_id = entry.pending_close_request_id;
             view_id = entry.view_id;
-            entry.remove_result_ready = false;
+            const removed = entry.remove_result.?;
+            entry.remove_result = null;
             entry.pending_close_response = null;
             entry.pending_close_request_id = 0;
-            if (entry.remove_result_removed) {
-                if (runner.focused_host == &entry.host) runner.focused_host = null;
-                entry.host.deinit();
-                for (&window_registry) |*child| {
-                    if (child.active and child.parent_view_id == view_id) child.parent_view_id = null;
-                }
-                entry.* = .{};
+            if (removed) {
+                runner.registry.unindexSurfaceLocked(entry);
+                release_entry = true;
                 completion = .remove_succeeded;
             } else {
-                entry.remove_pending = false;
+                entry.lifecycle = .active;
                 completion = .remove_failed;
             }
         }
-        unlockWindowRegistry();
+        if (!release_entry) index += 1;
+        runner.registry.unlock();
+
+        if (release_entry) {
+            if (runner.focused_host == &entry.host) runner.focused_host = null;
+            entry.host.deinit();
+            runner.registry.lock();
+            if (completion == .remove_succeeded) runner.registry.detachChildrenLocked(view_id);
+            runner.registry.releaseLocked(entry);
+            runner.registry.unlock();
+        }
 
         switch (completion) {
             .none => {},
@@ -1719,11 +1142,11 @@ fn processViewLifecycleResults(runner: *Runner) void {
                     continue;
                 };
                 defer runner.gpa.free(response);
-                if (handle) |h| sendPlatformResponse(runner, h, response);
+                if (handle) |h| runnerSendPlatformResponse(runner, h, response);
             },
             .add_failed => {
                 std.debug.print("[error] FlutterEngineAddView reported added=false for view {d}\n", .{view_id});
-                if (handle) |h| sendSurfaceError(runner, h, request_id, "AddViewFailed", "engine rejected the new view");
+                if (handle) |h| runnerSendSurfaceError(runner, h, request_id, "AddViewFailed", "engine rejected the new view");
             },
             .remove_succeeded => {
                 if (handle) |h| sendSurfaceSuccess(runner, h, request_id);
@@ -1731,69 +1154,112 @@ fn processViewLifecycleResults(runner: *Runner) void {
             },
             .remove_failed => {
                 std.debug.print("[error] FlutterEngineRemoveView reported removed=false for view {d}\n", .{view_id});
-                if (handle) |h| sendSurfaceError(runner, h, request_id, "RemoveViewFailed", "engine could not remove the view");
+                if (handle) |h| runnerSendSurfaceError(runner, h, request_id, "RemoveViewFailed", "engine could not remove the view");
             },
         }
     }
 }
 
-fn updateLayerSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.LayerUpdateRequest) !void {
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    const entry = findWindowEntryByViewId(request.window_id) orelse return error.WindowNotFound;
+pub fn updateLayerSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.LayerUpdateRequest) !void {
+    runner.registry.lock();
+    defer runner.registry.unlock();
+    const entry = runner.registry.findByViewIdLocked(request.window_id) orelse return error.WindowNotFound;
     _ = try entry.host.updateLayerRole(request.update);
     sendSurfaceSuccess(runner, response_handle, request.id);
 }
 
-fn updateWindowSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.WindowUpdateRequest) !void {
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    const entry = findWindowEntryByViewId(request.window_id) orelse return error.WindowNotFound;
+pub fn updateWindowSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.WindowUpdateRequest) !void {
+    runner.registry.lock();
+    defer runner.registry.unlock();
+    const entry = runner.registry.findByViewIdLocked(request.window_id) orelse return error.WindowNotFound;
     _ = try entry.host.updateWindowRole(request.update);
     sendSurfaceSuccess(runner, response_handle, request.id);
 }
 
 /// process.exit: 停止事件循环 → run() 退出序列 (关引擎 → 毁窗口 → 断连接)。
-fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.ExitRequest) !void {
+pub fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.ExitRequest) !void {
     sendSurfaceSuccess(runner, response_handle, request.id);
-    quit_requested.store(true, .release);
+    runner.quit_requested.store(true, .release);
     std.debug.print("process.exit({d}) requested; stopping event loop.\n", .{request.code});
 }
 
 /// 退出序列: 引擎已关闭 (无 present), 销毁全部剩余窗口。
-fn shutdownAllWindows() void {
-    lockWindowRegistry();
-    defer unlockWindowRegistry();
-    for (&window_registry) |*entry| {
-        if (!entry.active) continue;
+fn shutdownAllWindows(runner: *Runner) void {
+    while (true) {
+        runner.registry.lock();
+        const entry = if (runner.registry.entries.items.len > 0)
+            runner.registry.entries.items[runner.registry.entries.items.len - 1]
+        else {
+            runner.registry.unlock();
+            return;
+        };
+        runner.registry.unindexSurfaceLocked(entry);
+        runner.registry.unlock();
+
         entry.host.deinit();
-        entry.* = .{};
+        runner.registry.lock();
+        runner.registry.releaseLocked(entry);
+        runner.registry.unlock();
     }
 }
 
-fn surfaceRequestErrorCode(err: anyerror) []const u8 {
+fn runnerSurfaceRequestErrorCode(_: *Runner, err: anyerror) []const u8 {
     return @errorName(err);
 }
 
-fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: i64) void {
+pub fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: i64) void {
     const response = surface_channel.successResponse(runner.gpa, id) catch |err| {
         std.debug.print("[error] Failed to encode fushell surface success response: {s}\n", .{@errorName(err)});
         return;
     };
     defer runner.gpa.free(response);
-    sendPlatformResponse(runner, response_handle, response);
+    runnerSendPlatformResponse(runner, response_handle, response);
 }
 
-fn sendSurfaceError(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: ?i64, code: []const u8, message: []const u8) void {
+fn runnerSendSurfaceError(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: ?i64, code: []const u8, message: []const u8) void {
     const response = surface_channel.errorResponse(runner.gpa, id, code, message) catch |err| {
         std.debug.print("[error] Failed to encode fushell surface error response: {s}\n", .{@errorName(err)});
         return;
     };
     defer runner.gpa.free(response);
-    sendPlatformResponse(runner, response_handle, response);
+    runnerSendPlatformResponse(runner, response_handle, response);
 }
 
-fn sendPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
+fn runnerSendPlatformMethodError(
+    runner: *Runner,
+    response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+    code: []const u8,
+    message: []const u8,
+) void {
+    const response = platform_channels.encodeMethodError(runner.gpa, code, message) catch |err| {
+        std.debug.print("[error] Failed to encode Flutter method error: {s}\n", .{@errorName(err)});
+        runnerSendEmptyPlatformResponse(runner, response_handle);
+        return;
+    };
+    defer runner.gpa.free(response);
+    runnerSendPlatformResponse(runner, response_handle, response);
+}
+
+fn sendGuardedPlatformResponse(
+    context: *anyopaque,
+    response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+    response: []const u8,
+) void {
+    const runner: *Runner = @ptrCast(@alignCast(context));
+    sendRawPlatformResponse(runner, response_handle, response);
+}
+
+fn runnerSendPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
+    if (runner.active_platform_response) |reply| {
+        if (reply.handle == response_handle) {
+            if (reply.completed) return;
+            reply.completed = true;
+        }
+    }
+    sendRawPlatformResponse(runner, response_handle, response);
+}
+
+pub fn sendRawPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
     if (response_handle == null) {
         std.debug.print("Flutter platform message had no response handle.\n", .{});
         return;
@@ -1808,16 +1274,8 @@ fn sendPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatf
     }
 }
 
-fn sendEmptyPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle) void {
-    if (response_handle == null) return;
-    if (runner.engine == null) {
-        std.debug.print("[error] Cannot reply to unsupported Flutter platform message before engine handle is available.\n", .{});
-        return;
-    }
-    const result = runner.api.send_platform_message_response(runner.engine, response_handle, null, 0);
-    if (result != c.kSuccess) {
-        std.debug.print("[error] FlutterEngineSendPlatformMessageResponse(empty) failed: {s}\n", .{flutter.resultName(result)});
-    }
+fn runnerSendEmptyPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle) void {
+    runnerSendPlatformResponse(runner, response_handle, "");
 }
 
 fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
@@ -1829,6 +1287,15 @@ fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
         return false;
     };
     runner.beginRender();
+    return true;
+}
+
+fn makeResourceCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
+    const runner = fromUserData(user_data);
+    runner.render_context.makeResourceCurrent() catch |err| {
+        std.debug.print("[error] Flutter make_resource_current callback failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
     return true;
 }
 
@@ -1854,51 +1321,17 @@ fn presentCallback(user_data: ?*anyopaque) callconv(.c) bool {
 /// compositor: 为引擎 layer 创建 GL 纹理 backing store (kFlutterBackingStoreTypeOpenGL)。
 /// 在 raster 线程调用, GL context 已 current。
 fn createBackingStoreCallback(config_ptr: [*c]const c.FlutterBackingStoreConfig, backing_store_ptr: [*c]c.FlutterBackingStore, user_data: ?*anyopaque) callconv(.c) bool {
+    _ = user_data;
     const config: *const c.FlutterBackingStoreConfig = @ptrCast(config_ptr);
-    const backing_store_out: *c.FlutterBackingStore = @ptrCast(backing_store_ptr);
-    _ = fromUserData(user_data);
-    const width: c.GLsizei = @intFromFloat(@ceil(@max(config.size.width, 1.0)));
-    const height: c.GLsizei = @intFromFloat(@ceil(@max(config.size.height, 1.0)));
-    var texture: c.GLuint = 0;
-    c.glGenTextures(1, &texture);
-    if (texture == 0) {
-        std.debug.print("[error] glGenTextures failed for backing store {d}x{d}\n", .{ width, height });
-        return false;
-    }
-    c.glBindTexture(c.GL_TEXTURE_2D, texture);
-    // internalformat 与 format 报告都用 GL_RGBA8 (0x8058): 引擎按 FlutterOpenGLTexture.format
-    // 映射 SkColorType, GL_RGBA (6408) 不被支持 ("Cannot convert format 6408")。
-    const GL_RGBA8: c.GLint = 0x8058;
-    c.glTexImage2D(c.GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, null);
-    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
-    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
-    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
-    c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
-    c.glBindTexture(c.GL_TEXTURE_2D, 0);
-
-    backing_store_out.* = std.mem.zeroes(c.FlutterBackingStore);
-    backing_store_out.struct_size = @sizeOf(c.FlutterBackingStore);
-    backing_store_out.type = c.kFlutterBackingStoreTypeOpenGL;
-    backing_store_out.unnamed_0.open_gl.type = c.kFlutterOpenGLTargetTypeTexture;
-    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.target = c.GL_TEXTURE_2D;
-    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.name = texture;
-    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.format = 0x8058; // GL_RGBA8
-    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.width = @intCast(width);
-    backing_store_out.unnamed_0.open_gl.unnamed_0.texture.height = @intCast(height);
-    return true;
+    const output: *c.FlutterBackingStore = @ptrCast(backing_store_ptr);
+    return flutter_compositor.createBackingStore(config, output);
 }
 
 /// compositor: 回收 backing store 纹理。
 fn collectBackingStoreCallback(backing_store_ptr: [*c]const c.FlutterBackingStore, user_data: ?*anyopaque) callconv(.c) bool {
-    const backing_store: *const c.FlutterBackingStore = @ptrCast(backing_store_ptr);
     _ = user_data;
-    if (backing_store.type != c.kFlutterBackingStoreTypeOpenGL) return true;
-    const texture = backing_store.unnamed_0.open_gl.unnamed_0.texture;
-    if (texture.name != 0) {
-        const name = texture.name;
-        c.glDeleteTextures(1, &name);
-    }
-    return true;
+    const backing_store: *const c.FlutterBackingStore = @ptrCast(backing_store_ptr);
+    return flutter_compositor.collectBackingStore(backing_store);
 }
 
 /// compositor: 将 view 的 layer tree blit 到对应窗口 EGL surface 并 swap。
@@ -1907,22 +1340,22 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
     const info: *const c.FlutterPresentViewInfo = @ptrCast(info_ptr);
     if (info.view_id == 0) return true; // 无头 implicit view: 丢弃
     const runner = fromUserData(info.user_data);
-    lockWindowRegistry();
-    const entry = findWindowEntryByViewId(info.view_id) orelse {
-        unlockWindowRegistry();
+    runner.registry.lock();
+    const entry = runner.registry.findByViewIdLocked(info.view_id) orelse {
+        runner.registry.unlock();
         return true; // 窗口已关闭
     };
-    if (entry.remove_pending) {
-        unlockWindowRegistry();
+    if (entry.lifecycle == .removing) {
+        runner.registry.unlock();
         return true;
     }
     const host = &entry.host;
     const lock_ok = host.present_mutex.tryLock();
-    unlockWindowRegistry();
+    runner.registry.unlock();
     if (!lock_ok) {
         return true; // resize 中: 跳帧 (引擎会重试下一帧)
     }
-    defer host.present_mutex.unlock();
+    defer host.present_mutex.unlock(host.io);
 
     if (!host.isReady()) return true;
     runner.render_context.makeSurfaceCurrent(host.egl_surface) catch |err| {
@@ -1937,19 +1370,7 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
     const metrics = host.metrics();
     const vp_w: f32 = @floatFromInt(metrics.width);
     const vp_h: f32 = @floatFromInt(metrics.height);
-    for (0..info.layers_count) |i| {
-        const layer: *const c.FlutterLayer = @ptrCast(info.layers[i]);
-        switch (layer.type) {
-            c.kFlutterLayerContentTypeBackingStore => {
-                const bs: *const c.FlutterBackingStore = @ptrCast(layer.unnamed_0.backing_store);
-                const texture = bs.unnamed_0.open_gl.unnamed_0.texture;
-                blitter.blitLayer(texture.name, @floatCast(layer.offset.x), @floatCast(layer.offset.y), @floatCast(layer.size.width), @floatCast(layer.size.height), vp_w, vp_h);
-            },
-            else => {
-                std.debug.print("unsupported layer type in present: {}\n", .{layer.type});
-            },
-        }
-    }
+    flutter_compositor.blitLayers(blitter, info, vp_w, vp_h);
     runner.render_context.swapBuffers(host.egl_surface) catch |err| {
         std.debug.print("[error] present_view swapBuffers failed: {s}\n", .{@errorName(err)});
         return false;
@@ -1998,21 +1419,21 @@ fn vsyncCallback(user_data: ?*anyopaque, baton: isize) callconv(.c) void {
 /// 热重载: 从引擎日志解析出的 VM service URI (http://127.0.0.1:PORT/TOKEN/)。
 /// logMessageCallback (主线程) 写入, hot_reload 线程读取 — 带锁共享。
 pub const VmServiceState = struct {
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: std.Io.Mutex = .init,
     uri: [512]u8 = undefined,
     len: usize = 0,
 
-    pub fn set(self: *VmServiceState, value: []const u8) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
+    pub fn set(self: *VmServiceState, io: std.Io, value: []const u8) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (value.len > self.uri.len) return;
         @memcpy(self.uri[0..value.len], value);
         self.len = value.len;
     }
 
-    pub fn get(self: *VmServiceState, out: []u8) ?[]const u8 {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
+    pub fn get(self: *VmServiceState, io: std.Io, out: []u8) ?[]const u8 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (self.len == 0 or self.len > out.len) return null;
         @memcpy(out[0..self.len], self.uri[0..self.len]);
         return out[0..self.len];
@@ -2020,7 +1441,7 @@ pub const VmServiceState = struct {
 };
 pub var vm_service: VmServiceState = .{};
 
-fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, _: ?*anyopaque) callconv(.c) void {
+fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
     const safe_tag = if (tag == null) "flutter" else std.mem.span(tag);
     const safe_message = if (message == null) "" else std.mem.span(message);
     std.debug.print("[{s}] {s}\n", .{ safe_tag, safe_message });
@@ -2032,9 +1453,57 @@ fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, _: ?*anyopaque) 
             const rest = safe_message[idx + prefix.len ..];
             const end = std.mem.indexOfAny(u8, rest, " \t\r\n") orelse rest.len;
             if (end > 0) {
-                vm_service.set(rest[0..end]);
+                const runner = fromUserData(user_data);
+                vm_service.set(runner.task_queue.io, rest[0..end]);
                 std.debug.print("[fushell] VM service URI: {s}\n", .{rest[0..end]});
             }
         }
     }
+}
+
+test "physical key transition is applied exactly once" {
+    const FakeXkb = struct {
+        transitions: usize = 0,
+
+        fn updateKey(self: *@This(), _: u32, _: bool) u32 {
+            self.transitions += 1;
+            return 0;
+        }
+    };
+
+    var state: FakeXkb = .{};
+    _ = applyPhysicalKeyTransition(&state, 30, true);
+    try std.testing.expectEqual(@as(usize, 1), state.transitions);
+}
+
+test "key repeat reuses held key without xkb transition" {
+    const FakeXkb = struct {
+        transitions: usize = 0,
+
+        fn updateKey(self: *@This(), _: u32, _: bool) u32 {
+            self.transitions += 1;
+            return 0;
+        }
+    };
+    const FakeHandler = struct {
+        repeats: usize = 0,
+        text_updates: usize = 0,
+
+        fn sendKeyboardEvent(self: *@This(), _: u32, pressed: bool) void {
+            if (pressed) self.repeats += 1;
+        }
+
+        fn applyTextKey(self: *@This(), _: u32) void {
+            self.text_updates += 1;
+        }
+    };
+
+    var state: FakeXkb = .{};
+    var handler: FakeHandler = .{};
+    _ = applyPhysicalKeyTransition(&state, 30, true);
+    dispatchKeyRepeat(&handler, 30);
+    dispatchKeyRepeat(&handler, 30);
+    try std.testing.expectEqual(@as(usize, 1), state.transitions);
+    try std.testing.expectEqual(@as(usize, 2), handler.repeats);
+    try std.testing.expectEqual(@as(usize, 2), handler.text_updates);
 }

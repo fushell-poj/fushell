@@ -5,8 +5,8 @@
 //! 读 (粘贴): device 收到 selection 事件 → offer 对象 → offer 的 offer 事件记录 mime
 //!            → offer.receive(mime, pipe_w) → 读 pipe_r 内容。
 //!
-//! 线程模型: 事件在主线程 dispatch (primary queue), publish/requestText 可在
-//!           任意线程调用 (内部加锁 + flush_mutex 保护 marshal)。
+//! 线程模型: 协议事件、平台消息与剪贴板 API 都在平台线程执行；模块不做
+//!           额外线程同步。读取 pipe 由主事件循环非阻塞驱动。
 
 const std = @import("std");
 const wayland = @import("wayland");
@@ -14,6 +14,8 @@ const wl = wayland.client.wl;
 const zwlr = wayland.client.zwlr;
 
 const display_state = @import("wl_display_state.zig");
+
+const max_clipboard_bytes: usize = 16 * 1024 * 1024;
 
 pub const DataControl = struct {
     gpa: std.mem.Allocator,
@@ -28,54 +30,39 @@ pub const DataControl = struct {
     offer_mimes: std.ArrayListUnmanaged([]const u8) = .empty,
     /// 当前发布的内容 (send 回调时写入 fd)。
     published_text: std.ArrayListUnmanaged(u8) = .empty,
-
-    mutex: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *DataControl) void {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-    }
+    /// 正在读取的外部 selection；fd 与累积缓冲均由平台线程拥有。
+    request_fd: ?i32 = null,
+    request_bytes: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, display: *display_state.DisplayState) DataControl {
         return .{ .gpa = gpa, .display = display };
     }
 
     pub fn deinit(self: *DataControl) void {
-        self.lock();
-        defer self.mutex.unlock();
         for (self.offer_mimes.items) |m| self.gpa.free(m);
         self.offer_mimes.deinit(self.gpa);
         self.published_text.deinit(self.gpa);
-        if (self.manager) |m| m.destroy();
-        self.manager = null;
-        if (self.device) |dev| dev.destroy();
-        self.device = null;
-        self.source = null;
+        self.cancelRequestText();
+        self.request_bytes.deinit(self.gpa);
+        if (self.source) |src| src.destroy();
         if (self.offer) |off| off.destroy();
+        if (self.device) |dev| dev.destroy();
+        if (self.manager) |m| m.destroy();
+        self.source = null;
         self.offer = null;
+        self.device = null;
+        self.manager = null;
     }
 
     /// registry global 出现 data_control_manager 时绑定。
     pub fn bindManager(self: *DataControl, global: *wl.Registry, name: u32, version: u32) void {
-        self.lock();
-        if (self.manager != null) {
-            self.mutex.unlock();
-            return;
-        }
-        const manager = wl.Registry.bind(global, name, zwlr.DataControlManagerV1, @min(version, 2)) catch {
-            self.mutex.unlock();
-            return;
-        };
-        self.manager = manager;
-        // 记录 seat 引用, 解锁后再 bindDevice (bindDevice 自身加锁, 避免自旋锁不可重入死锁)。
-        const seat = self.display.seat;
-        self.mutex.unlock();
-        if (seat) |s| self.bindDevice(s);
+        if (self.manager != null) return;
+        self.manager = wl.Registry.bind(global, name, zwlr.DataControlManagerV1, @min(version, 2)) catch return;
+        if (self.display.seat) |seat| self.bindDevice(seat);
     }
 
     /// seat 可用时创建 data device。
     pub fn bindDevice(self: *DataControl, seat: *wl.Seat) void {
-        self.lock();
-        defer self.mutex.unlock();
         if (self.manager == null or self.device != null) return;
         const device = self.manager.?.getDataDevice(seat) catch null orelse return;
         device.setListener(*DataControl, deviceListener, self);
@@ -84,8 +71,6 @@ pub const DataControl = struct {
 
     /// 系统剪贴板是否可能包含文本 (offer 存在且含 text/plain)。
     pub fn hasText(self: *DataControl) bool {
-        self.lock();
-        defer self.mutex.unlock();
         if (self.offer == null) return false;
         for (self.offer_mimes.items) |m| {
             if (std.mem.eql(u8, m, "text/plain")) return true;
@@ -95,8 +80,6 @@ pub const DataControl = struct {
 
     /// 发布文本到系统剪贴板。
     pub fn publish(self: *DataControl, text: []const u8) void {
-        self.lock();
-        defer self.mutex.unlock();
         self.published_text.clearRetainingCapacity();
         self.published_text.appendSlice(self.gpa, text) catch return;
 
@@ -113,86 +96,67 @@ pub const DataControl = struct {
         self.device.?.setSelection(source);
     }
 
-    /// 请求系统剪贴板文本。返回 null = 无内容或失败。
-    /// 调用方负责 free 返回值。
-    pub fn requestText(self: *DataControl, gpa: std.mem.Allocator) ?[]const u8 {
-        // 阶段 1: 锁内检查 + 发起 receive。锁在阶段 2 前必须释放 —
-        // 否则等待循环里 dispatch 的 source.send 事件 (sourceListener)
-        // 会自旋等同一把锁 → 死锁 (应用内复制→粘贴必现)。
+    pub const RequestProgress = union(enum) {
+        pending,
+        complete: ?[]u8,
+    };
+
+    /// Starts a text/plain transfer. The runner polls requestFd() alongside
+    /// Wayland and Flutter task wakeups, so a slow owner cannot stall the UI.
+    pub fn beginRequestText(self: *DataControl) !bool {
+        const offer = self.offer orelse return false;
+        if (!self.hasText()) return false;
+        if (self.request_fd != null) return error.ClipboardBusy;
+
         var pipe_fds: [2]i32 = undefined;
-        {
-            self.lock();
-            defer self.mutex.unlock();
-            const offer = self.offer orelse {
-                return null;
-            };
-            var has_text_plain = false;
-            for (self.offer_mimes.items) |m| {
-                if (std.mem.eql(u8, m, "text/plain")) {
-                    has_text_plain = true;
-                    break;
-                }
-            }
-            if (!has_text_plain) {
-                return null;
-            }
-
-            _ = std.os.linux.pipe2(&pipe_fds, .{});
-            const write_fd = pipe_fds[1];
-
-            // marshal 需要 display 锁 (避免与主线程 dispatch 竞争)
-            self.display.lockFlush();
-            offer.receive("text/plain", write_fd);
-            self.display.unlockFlush();
-            if (self.display.display) |d| _ = d.flush();
-            _ = std.os.linux.close(write_fd);
-        }
+        if (std.os.linux.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) return error.ClipboardPipeFailed;
         const read_fd = pipe_fds[0];
+        const write_fd = pipe_fds[1];
+        errdefer _ = std.os.linux.close(read_fd);
+        defer _ = std.os.linux.close(write_fd);
 
-        // 后台线程阻塞读 fd; 主线程等待期间持续 dispatch,
-        // 让 compositor 把 source.send 事件送进来 (数据经 fd 到达)。
-        const ThreadCtx = struct {
-            fd: i32,
-            buf: [65536]u8 = undefined,
-            n: usize = 0,
-            done: bool = false,
-        };
-        var ctx: ThreadCtx = .{ .fd = read_fd };
-        const thread = std.Thread.spawn(.{}, struct {
-            fn run(c: *ThreadCtx) void {
-                while (c.n < c.buf.len) {
-                    // poll 100ms 超时: 无数据也退出, 保证 join 不卡死。
-                    var pfd = [1]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                    const pr = std.posix.poll(&pfd, 100) catch break;
-                    if (pr == 0) break;
-                    const r = std.os.linux.read(c.fd, c.buf[c.n..].ptr, c.buf.len - c.n);
-                    if (std.os.linux.errno(r) == .SUCCESS) {
-                        if (r == 0) break;
-                        c.n += r;
-                    } else if (std.os.linux.errno(r) == .INTR) {
-                        continue;
-                    } else break;
-                }
-                _ = std.os.linux.close(c.fd);
-                c.done = true;
-            }
-        }.run, .{&ctx}) catch {
-            _ = std.os.linux.close(read_fd);
-            return null;
-        };
+        offer.receive("text/plain", write_fd);
+        self.display.flush();
+        self.request_fd = read_fd;
+        self.request_bytes.clearRetainingCapacity();
+        return true;
+    }
 
-        var waited_ms: u32 = 0;
-        while (!ctx.done and waited_ms < 2000) {
-            if (self.display.display) |d| {
-                if (self.display.shared_queue) |q| _ = d.dispatchQueuePending(q);
+    pub fn requestFd(self: *const DataControl) ?i32 {
+        return self.request_fd;
+    }
+
+    /// Drains currently available bytes. A completed slice transfers ownership
+    /// to the caller; pending leaves the request registered for the next poll.
+    pub fn pumpRequestText(self: *DataControl) !RequestProgress {
+        const fd = self.request_fd orelse return error.NoClipboardRequest;
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const count = std.posix.read(fd, &chunk) catch |err| switch (err) {
+                error.WouldBlock => return .pending,
+                else => {
+                    self.cancelRequestText();
+                    return error.ClipboardReadFailed;
+                },
+            };
+            if (count == 0) {
+                _ = std.os.linux.close(fd);
+                self.request_fd = null;
+                if (self.request_bytes.items.len == 0) return .{ .complete = null };
+                return .{ .complete = try self.request_bytes.toOwnedSlice(self.gpa) };
             }
-            const ts = std.os.linux.timespec{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
-            _ = std.os.linux.nanosleep(&ts, null);
-            waited_ms += 1;
+            if (self.request_bytes.items.len > max_clipboard_bytes -| count) {
+                self.cancelRequestText();
+                return error.ClipboardTooLarge;
+            }
+            try self.request_bytes.appendSlice(self.gpa, chunk[0..count]);
         }
-        thread.join();
-        if (ctx.n == 0) return null;
-        return gpa.dupe(u8, ctx.buf[0..ctx.n]) catch null;
+    }
+
+    pub fn cancelRequestText(self: *DataControl) void {
+        if (self.request_fd) |fd| _ = std.os.linux.close(fd);
+        self.request_fd = null;
+        self.request_bytes.clearRetainingCapacity();
     }
 
     fn sourceListener(source: *zwlr.DataControlSourceV1, event: zwlr.DataControlSourceV1.Event, data: *DataControl) void {
@@ -200,28 +164,29 @@ pub const DataControl = struct {
         switch (event) {
             .send => |s| {
                 // 把 published_text 写入 fd
-                data.lock();
                 const text = data.published_text.items;
                 if (text.len > 0) {
                     var off: usize = 0;
                     while (off < text.len) {
                         const w = std.os.linux.write(s.fd, text[off..].ptr, text.len - off);
-                        if (std.os.linux.errno(w) == .SUCCESS) {
-                            off += w;
-                        } else break;
+                        switch (std.os.linux.errno(w)) {
+                            .SUCCESS => {
+                                if (w == 0) break;
+                                off += w;
+                            },
+                            .INTR => continue,
+                            else => break,
+                        }
                     }
                 }
-                data.mutex.unlock();
                 _ = std.os.linux.close(s.fd);
             },
             .cancelled => {
                 // 新 selection 取代我们 → 销毁 source
-                data.lock();
                 if (data.source) |src| {
                     src.destroy();
                     data.source = null;
                 }
-                data.mutex.unlock();
             },
         }
     }
@@ -233,13 +198,10 @@ pub const DataControl = struct {
                 // 新 offer 对象 (后续 selection 事件引用它)。先注册 listener。
                 doffer.id.setListener(*DataControl, offerListener, data);
                 // 新 offer 开始: 旧 offer 的 mime 作废。
-                data.lock();
                 for (data.offer_mimes.items) |m| data.gpa.free(m);
                 data.offer_mimes.clearRetainingCapacity();
-                data.mutex.unlock();
             },
             .selection => |sel| {
-                data.lock();
                 // 注意: 不能在这里清 mime 列表 — offer 的 mime 事件先于
                 // selection 到达 (compositor 事件顺序), selection 时列表已填好。
                 // 旧 offer 的 mime 在 data_offer 事件(新 offer 开始)时清理。
@@ -247,13 +209,10 @@ pub const DataControl = struct {
                     data.offer.?.destroy();
                 }
                 data.offer = sel.id;
-                data.mutex.unlock();
             },
             .finished => {
                 // compositor 销毁 device
-                data.lock();
                 data.device = null;
-                data.mutex.unlock();
             },
             .primary_selection => {
                 // 主选择 (中键粘贴) — 本实现忽略。
@@ -265,8 +224,6 @@ pub const DataControl = struct {
         _ = offer;
         switch (event) {
             .offer => |offer_ev| {
-                data.lock();
-                defer data.mutex.unlock();
                 // 注意: mime 事件先于 selection 到达 (compositor 顺序),
                 // 此时 data.offer 尚未设置 — 不能做 offer 匹配检查。
                 const mime_z: [*:0]const u8 = offer_ev.mime_type;
@@ -278,3 +235,57 @@ pub const DataControl = struct {
         }
     }
 };
+
+test "non-blocking clipboard request remains pending until producer closes" {
+    var pipe_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        std.os.linux.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    var writer_open = true;
+    defer if (writer_open) std.posix.close(pipe_fds[1]);
+
+    var dc: DataControl = undefined;
+    dc.gpa = std.testing.allocator;
+    dc.request_fd = pipe_fds[0];
+    dc.request_bytes = .empty;
+    defer dc.cancelRequestText();
+
+    try std.testing.expectEqual(DataControl.RequestProgress.pending, try dc.pumpRequestText());
+    try std.testing.expectEqual(@as(usize, 5), try std.posix.write(pipe_fds[1], "hello"));
+    try std.testing.expectEqual(DataControl.RequestProgress.pending, try dc.pumpRequestText());
+
+    std.posix.close(pipe_fds[1]);
+    writer_open = false;
+    const complete = try dc.pumpRequestText();
+    const text = switch (complete) {
+        .complete => |value| value orelse return error.ExpectedClipboardText,
+        .pending => return error.ExpectedCompletedClipboardRead,
+    };
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello", text);
+    try std.testing.expectEqual(@as(?c_int, null), dc.request_fd);
+}
+
+test "clipboard source destruction completes an empty request" {
+    var pipe_fds: [2]c_int = undefined;
+    try std.testing.expectEqual(
+        std.os.linux.E.SUCCESS,
+        std.os.linux.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+
+    var dc: DataControl = undefined;
+    dc.gpa = std.testing.allocator;
+    dc.request_fd = pipe_fds[0];
+    dc.request_bytes = .empty;
+    defer dc.cancelRequestText();
+
+    try std.testing.expectEqual(DataControl.RequestProgress.pending, try dc.pumpRequestText());
+    std.posix.close(pipe_fds[1]);
+    const result = try dc.pumpRequestText();
+    switch (result) {
+        .complete => |value| try std.testing.expectEqual(@as(?[]u8, null), value),
+        .pending => return error.ExpectedCompletedClipboardRead,
+    }
+    try std.testing.expectEqual(@as(?c_int, null), dc.request_fd);
+}

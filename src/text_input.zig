@@ -19,12 +19,13 @@ pub const EditingState = struct {
     composing_end: i64 = -1,
 };
 
-pub const SendFn = *const fn (client_id: i64, msg: []const u8) void;
+pub const SendFn = *const fn (client_id: i64, msg: []const u8, context: ?*anyopaque) void;
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
     client_id: i64 = -1,
     send_fn: ?SendFn = null,
+    send_context: ?*anyopaque = null,
     active: bool = false,
     multiline: bool = false,
     input_action: []const u8 = "done",
@@ -52,14 +53,13 @@ pub const Client = struct {
         self.* = .{ .gpa = self.gpa };
     }
 
-    fn sendUpdate(self: *Client) void {
-        var buf: [2048]u8 = undefined;
-        const msg = self.buildUpdateMessage(&buf) catch {
-            std.debug.print("[ti] buildUpdateMessage failed\n", .{});
+    pub fn sendUpdate(self: *Client) void {
+        const msg = self.buildUpdateMessageAlloc() catch |err| {
+            std.debug.print("[error] Failed to encode text-input update: {s}\n", .{@errorName(err)});
             return;
         };
-        std.debug.print("[ti] sendUpdate {d} bytes: {s}\n", .{ msg.len, msg[0..@min(msg.len, 120)] });
-        if (self.send_fn) |send| send(self.client_id, msg) else std.debug.print("[ti] send_fn null!\n", .{});
+        defer self.gpa.free(msg);
+        if (self.send_fn) |send| send(self.client_id, msg, self.send_context);
     }
 
     pub fn clear(self: *Client) void {
@@ -126,8 +126,11 @@ pub const Client = struct {
         // 先移除旧组合区 (preedit 更新是替换, 不是追加)。
         _ = try self.removeComposingRegion();
         if (text) |t| {
-            const base: usize = @min(@as(usize, @intCast(@max(self.state.selection_base, 0))), self.state.text.items.len);
-            try self.state.text.replaceRange(self.gpa, base, 0, t);
+            // 第一段 preedit 必须替换当前 selection；selection_base 可能位于
+            // 选区末端（例如 Ctrl+A 的反向 selection），不能直接当插入点。
+            const sel = self.selectionRange();
+            try self.state.text.replaceRange(self.gpa, sel.start, sel.end - sel.start, t);
+            const base = sel.start;
             const end: i64 = @intCast(base + t.len);
             self.state.selection_base = end;
             self.state.selection_extent = end;
@@ -266,28 +269,19 @@ pub const Client = struct {
         self.state.selection_extent = pos;
     }
 
-    /// 构造 updateEditingState 消息 (JSON, 写 out buffer)。
-    /// 注意: Flutter 的 TextEditingValue.fromJSON 用扁平字段 (selectionBase/Extent), 不是嵌套 selection。
-    pub fn buildUpdateMessage(self: *const Client, out: []u8) ![]const u8 {
+    /// 构造 updateEditingState 消息 (JSON, 调用方负责释放返回值)。
+    /// Flutter 的 TextEditingValue.fromJSON 使用扁平 selection 字段。
+    pub fn buildUpdateMessageAlloc(self: *const Client) ![]u8 {
         const text = self.state.text.items;
+        const escaped = try jsonEscape(self.gpa, text);
+        defer self.gpa.free(escaped);
         const sel_base = byteToUtf16(text, self.state.selection_base);
         const sel_ext = byteToUtf16(text, self.state.selection_extent);
         const comp_base = if (self.state.composing_start >= 0) byteToUtf16(text, self.state.composing_start) else -1;
         const comp_ext = if (self.state.composing_end >= 0) byteToUtf16(text, self.state.composing_end) else -1;
-        return std.fmt.bufPrint(out,
+        return std.fmt.allocPrint(self.gpa,
             \\{{"method":"TextInputClient.updateEditingState","args":[{d},{{"text":"{s}","selectionBase":{d},"selectionExtent":{d},"selectionAffinity":"downstream","selectionIsDirectional":false,"composingBase":{d},"composingExtent":{d}}}]}}
-        , .{ self.client_id, text, sel_base, sel_ext, comp_base, comp_ext });
-    }
-
-    /// 同 buildUpdateMessage, 但 text 已由调用方预转义 (含引号/换行安全)。
-    pub fn buildUpdateMessageEscaped(self: *const Client, out: []u8, escaped_text: []const u8) ![]const u8 {
-        const sel_base = byteToUtf16(self.state.text.items, self.state.selection_base);
-        const sel_ext = byteToUtf16(self.state.text.items, self.state.selection_extent);
-        const comp_base = if (self.state.composing_start >= 0) byteToUtf16(self.state.text.items, self.state.composing_start) else -1;
-        const comp_ext = if (self.state.composing_end >= 0) byteToUtf16(self.state.text.items, self.state.composing_end) else -1;
-        return std.fmt.bufPrint(out,
-            \\{{"method":"TextInputClient.updateEditingState","args":[{d},{{"text":"{s}","selectionBase":{d},"selectionExtent":{d},"selectionAffinity":"downstream","selectionIsDirectional":false,"composingBase":{d},"composingExtent":{d}}}]}}
-        , .{ self.client_id, escaped_text, sel_base, sel_ext, comp_base, comp_ext });
+        , .{ self.client_id, escaped, sel_base, sel_ext, comp_base, comp_ext });
     }
 
     /// 构造 performAction 消息。
@@ -315,4 +309,31 @@ pub fn jsonEscape(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "IME preedit replaces forward selection" {
+    var client = Client.init(std.testing.allocator);
+    defer client.deinit();
+
+    try client.applyEditingState("existing text", 0, 13);
+    try client.setComposing("ni", 0, 0);
+
+    try std.testing.expectEqualStrings("ni", client.state.text.items);
+    try std.testing.expectEqual(@as(i64, 0), client.state.composing_start);
+    try std.testing.expectEqual(@as(i64, 2), client.state.composing_end);
+}
+
+test "IME preedit replaces reverse selection and commit replaces preedit" {
+    var client = Client.init(std.testing.allocator);
+    defer client.deinit();
+
+    try client.applyEditingState("existing text", 13, 0);
+    try client.setComposing("ni", 0, 0);
+    try client.insertText("你");
+
+    try std.testing.expectEqualStrings("你", client.state.text.items);
+    try std.testing.expectEqual(@as(i64, 3), client.state.selection_base);
+    try std.testing.expectEqual(@as(i64, 3), client.state.selection_extent);
+    try std.testing.expectEqual(@as(i64, -1), client.state.composing_start);
+    try std.testing.expectEqual(@as(i64, -1), client.state.composing_end);
 }

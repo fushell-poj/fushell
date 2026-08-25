@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
     linkRuntimeLibraries(exe_mod, dynamic_link_opts);
 
     const exe = b.addExecutable(.{
+        // pi-lens-ignore: zls
         .name = "fushell-runner",
         .root_module = exe_mod,
         .use_llvm = true,
@@ -209,6 +210,10 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    const build_tool_unit_tests = b.addTest(.{ .root_module = build_tool_mod });
+    const run_build_tool_unit_tests = b.addRunArtifact(build_tool_unit_tests);
+    test_step.dependOn(&run_build_tool_unit_tests.step);
 }
 
 /// 检查引擎 .so 是否存在, 缺失时给明确指引 (先构建对应引擎) 并退出。

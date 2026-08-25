@@ -11,11 +11,12 @@ comptime {
 
 /// 播放一个 bundle (阻塞直到程序退出)。
 /// enable_vm_service: 启动 VM service (热重载, 仅 debug/JIT 引擎)。
-pub fn runPlayer(gpa: std.mem.Allocator, bundle_path: []const u8, enable_vm_service: bool) !void {
+pub fn runPlayer(gpa: std.mem.Allocator, io: std.Io, bundle_path: []const u8, enable_vm_service: bool) !void {
     const engine_library = try resolveBundleEngineLibrary(gpa, bundle_path);
     defer gpa.free(engine_library);
 
     try flutter_runner.run(gpa, .{
+        .io = io,
         .engine_library = engine_library,
         .bundle_path = bundle_path,
         .enable_vm_service = enable_vm_service,

@@ -119,6 +119,14 @@ still call `openWindow` to create additional views. Calling `updateLayer` on
 a window role, or `updateWindow` on a layer role, returns a structured
 `FushellSurfaceException`.
 
+## Bundle requirements
+
+Debug/JIT bundles contain `data/flutter_assets/kernel_blob.bin`. Release/AOT
+bundles must contain both `lib/libapp.so` and its matching split debug-info
+artifact at `lib/libapp.so.symbols`. `fushell-build --release` generates and
+packages both; the runner rejects incomplete AOT bundles instead of silently
+starting without symbolization support.
+
 ## Concurrency model (for embedder maintainers)
 
 One engine, one Wayland connection, one event loop (main thread), one shared
@@ -129,3 +137,16 @@ Present runs on an engine thread; `present_mutex` serializes it with main
 thread resizes. Window destruction is asynchronous: `closeWindow` submits
 `FlutterEngineRemoveView` and destroys the surface only after the
 `remove_view_callback` confirms the engine no longer touches the view.
+
+The platform thread blocks on the Wayland display fd, Flutter's task `eventfd`,
+and an active clipboard-transfer fd. Flutter deadlines determine the poll
+timeout, so an idle headless process has no periodic wakeup while `Timer` and
+`Future` callbacks still run at their requested deadlines. Clipboard reads are
+non-blocking state machines with a 16 MiB resource limit and a 5 second timeout;
+they never synchronously block the platform thread.
+
+## SDK source of truth
+
+`packages/fushell` is the canonical SDK source used by in-repository examples.
+`fushell-build sdk` exports that same package for external consumers; no
+checked-in vendored SDK copy is maintained.
