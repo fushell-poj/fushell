@@ -54,6 +54,10 @@ pub const EventLoopSource = struct {
     /// The next loop tick consumes readiness, keeping subsystem state on the
     /// platform thread instead of introducing worker-thread completion races.
     auxiliary_fd: ?*const fn (context: ?*anyopaque) c_int = null,
+    /// Process shutdown notification (SIGINT/SIGTERM). A negative descriptor
+    /// disables it; readiness makes the event loop stop without dispatching
+    /// further Wayland work.
+    shutdown_fd: c_int = -1,
 };
 
 pub const State = enum {
@@ -502,8 +506,15 @@ pub const Host = struct {
                     .events = std.posix.POLL.IN,
                     .revents = 0,
                 },
+                .{
+                    .fd = source.shutdown_fd,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
             };
             _ = std.posix.poll(&fds, source.timeout_ms(source.context)) catch return error.EventLoopPollFailed;
+            if ((fds[3].revents & std.posix.POLL.IN) != 0) break;
+            if ((fds[3].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.ShutdownPollFailed;
             if ((fds[1].revents & std.posix.POLL.IN) != 0) source.consume_wake(source.context);
             if ((fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.TaskWakePollFailed;
             if ((fds[2].revents & std.posix.POLL.NVAL) != 0) return error.AuxiliaryPollFailed;
@@ -625,7 +636,11 @@ pub const Host = struct {
 
     fn applyBufferScale(self: *Host) void {
         if (self.surface) |surface| {
-            if (self.fractional_scale_120 > 0 and self.viewport != null) {
+            // A layer surface may intentionally start with width/height 0 so
+            // opposite anchors choose that dimension.  wp_viewport rejects
+            // non-positive destinations; wait for the compositor's configure
+            // before installing a fractional-scale destination.
+            if (self.fractional_scale_120 > 0 and self.viewport != null and self.width > 0 and self.height > 0) {
                 surface.setBufferScale(1);
                 self.viewport.?.setDestination(self.width, self.height);
             } else {

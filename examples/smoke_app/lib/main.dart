@@ -10,7 +10,6 @@ import 'settings.dart';
 /// 渲染到对应 view。关闭全部窗口不会退出进程 (显式退出用 FushellProcess.exit)。
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
   final int mainWindowId = await FushellWindow.openWindow(
     title: 'fushell Flutter Smoke',
     appId: 'dev.fushell.smoke',
@@ -48,7 +47,7 @@ Future<void> main() async {
     debugPrint('layer-shell window unavailable on this compositor: $e');
   }
 
-  runApp(
+  runWidget(
     _SmokeViewCollection(
       mainWindowId: mainWindowId,
       mainView: await FushellWindow.viewById(mainWindowId),

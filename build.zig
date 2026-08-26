@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     const build_engine_debug_step = b.step("build-engine-debug", "Build the debug (JIT) Flutter engine in the workspace");
     build_engine_debug_step.dependOn(&build_engine_debug.step);
 
-    // 三个引擎 .so 全部内嵌进 fushell-build (打包时按模式选), 各自可覆盖:
+    // 三个引擎 .so 全部内嵌进 fushell CLI (打包时按模式选), 各自可覆盖:
     //   debug   → 打包 JIT bundle (kernel_blob.bin)
     //   profile → 打包 AOT+剖析 bundle
     //   release → 打包 AOT bundle (默认)
@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const build_tool_mod = b.createModule(.{
-        .root_source_file = b.path("src/fushell_build.zig"),
+        .root_source_file = b.path("src/fushell.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -144,12 +144,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }));
-    // fushell-build run: 进程内播放 (player.zig → flutter_runner → c/wayland/EGL)
+    // fushell run: 进程内播放 (player.zig → flutter_runner → c/wayland/EGL)
     build_tool_mod.addImport("c", c_mod);
     build_tool_mod.addImport("wayland", wayland_mod);
     linkRuntimeLibraries(build_tool_mod, dynamic_link_opts);
     // workspace 解析后是绝对路径 (或相对构建根), 用 cwd_relative 支持两者
-    // 目标平台 arch (Flutter 命名: x64/arm64/riscv64), 注入 fushell-build
+    // 目标平台 arch (Flutter 命名: x64/arm64/riscv64), 注入 fushell CLI
     // 用于默认 bundle 输出目录 build/linux/<arch>/<mode>
     const build_options = b.addOptions();
     {
@@ -173,12 +173,12 @@ pub fn build(b: *std.Build) void {
     build_tool_mod.addAnonymousImport("flutter_engine_so_release", .{
         .root_source_file = .{ .cwd_relative = flutter_engine_release_so },
     });
-    // runner 可执行文件内嵌进 fushell-build: 打包时写出为 bundle 入口
+    // runner 可执行文件内嵌进 fushell CLI: 打包时写出为 bundle 入口
     // (getEmittedBin LazyPath, 构建顺序自动: runner 先编译)
     build_tool_mod.addAnonymousImport("fushell_runner_bin", .{
         .root_source_file = exe.getEmittedBin(),
     });
-    // fushell SDK 包文件内嵌: `fushell-build sdk` 释放给外部项目
+    // fushell SDK 包文件内嵌: `fushell sdk` 释放给外部项目
     build_tool_mod.addAnonymousImport("fushell_sdk_pubspec", .{
         .root_source_file = b.path("packages/fushell/pubspec.yaml"),
     });
@@ -189,7 +189,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/fushell/README.md"),
     });
     const build_tool = b.addExecutable(.{
-        .name = "fushell-build",
+        .name = "fushell",
         .root_module = build_tool_mod,
         .use_llvm = true,
     });

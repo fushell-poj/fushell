@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 const String _surfaceChannel = 'dev.fushell/surface';
 
@@ -13,7 +15,7 @@ const String _surfaceChannel = 'dev.fushell/surface';
 /// ```dart
 /// final id = await FushellWindow.openWindow(title: 'Main', appId: '...');
 /// final view = await FushellWindow.viewById(id);
-/// runApp(ViewCollection(views: [View(view: view, child: const MainApp())]));
+/// runWidget(ViewCollection(views: [View(view: view, child: const MainApp())]));
 /// ```
 ///
 /// 关闭全部窗口不会退出进程; 退出用 [FushellProcess.exit]。
@@ -21,6 +23,7 @@ final class FushellWindow {
   FushellWindow._();
 
   static int _nextRequestId = 1;
+  static Future<void>? _fontFallbackLoad;
 
   /// 创建新窗口, 返回窗口 id (= Flutter view_id)。
   ///
@@ -38,6 +41,7 @@ final class FushellWindow {
     int? parent,
     LayerSurfaceRole? layer,
   }) async {
+    await _ensureSystemFontFallbackLoaded();
     final Map<String, Object?> role = layer == null
         ? <String, Object?>{
             'kind': 'window',
@@ -109,6 +113,44 @@ final class FushellWindow {
       code: 'ViewNotFound',
       message: 'view $windowId did not appear in PlatformDispatcher.views',
     );
+  }
+
+  static Future<void> _ensureSystemFontFallbackLoaded() {
+    return _fontFallbackLoad ??= _loadSystemFontFallback();
+  }
+
+  static Future<void> _loadSystemFontFallback() async {
+    const String configAsset = 'fushell_system_fonts/fallback.json';
+    const String fontAsset = 'fushell_system_fonts/system.ttf';
+
+    final String config;
+    try {
+      config = await rootBundle.loadString(configAsset);
+    } on FlutterError {
+      // The application bundle already provides every required fallback.
+      return;
+    }
+
+    final Object? decoded = jsonDecode(config);
+    if (decoded is! Map<String, Object?> ||
+        decoded['aliases'] is! List<Object?>) {
+      throw StateError('$configAsset is malformed');
+    }
+    final List<String> aliases = <String>[];
+    for (final Object? alias in decoded['aliases']! as List<Object?>) {
+      if (alias is! String || alias.isEmpty) {
+        throw StateError('$configAsset contains an invalid font alias');
+      }
+      aliases.add(alias);
+    }
+    if (aliases.isEmpty) return;
+
+    final ByteData font = await rootBundle.load(fontAsset);
+    for (final String alias in aliases) {
+      final FontLoader loader = FontLoader(alias)
+        ..addFont(Future<ByteData>.value(font));
+      await loader.load();
+    }
   }
 
   static Future<Map<String, Object?>> _sendRequest(

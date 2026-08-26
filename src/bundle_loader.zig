@@ -1,7 +1,9 @@
 const std = @import("std");
 const c = @import("c");
 
-const flutter_default_font_family = "Roboto";
+const fallback_font_asset = "fushell_system_fonts/system.ttf";
+const fallback_font_config = "fushell_system_fonts/fallback.json";
+const fallback_font_aliases = [_][]const u8{ "Roboto", "monospace", "sans-serif" };
 
 /// Validated Flutter bundle paths plus an optional temporary font overlay.
 pub const Bundle = struct {
@@ -104,7 +106,7 @@ fn validateAssetsLayout(gpa: std.mem.Allocator, assets_path: []const u8, icu_dat
 
 fn prepareBundle(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8, app_so_path: ?[]const u8) !Bundle {
     const injected_assets_path = prepareFontconfigAssetsOverlay(gpa, assets_path) catch |err| switch (err) {
-        error.SystemFontUnavailable, error.FontManifestAlreadyProvidesDefault => null,
+        error.SystemFontUnavailable, error.FontFallbackAlreadyProvided => null,
         else => fallback: {
             std.debug.print("[error] System font asset injection failed: {s}; continuing with original bundle assets.\n", .{@errorName(err)});
             break :fallback null;
@@ -140,13 +142,12 @@ fn prepareFontconfigAssetsOverlay(gpa: std.mem.Allocator, assets_path: []const u
 
     const manifest_path = try std.fs.path.join(gpa, &.{ assets_path, "FontManifest.json" });
     defer gpa.free(manifest_path);
+    const manifest = readFileAllocC(gpa, manifest_path) catch null;
+    defer if (manifest) |bytes| gpa.free(bytes);
 
-    if (readFileAllocC(gpa, manifest_path)) |manifest| {
-        defer gpa.free(manifest);
-        if (manifestHasFontFamily(manifest, system_font.family) and manifestHasFontFamily(manifest, flutter_default_font_family)) {
-            return error.FontManifestAlreadyProvidesDefault;
-        }
-    } else |_| {}
+    var alias_storage: [fallback_font_aliases.len + 1][]const u8 = undefined;
+    const aliases = collectMissingFontAliases(manifest, system_font.family, &alias_storage);
+    if (aliases.len == 0) return error.FontFallbackAlreadyProvided;
 
     const assets_abs = try realPathAlloc(gpa, assets_path);
     defer gpa.free(assets_abs);
@@ -163,17 +164,14 @@ fn prepareFontconfigAssetsOverlay(gpa: std.mem.Allocator, assets_path: []const u
     defer gpa.free(font_dir);
     if (c.mkdir(font_dir.ptr, 0o700) != 0) return error.CreateOverlayFailed;
 
-    const font_basename = std.fs.path.basename(system_font.path);
-    const font_asset = try std.fs.path.join(gpa, &.{ font_dir_name, font_basename });
-    defer gpa.free(font_asset);
-    const font_link = try std.fs.path.joinZ(gpa, &.{ overlay_path, font_asset });
+    const font_link = try std.fs.path.joinZ(gpa, &.{ overlay_path, fallback_font_asset });
     defer gpa.free(font_link);
     const system_font_path_z = try gpa.dupeZ(u8, system_font.path);
     defer gpa.free(system_font_path_z);
     if (c.symlink(system_font_path_z.ptr, font_link.ptr) != 0) return error.CreateOverlayFailed;
 
-    try writeInjectedFontManifest(gpa, assets_path, overlay_path, system_font.family, font_asset);
-    std.debug.print("Resolved fontconfig sans font for Flutter text fallback: {s} ({s}); registering Flutter default alias {s}\n", .{ system_font.family, system_font.path, flutter_default_font_family });
+    try writeFallbackFontConfig(gpa, overlay_path, aliases);
+    std.debug.print("Resolved fontconfig sans font for Flutter runtime fallback: {s} ({s})\n", .{ system_font.family, system_font.path });
     return overlay_path;
 }
 
@@ -221,7 +219,7 @@ fn symlinkTopLevelAssets(gpa: std.mem.Allocator, assets_abs: []const u8, overlay
     while (c.readdir(dir)) |entry| {
         const name = direntName(entry);
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        if (std.mem.eql(u8, name, "FontManifest.json") or std.mem.eql(u8, name, "fushell_system_fonts")) continue;
+        if (std.mem.eql(u8, name, "fushell_system_fonts")) continue;
         const src = try std.fs.path.joinZ(gpa, &.{ assets_abs, name });
         defer gpa.free(src);
         const dst = try std.fs.path.joinZ(gpa, &.{ overlay_path, name });
@@ -230,50 +228,43 @@ fn symlinkTopLevelAssets(gpa: std.mem.Allocator, assets_abs: []const u8, overlay
     }
 }
 
-fn writeInjectedFontManifest(gpa: std.mem.Allocator, original_assets_path: []const u8, overlay_path: []const u8, family: []const u8, asset: []const u8) !void {
-    const original_manifest_path = try std.fs.path.join(gpa, &.{ original_assets_path, "FontManifest.json" });
-    defer gpa.free(original_manifest_path);
-
-    var original_manifest: ?[]u8 = null;
-    if (readFileAllocC(gpa, original_manifest_path)) |manifest| {
-        original_manifest = manifest;
-    } else |err| if (err != error.FileUnavailable) {
-        std.debug.print("[warn] failed to read original FontManifest.json: {s}\n", .{@errorName(err)});
+fn writeFallbackFontConfig(gpa: std.mem.Allocator, overlay_path: []const u8, aliases: []const []const u8) !void {
+    var generated: std.ArrayList(u8) = .empty;
+    defer generated.deinit(gpa);
+    try generated.appendSlice(gpa, "{\"aliases\":[");
+    for (aliases, 0..) |family, index| {
+        try validateJsonStringFragment(family);
+        if (index != 0) try generated.append(gpa, ',');
+        try generated.append(gpa, '"');
+        try generated.appendSlice(gpa, family);
+        try generated.append(gpa, '"');
     }
-    defer if (original_manifest) |manifest| gpa.free(manifest);
+    try generated.appendSlice(gpa, "]}\n");
 
-    const generated = try buildFontManifest(gpa, original_manifest, family, asset);
-    defer gpa.free(generated);
-    const overlay_manifest_path = try std.fs.path.joinZ(gpa, &.{ overlay_path, "FontManifest.json" });
-    defer gpa.free(overlay_manifest_path);
-    try writeFileC(overlay_manifest_path, generated);
+    const config_path = try std.fs.path.joinZ(gpa, &.{ overlay_path, fallback_font_config });
+    defer gpa.free(config_path);
+    try writeFileC(config_path, generated.items);
 }
 
-fn buildFontManifest(gpa: std.mem.Allocator, original_manifest: ?[]const u8, family: []const u8, asset: []const u8) ![]u8 {
-    try validateJsonStringFragment(family);
-    try validateJsonStringFragment(flutter_default_font_family);
-    try validateJsonStringFragment(asset);
-
-    const injected = if (std.mem.eql(u8, family, flutter_default_font_family))
-        try std.fmt.allocPrint(gpa, "{{\"family\":\"{s}\",\"fonts\":[{{\"asset\":\"{s}\",\"weight\":400}},{{\"asset\":\"{s}\",\"weight\":800}}]}}", .{ family, asset, asset })
-    else
-        try std.fmt.allocPrint(gpa, "{{\"family\":\"{s}\",\"fonts\":[{{\"asset\":\"{s}\",\"weight\":400}},{{\"asset\":\"{s}\",\"weight\":800}}]}},{{\"family\":\"{s}\",\"fonts\":[{{\"asset\":\"{s}\",\"weight\":400}},{{\"asset\":\"{s}\",\"weight\":800}}]}}", .{ family, asset, asset, flutter_default_font_family, asset, asset });
-    defer gpa.free(injected);
-
-    if (original_manifest == null) return std.fmt.allocPrint(gpa, "[{s}]\n", .{injected});
-    const original = original_manifest.?;
-    var end = original.len;
-    while (end > 0 and std.ascii.isWhitespace(original[end - 1])) end -= 1;
-    if (end == 0 or original[end - 1] != ']') return std.fmt.allocPrint(gpa, "[{s}]\n", .{injected});
-
-    var has_existing_entries = false;
-    for (original[0 .. end - 1]) |byte| {
-        if (!std.ascii.isWhitespace(byte) and byte != '[') {
-            has_existing_entries = true;
-            break;
+fn collectMissingFontAliases(
+    manifest: ?[]const u8,
+    system_family: []const u8,
+    storage: *[fallback_font_aliases.len + 1][]const u8,
+) []const []const u8 {
+    var count: usize = 0;
+    const candidates = [_][]const u8{system_family} ++ fallback_font_aliases;
+    for (candidates) |family| {
+        if (manifest) |bytes| {
+            if (manifestHasFontFamily(bytes, family)) continue;
+        }
+        for (storage[0..count]) |existing| {
+            if (std.mem.eql(u8, existing, family)) break;
+        } else {
+            storage[count] = family;
+            count += 1;
         }
     }
-    return std.fmt.allocPrint(gpa, "{s}{s}{s}]\n", .{ original[0 .. end - 1], if (has_existing_entries) "," else "", injected });
+    return storage[0..count];
 }
 
 fn manifestHasFontFamily(manifest: []const u8, family: []const u8) bool {
@@ -317,6 +308,29 @@ fn realPathAlloc(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn direntName(entry: *c.struct_dirent) []const u8 {
     return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.d_name)), 0);
+}
+
+test "font fallback aliases preserve application declarations" {
+    const manifest =
+        \\[{"family":"monospace","fonts":[{"asset":"custom.ttf"}]}]
+    ;
+    var storage: [fallback_font_aliases.len + 1][]const u8 = undefined;
+    const aliases = collectMissingFontAliases(manifest, "MiSans", &storage);
+
+    try std.testing.expectEqual(@as(usize, 3), aliases.len);
+    try std.testing.expectEqualStrings("MiSans", aliases[0]);
+    try std.testing.expectEqualStrings("Roboto", aliases[1]);
+    try std.testing.expectEqualStrings("sans-serif", aliases[2]);
+}
+
+test "font fallback aliases are unique when system family matches a default" {
+    var storage: [fallback_font_aliases.len + 1][]const u8 = undefined;
+    const aliases = collectMissingFontAliases(null, "Roboto", &storage);
+
+    try std.testing.expectEqual(@as(usize, 3), aliases.len);
+    try std.testing.expectEqualStrings("Roboto", aliases[0]);
+    try std.testing.expectEqualStrings("monospace", aliases[1]);
+    try std.testing.expectEqualStrings("sans-serif", aliases[2]);
 }
 
 fn deleteTreeBestEffort(path: []const u8) void {

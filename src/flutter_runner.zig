@@ -15,6 +15,7 @@ const flutter_task_queue = @import("flutter_task_queue.zig");
 const flutter_compositor = @import("flutter_compositor.zig");
 const window_registry = @import("window_registry.zig");
 const bundle_loader = @import("bundle_loader.zig");
+const service_uri = @import("service_uri.zig");
 const WindowEntry = window_registry.Entry;
 const WindowRegistry = window_registry.Registry;
 const wayland = @import("wayland");
@@ -111,9 +112,10 @@ pub const Options = struct {
     io: std.Io,
     engine_library: []const u8,
     bundle_path: []const u8,
-    /// 启动 VM service (热重载用, 仅 debug/JIT 引擎支持):
-    /// 传 --enable-vm-service --vm-service-port=0, URI 从引擎日志解析。
-    enable_vm_service: bool = false,
+    /// null disables VM Service; 0 requests a random localhost port.
+    vm_service_port: ?u16 = null,
+    /// SIGINT/SIGTERM notification owned by the process entry point.
+    shutdown_fd: c_int = -1,
 };
 
 const Runner = struct {
@@ -559,6 +561,7 @@ const Runner = struct {
 };
 
 pub fn run(gpa: std.mem.Allocator, options: Options) !void {
+    vm_service.clear(options.io);
     var api = try flutter.Api.load(gpa, options.engine_library);
     defer api.deinit();
 
@@ -687,17 +690,31 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     project_args.log_tag = "fushell";
     if (is_aot) project_args.aot_data = aot_data;
 
-    // 热重载 (debug): 启动 VM service。
-    // 字符串字面量是静态的, 引擎在 run 返回后已拷贝, 生命周期安全。
-    if (options.enable_vm_service) {
-        const vm_argv = [_]?[*:0]const u8{
-            "fushell".ptr,
-            "--enable-vm-service".ptr,
-            "--vm-service-port=0".ptr,
-        };
-        project_args.command_line_argc = vm_argv.len;
+    // The Flutter tool enables checked mode for debug engines. Without this
+    // switch the VM still exposes service RPCs, but DevTools classifies the JIT
+    // application as profile and hides the Inspector and Debugger panels.
+    // VM Service remains localhost-only with authentication enabled. Port 0 asks
+    // the Dart VM to choose an available port. These buffers outlive engine run.
+    var vm_service_port_arg: [64]u8 = undefined;
+    var vm_argv: [4]?[*:0]const u8 = undefined;
+    var vm_argc: usize = 0;
+    vm_argv[vm_argc] = "fushell".ptr;
+    vm_argc += 1;
+    if (!is_aot) {
+        vm_argv[vm_argc] = "--enable-checked-mode".ptr;
+        vm_argc += 1;
+    }
+    if (options.vm_service_port) |port| {
+        const port_arg = try std.fmt.bufPrintZ(&vm_service_port_arg, "--vm-service-port={d}", .{port});
+        vm_argv[vm_argc] = "--enable-vm-service".ptr;
+        vm_argc += 1;
+        vm_argv[vm_argc] = port_arg.ptr;
+        vm_argc += 1;
+        std.debug.print("VM service requested on port {d}; waiting for engine URI.\n", .{port});
+    }
+    if (vm_argc > 1) {
+        project_args.command_line_argc = @intCast(vm_argc);
         project_args.command_line_argv = &vm_argv;
-        std.debug.print("VM service requested (hot reload); waiting for engine to report the service URI.\n", .{});
     }
 
     // compositor 渲染路径 (multi-view 基础): 引擎产出 layer tree,
@@ -724,14 +741,19 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     };
 
     std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
-    try host.runEventLoop(&runner.quit_requested, "Engine event loop active (headless shell).", .{
+    var event_loop_error: ?anyerror = null;
+    host.runEventLoop(&runner.quit_requested, "Engine event loop active (headless shell).", .{
         .fd = task_queue.wake_fd,
         .context = &runner,
         .tick = flutterTaskPumpCallback,
         .timeout_ms = flutterTaskTimeoutCallback,
         .consume_wake = flutterTaskWakeCallback,
         .auxiliary_fd = clipboardReadFdCallback,
-    });
+        .shutdown_fd = options.shutdown_fd,
+    }) catch |err| {
+        event_loop_error = err;
+        std.debug.print("[error] engine event loop stopped: {s}\n", .{@errorName(err)});
+    };
 
     if (runner.pending_clipboard_read) |pending| {
         runner.clipboard.cancelReadText();
@@ -739,14 +761,19 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
         runner.completeClipboardRead(pending, null, error.EngineShuttingDown);
     }
 
-    // 退出序列: 先关引擎 (join 引擎线程 → 不再有 present 回调),
-    // 再销毁剩余窗口与共享 dc/ime (此刻 state Wayland 连接仍有效)。
+    // Every exit path uses the same teardown order, including signals and a
+    // compositor disconnect: stop engine callbacks first, then destroy window
+    // resources while the display is still owned by the headless host.
     std.debug.print("Shutting down Flutter engine.\n", .{});
-    try flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown");
+    flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown") catch |err| {
+        if (event_loop_error == null) event_loop_error = err;
+        std.debug.print("[error] FlutterEngineShutdown failed: {s}\n", .{@errorName(err)});
+    };
     runner.engine = null;
     shutdownAllWindows(&runner);
     shutdownShared(gpa, state);
     std.debug.print("engine event loop exited.\n", .{});
+    if (event_loop_error) |err| return err;
 }
 
 /// 单调时钟纳秒 (重复计时用)。
@@ -1339,6 +1366,7 @@ fn collectBackingStoreCallback(backing_store_ptr: [*c]const c.FlutterBackingStor
 fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c) bool {
     const info: *const c.FlutterPresentViewInfo = @ptrCast(info_ptr);
     if (info.view_id == 0) return true; // 无头 implicit view: 丢弃
+
     const runner = fromUserData(info.user_data);
     runner.registry.lock();
     const entry = runner.registry.findByViewIdLocked(info.view_id) orelse {
@@ -1416,30 +1444,8 @@ fn vsyncCallback(user_data: ?*anyopaque, baton: isize) callconv(.c) void {
     }
 }
 
-/// 热重载: 从引擎日志解析出的 VM service URI (http://127.0.0.1:PORT/TOKEN/)。
-/// logMessageCallback (主线程) 写入, hot_reload 线程读取 — 带锁共享。
-pub const VmServiceState = struct {
-    mutex: std.Io.Mutex = .init,
-    uri: [512]u8 = undefined,
-    len: usize = 0,
-
-    pub fn set(self: *VmServiceState, io: std.Io, value: []const u8) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        if (value.len > self.uri.len) return;
-        @memcpy(self.uri[0..value.len], value);
-        self.len = value.len;
-    }
-
-    pub fn get(self: *VmServiceState, io: std.Io, out: []u8) ?[]const u8 {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        if (self.len == 0 or self.len > out.len) return null;
-        @memcpy(out[0..self.len], self.uri[0..self.len]);
-        return out[0..self.len];
-    }
-};
-pub var vm_service: VmServiceState = .{};
+/// VM Service URI published by the engine log callback for development tools.
+pub var vm_service: service_uri.State = .{};
 
 fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
     const safe_tag = if (tag == null) "flutter" else std.mem.span(tag);

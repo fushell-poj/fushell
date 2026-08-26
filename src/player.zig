@@ -1,6 +1,5 @@
-//! 播放器入口: 由 fushell (main.zig) 和 fushell-build (run 子命令) 共用。
-//! fushell 是发行版播放器 (只播 bundle); fushell-build 是开发工具,
-//! run 子命令在进程内调用这里直接播放刚打包的 bundle。
+//! 播放器入口: 由 fushell-runner 和 fushell CLI 的 run 子命令共用。
+//! fushell-runner 只播放 bundle；fushell run 在进程内播放刚打包的 bundle。
 
 const std = @import("std");
 const flutter_runner = @import("flutter_runner.zig");
@@ -10,8 +9,8 @@ comptime {
 }
 
 /// 播放一个 bundle (阻塞直到程序退出)。
-/// enable_vm_service: 启动 VM service (热重载, 仅 debug/JIT 引擎)。
-pub fn runPlayer(gpa: std.mem.Allocator, io: std.Io, bundle_path: []const u8, enable_vm_service: bool) !void {
+/// vm_service_port 为 null 时关闭 VM Service；0 表示随机本地端口。
+pub fn runPlayer(gpa: std.mem.Allocator, io: std.Io, bundle_path: []const u8, vm_service_port: ?u16, shutdown_fd: c_int) !void {
     const engine_library = try resolveBundleEngineLibrary(gpa, bundle_path);
     defer gpa.free(engine_library);
 
@@ -19,7 +18,8 @@ pub fn runPlayer(gpa: std.mem.Allocator, io: std.Io, bundle_path: []const u8, en
         .io = io,
         .engine_library = engine_library,
         .bundle_path = bundle_path,
-        .enable_vm_service = enable_vm_service,
+        .vm_service_port = vm_service_port,
+        .shutdown_fd = shutdown_fd,
     });
 }
 

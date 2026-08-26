@@ -10,6 +10,52 @@ window's content to the corresponding `FlutterView` with the framework's
 `View`/`ViewCollection` widgets. Closing **all** windows does not exit the
 process; call `FushellProcess.exit` to terminate.
 
+## Command-line interface
+
+The installed developer tool is `fushell`, and all operations use explicit
+subcommands.
+
+```bash
+# Build the current Flutter project into build/fushell.
+fushell build
+
+# Build another project or select a mode.
+fushell build --debug ./examples/smoke_app
+fushell build --profile ./examples/smoke_app
+fushell build --release ./examples/smoke_app
+
+# Build and run. Debug keeps hot reload enabled by default.
+fushell run --debug ./examples/smoke_app
+fushell run --profile ./examples/smoke_app
+
+# Export the canonical Dart SDK package.
+fushell sdk ./vendor
+```
+
+Debug runs enable the localhost Dart VM Service automatically. Profile runs
+enable it when DevTools or an explicit service port is requested:
+
+```bash
+# Start browser DevTools and connect it to this fushell process.
+fushell run --debug --devtools ./examples/smoke_app
+
+# Profile with DevTools but do not open a browser automatically.
+fushell run --profile --devtools --no-launch-browser ./examples/smoke_app
+
+# Bind a deterministic localhost port for manual tooling connections.
+fushell run --debug --vm-service-port=8181 ./examples/smoke_app
+```
+
+The CLI prints the authenticated VM Service URI. For debug runs it manages a
+non-interactive `flutter attach --machine` bridge, then connects both
+`dart devtools` and fushell hot reload to the bridge's DDS URI. This supplies
+the Flutter expression compiler required by the Inspector and Debugger. Profile
+runs connect DevTools directly. All managed tool processes are terminated when
+the application exits. VM Service authentication remains enabled, binding is
+loopback-only, and a requested busy port is reported as an error before the
+application starts. DevTools and VM Service options are not available for
+release runs.
+
 ## Creating windows
 
 ```dart
@@ -38,7 +84,9 @@ Future<void> main() async {
   final mainView = await FushellWindow.viewById(mainWindowId);
   final settingsView = await FushellWindow.viewById(settingsWindowId);
 
-  runApp(ViewCollection(views: [
+  // ViewCollection is the root of multiple independent render trees, so use
+  // runWidget rather than runApp (which installs a single-view wrapper).
+  runWidget(ViewCollection(views: [
     View(view: mainView, child: const MainApp()),
     View(view: settingsView, child: const SettingsApp()),
   ]));
@@ -123,9 +171,14 @@ a window role, or `updateWindow` on a layer role, returns a structured
 
 Debug/JIT bundles contain `data/flutter_assets/kernel_blob.bin`. Release/AOT
 bundles must contain both `lib/libapp.so` and its matching split debug-info
-artifact at `lib/libapp.so.symbols`. `fushell-build --release` generates and
+artifact at `lib/libapp.so.symbols`. `fushell build --release` generates and
 packages both; the runner rejects incomplete AOT bundles instead of silently
 starting without symbolization support.
+
+When an application does not bundle Flutter's default font families, fushell
+exposes a fontconfig-selected system font under a stable runtime asset path.
+The SDK registers only the missing aliases before the first window is added;
+font families already declared by the application remain untouched.
 
 ## Concurrency model (for embedder maintainers)
 
@@ -148,5 +201,5 @@ they never synchronously block the platform thread.
 ## SDK source of truth
 
 `packages/fushell` is the canonical SDK source used by in-repository examples.
-`fushell-build sdk` exports that same package for external consumers; no
+`fushell sdk` exports that same package for external consumers; no
 checked-in vendored SDK copy is maintained.

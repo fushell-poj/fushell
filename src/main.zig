@@ -1,5 +1,6 @@
 const std = @import("std");
 const player = @import("player.zig");
+const signal_shutdown = @import("signal_shutdown.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -29,10 +30,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    player.runPlayer(gpa, init.io, bundle_root, false) catch |err| {
+    var signal_watcher = signal_shutdown.Watcher.init() catch |err| {
+        std.debug.print("fushell-runner failed to install signal handlers: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer signal_watcher.deinit();
+
+    player.runPlayer(gpa, init.io, bundle_root, null, signal_watcher.fd) catch |err| {
         std.debug.print("fushell-runner failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    if (signal_watcher.triggered()) std.process.exit(130);
 }
 
 fn printUsage() void {

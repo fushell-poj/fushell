@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const FrontendServer = struct {
+    io: std.Io,
     pid: std.c.pid_t,
     stdin_fd: std.posix.fd_t,
     stdout_fd: std.posix.fd_t,
@@ -84,12 +85,14 @@ pub const FrontendServer = struct {
             .stdin = .{ .file = .{ .handle = stdin_pipe[0], .flags = .{ .nonblocking = false } } },
             .stdout = .{ .file = .{ .handle = stdout_pipe[1], .flags = .{ .nonblocking = false } } },
             .stderr = .inherit,
+            .pgid = 0,
         });
         // 父进程关闭不需要的端
         _ = std.os.linux.close(stdin_pipe[0]);
         _ = std.os.linux.close(stdout_pipe[1]);
 
         return .{
+            .io = io,
             .pid = child.id orelse 0,
             .stdin_fd = stdin_pipe[1],
             .stdout_fd = stdout_pipe[0],
@@ -212,7 +215,25 @@ pub const FrontendServer = struct {
     pub fn stop(self: *FrontendServer) void {
         _ = std.os.linux.close(self.stdin_fd);
         _ = std.os.linux.close(self.stdout_fd);
-        _ = std.os.linux.kill(self.pid, std.os.linux.SIG.TERM);
+        if (self.pid == 0) return;
+
+        const pid = self.pid;
+        const group = -pid;
+        _ = std.os.linux.kill(group, std.posix.SIG.TERM);
+        var status: u32 = 0;
+        for (0..100) |_| {
+            const result = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
+            if (result == pid or std.posix.errno(result) == .CHILD) {
+                _ = std.os.linux.kill(group, std.posix.SIG.KILL);
+                self.pid = 0;
+                return;
+            }
+            std.Io.sleep(self.io, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .real) catch break;
+        }
+
+        _ = std.os.linux.kill(group, std.posix.SIG.KILL);
+        _ = std.os.linux.waitpid(pid, &status, 0);
+        self.pid = 0;
     }
 };
 

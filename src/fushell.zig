@@ -7,6 +7,10 @@ const player = @import("player.zig");
 const flutter_runner = @import("flutter_runner.zig");
 const hot_reload = @import("hot_reload.zig");
 const frontend_server = @import("frontend_server.zig");
+const cli = @import("fushell_cli.zig");
+const devtools = @import("devtools.zig");
+const service_uri = @import("service_uri.zig");
+const signal_shutdown = @import("signal_shutdown.zig");
 const build_support = @import("build_support");
 
 comptime {
@@ -23,7 +27,7 @@ const vm_uri_poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
 /// 500ms 足够捕获保存操作, 开销可忽略。
 const watch_poll_interval_ns: u64 = 500 * std.time.ns_per_ms;
 
-// fushell SDK 包 (fushell-build sdk 释放)
+// fushell SDK 包 (`fushell sdk` 释放)
 const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
 const embedded_sdk_lib = @embedFile("fushell_sdk_lib");
 const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
@@ -32,7 +36,7 @@ const embedded_engine_debug = @embedFile("flutter_engine_so_debug");
 const embedded_engine_profile = @embedFile("flutter_engine_so_profile");
 const embedded_engine_release = @embedFile("flutter_engine_so_release");
 
-const Mode = enum { debug, profile, release };
+const Mode = cli.Mode;
 
 /// 各模式对应的内嵌引擎字节。
 fn embeddedEngine(mode: Mode) []const u8 {
@@ -44,164 +48,168 @@ fn embeddedEngine(mode: Mode) []const u8 {
 }
 
 const Options = struct {
-    mode: Mode = .debug,
-    /// run 子命令: 打包后进程内直接播放 (开发工具模式)。
-    run: bool = false,
-    /// sdk 子命令: 释放内嵌的 fushell 包到指定目录 (默认 ./vendor)。
-    sdk: bool = false,
-    sdk_dir: ?[]const u8 = null,
+    command: cli.Command,
+    mode: Mode,
+    hot_reload: bool,
+    devtools: bool,
+    launch_browser: bool,
+    vm_service_port: ?u16,
     /// 第一个位置参数是目录时: 视为工作目录 (chdir 后打包)。
     workdir: ?[]const u8 = null,
     entrypoint: []const u8,
     bundle_dir: []const u8,
+
+    fn vmServiceEnabled(self: Options) bool {
+        return (self.mode == .debug and self.hot_reload) or self.devtools or self.vm_service_port != null;
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    // 进程级 arena: 生命周期 = 整个进程, 退出时自动回收。
-    // args.toSlice 文档要求 arena 式分配器 (结果含多个分配);
-    // 默认 bundle_dir (defaultBundleDir) 也用它, 避免每次打包泄漏一个字符串。
     const runtime_arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(runtime_arena);
-    // zig 0.16: init.io 自带完整环境, std.process.spawn 可解析 PATH 命令 (flutter/gclient 等)
     const io = init.io;
-    const options = parseArgs(runtime_arena, args) catch |err| {
-        printUsage();
-        if (err == error.HelpRequested) return;
-        return err;
-    };
 
-    // sdk 子命令: 释放内嵌的 fushell 包 (不需要工作目录/打包)
-    if (options.sdk) {
-        const sdk_dir = options.sdk_dir orelse "vendor";
+    const parsed = cli.parse(args[1..]) catch |err| {
+        std.debug.print("[error] {s}\n\n", .{cli.errorMessage(err)});
+        printUsage(io);
+        std.process.exit(2);
+    };
+    if (parsed.command == .help or parsed.help) {
+        printUsage(io);
+        return;
+    }
+    if (parsed.command == .sdk) {
+        const sdk_dir = parsed.positional(0) orelse "vendor";
         releaseSdk(gpa, io, sdk_dir) catch |err| {
-            std.debug.print("[error] fushell-build sdk failed: {s}\n", .{@errorName(err)});
+            std.debug.print("[error] fushell sdk failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
         return;
     }
 
-    // 目录参数 → 工作目录 (所有相对路径: flutter 命令/产物/bundle 默认目录)
-    if (options.workdir) |workdir| {
-        const workdir_z = try gpa.dupeZ(u8, workdir);
-        defer gpa.free(workdir_z);
-        const chdir_result = std.c.chdir(workdir_z.ptr);
-        if (chdir_result != 0) {
-            std.debug.print("[error] fushell-build failed: cannot chdir to {s} (errno {d})\n", .{ workdir, std.posix.errno(chdir_result) });
+    const options = resolveOptions(runtime_arena, parsed);
+    if (options.vm_service_port) |port| {
+        const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+        var server = address.listen(io, .{}) catch |err| {
+            std.debug.print("[error] VM service port {d} is unavailable on 127.0.0.1: {s}\n", .{ port, @errorName(err) });
             std.process.exit(1);
-        }
+        };
+        server.deinit(io);
+    }
+    if (options.workdir) |workdir| {
+        std.Io.Threaded.chdir(workdir) catch |err| {
+            std.debug.print("[error] fushell failed: cannot chdir to {s}: {s}\n", .{ workdir, @errorName(err) });
+            std.process.exit(1);
+        };
         std.debug.print("working directory: {s}\n", .{workdir});
     }
 
     buildBundle(gpa, io, options) catch |err| {
-        std.debug.print("[error] fushell-build failed: {s}\n", .{@errorName(err)});
+        std.debug.print("[error] fushell build failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-
-    if (options.run) {
-        std.debug.print("running {s}...\n", .{options.bundle_dir});
-        // 热重载: 仅 debug 模式 (JIT 引擎带 VM service)
-        const enable_vm_service = options.run and options.mode == .debug;
-        var hot_thread: ?std.Thread = null;
-        if (enable_vm_service) {
-            const spawn_result = std.Thread.spawn(.{}, hotReloadThreadMain, .{gpa});
-            hot_thread = spawn_result catch |err| blk: {
-                std.debug.print("[error] hot reload unavailable: {s}\n", .{@errorName(err)});
-                break :blk null;
-            };
-        }
-        player.runPlayer(gpa, io, options.bundle_dir, enable_vm_service) catch |err| {
-            std.debug.print("[error] fushell-build run failed: {s}\n", .{@errorName(err)});
+    if (options.command == .run) {
+        runBundle(gpa, io, options) catch |err| {
+            if (err == error.UserInterrupt) std.process.exit(130);
+            std.debug.print("[error] fushell run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
-        // 主窗口已关 (引擎退出): 通知热重载线程退出, 再 join 收尸。
-        // 否则 watcher 的 while(true) 永挂, join 卡死进程。
-        hot_reload_stop.store(true, .release);
-        if (hot_thread) |t| t.join();
     }
 }
 
-fn parseArgs(runtime_arena: std.mem.Allocator, args: []const [:0]const u8) !Options {
-    var mode: Mode = .debug;
-    var run: bool = false;
-    var positional: [2][]const u8 = undefined;
-    var positional_count: usize = 0;
-
-    var index: usize = 1;
-    // run 子命令: fushell-build run [options] [<folder>]
-    if (index < args.len and std.mem.eql(u8, args[index], "run")) {
-        run = true;
-        index += 1;
-    }
-    // sdk 子命令: fushell-build sdk [<dir>]  (释放内嵌 fushell 包)
-    var sdk_dir: ?[]const u8 = null;
-    if (!run and index < args.len and std.mem.eql(u8, args[index], "sdk")) {
-        index += 1;
-        if (index < args.len and !std.mem.startsWith(u8, args[index], "-")) {
-            sdk_dir = args[index];
-            index += 1;
-        }
-        if (index != args.len) return error.InvalidArguments;
-        return Options{
-            .mode = .debug,
-            .run = false,
-            .sdk = true,
-            .sdk_dir = sdk_dir,
-            .entrypoint = "lib/main.dart",
-            .bundle_dir = "build/linux/x64/debug",
-        };
-    }
-
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--debug")) {
-            mode = .debug;
-        } else if (std.mem.eql(u8, arg, "--release")) {
-            mode = .release;
-        } else if (std.mem.eql(u8, arg, "--profile")) {
-            mode = .profile;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return error.HelpRequested;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("unknown option: {s}\n", .{arg});
-            return error.InvalidArguments;
-        } else {
-            if (positional_count == positional.len) return error.InvalidArguments;
-            positional[positional_count] = arg;
-            positional_count += 1;
-        }
-    }
-
-    if (positional_count > positional.len) return error.InvalidArguments;
-
-    // 第一个位置参数: 目录 → 工作目录 (entry/输出用默认); 否则 → entrypoint
+fn resolveOptions(runtime_arena: std.mem.Allocator, parsed: cli.Options) Options {
     var workdir: ?[]const u8 = null;
     var entrypoint: []const u8 = "lib/main.dart";
-    var bundle_dir: []const u8 = defaultBundleDir(runtime_arena, mode);
-    if (positional_count >= 1) {
-        if (isDir(positional[0])) {
-            workdir = positional[0];
-            if (positional_count >= 2) bundle_dir = positional[1];
+    var bundle_dir: []const u8 = defaultBundleDir(runtime_arena, parsed.mode);
+    if (parsed.positional(0)) |first| {
+        if (isDir(first)) {
+            workdir = first;
+            if (parsed.positional(1)) |output| bundle_dir = output;
         } else {
-            entrypoint = positional[0];
-            if (positional_count >= 2) bundle_dir = positional[1];
+            entrypoint = first;
+            if (parsed.positional(1)) |output| bundle_dir = output;
         }
     }
 
     return .{
-        .mode = mode,
-        .run = run,
+        .command = parsed.command,
+        .mode = parsed.mode,
+        .hot_reload = parsed.hot_reload,
+        .devtools = parsed.devtools,
+        .launch_browser = parsed.launch_browser,
+        .vm_service_port = parsed.vm_service_port,
         .workdir = workdir,
         .entrypoint = entrypoint,
         .bundle_dir = bundle_dir,
     };
 }
 
+fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !void {
+    std.debug.print("running {s}...\n", .{options.bundle_dir});
+    hot_reload_stop.store(false, .release);
+
+    var signal_watcher = try signal_shutdown.Watcher.init();
+    defer signal_watcher.deinit();
+
+    var resolved_service: service_uri.State = .{};
+    resolved_service.clear(io);
+    const hot_reload_service = if (options.devtools) &resolved_service else &flutter_runner.vm_service;
+
+    var hot_thread: ?std.Thread = null;
+    if (options.mode == .debug and options.hot_reload) {
+        hot_thread = std.Thread.spawn(.{}, hotReloadThreadMain, .{ gpa, hot_reload_service }) catch |err| blk: {
+            std.debug.print("[error] hot reload unavailable: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    var devtools_context = devtools.Context{
+        .io = io,
+        .gpa = gpa,
+        .launch_browser = options.launch_browser,
+        .use_flutter_attach = options.mode == .debug,
+        .raw_service = &flutter_runner.vm_service,
+        .resolved_service = &resolved_service,
+    };
+    var devtools_thread: ?std.Thread = null;
+    if (options.devtools) {
+        devtools_thread = std.Thread.spawn(.{}, devtools.threadMain, .{&devtools_context}) catch |err| blk: {
+            std.debug.print("[error] DevTools unavailable: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    defer {
+        hot_reload_stop.store(true, .release);
+        devtools_context.stop.store(true, .release);
+        if (hot_thread) |thread| thread.join();
+        if (devtools_thread) |thread| thread.join();
+    }
+
+    const vm_service_port: ?u16 = if (options.vmServiceEnabled()) options.vm_service_port orelse 0 else null;
+    try player.runPlayer(gpa, io, options.bundle_dir, vm_service_port, signal_watcher.fd);
+    if (signal_watcher.triggered()) return error.UserInterrupt;
+}
+
 /// 热重载线程: 等待引擎报告 VM service URI → 连接 → getVM 验证。
 /// (spike 阶段: 验证 WebSocket + JSON-RPC 链路; 后续扩展为文件监听 + reload)
 /// 主窗口关闭后由 main 置位, watcher while 循环检查退出 (避免 join 卡死)。
 var hot_reload_stop = std.atomic.Value(bool).init(false);
-fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
+fn parseIsolateId(allocator: std.mem.Allocator, result: []const u8, buffer: []u8) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const isolates = parsed.value.object.get("isolates") orelse return null;
+    if (isolates != .array or isolates.array.items.len == 0) return null;
+    const isolate = isolates.array.items[0];
+    if (isolate != .object) return null;
+    const id = isolate.object.get("id") orelse return null;
+    if (id != .string) return null;
+    return std.fmt.bufPrint(buffer, "{s}", .{id.string}) catch null;
+}
+
+fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -210,7 +218,7 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
     var waited: usize = 0;
     var uri_buf: [512]u8 = undefined;
     const uri = while (true) {
-        if (flutter_runner.vm_service.get(io, &uri_buf)) |u| break u;
+        if (service.get(io, &uri_buf)) |u| break u;
         if (waited > 20_000) {
             std.debug.print("[hot-reload] timeout waiting for VM service URI.\n", .{});
             return;
@@ -234,17 +242,11 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator) void {
         std.debug.print("[hot-reload] getVM failed: {s}\n", .{@errorName(err)});
         return;
     };
-    // 提取 isolateId: 找 "id":"isolates/... (Dart JSON 会转义 / 为 \/)
-    const iso_marker = "\"id\":\"isolates\\/";
-    const iso_idx = std.mem.indexOf(u8, vm_result, iso_marker) orelse {
+    var iso_buf: [128]u8 = undefined;
+    const isolate_id = parseIsolateId(gpa, vm_result, &iso_buf) orelse {
         std.debug.print("[hot-reload] cannot find isolate id in getVM result\n", .{});
         return;
     };
-    const iso_start = iso_idx + iso_marker.len;
-    const iso_end = std.mem.indexOfScalar(u8, vm_result[iso_start..], '"') orelse return;
-    // VM service 需要完整 id: "isolates/<number>"
-    var iso_buf: [128]u8 = undefined;
-    const isolate_id = std.fmt.bufPrint(&iso_buf, "isolates/{s}", .{vm_result[iso_start .. iso_start + iso_end]}) catch return;
     std.debug.print("[hot-reload] isolateId: {s}\n", .{isolate_id});
 
     // 定位 flutter SDK (用于 frontend_server 启动参数)
@@ -403,6 +405,16 @@ fn filesChanged(gpa: std.mem.Allocator, old: *std.ArrayList(FileEntry), new: *st
     return changed;
 }
 
+test "parse isolate id from standard DDS getVM JSON" {
+    var buffer: [64]u8 = undefined;
+    const id = parseIsolateId(
+        std.testing.allocator,
+        "{\"type\":\"VM\",\"isolates\":[{\"id\":\"isolates/42\"}]}",
+        &buffer,
+    ) orelse return error.MissingIsolateId;
+    try std.testing.expectEqualStrings("isolates/42", id);
+}
+
 fn freeFileMap(gpa: std.mem.Allocator, map: *std.ArrayList(FileEntry)) void {
     for (map.items) |e| gpa.free(e.path);
     map.deinit(gpa);
@@ -427,26 +439,38 @@ fn defaultBundleDir(gpa: std.mem.Allocator, mode: Mode) []const u8 {
     return std.fmt.allocPrint(gpa, "build/linux/{s}/{s}", .{ arch, mode_str }) catch "build/bundle";
 }
 
-fn printUsage() void {
-    std.debug.print("usage: fushell-build [--debug|--profile|--release] [<entry-dart-file>] [<output-dir>]\n", .{});
-    std.debug.print("       fushell-build run [--debug|--profile|--release] [<project-dir>]\n", .{});
-    std.debug.print("       fushell-build sdk [<dir>]   (release the fushell package; default ./vendor)\n", .{});
-    std.debug.print("  default entry: lib/main.dart   default output: build/linux/x64/<mode>\n", .{});
-    std.debug.print("  <project-dir> (first arg is a directory) → treated as the working directory\n", .{});
-    std.debug.print("  run → build then play in-process (dev tool mode; debug auto hot-reload)\n", .{});
-    std.debug.print("example: fushell-build --release                      # → build/linux/x64/release\n", .{});
-    std.debug.print("         fushell-build examples/smoke_app             # build in that project\n", .{});
-    std.debug.print("         fushell-build run examples/smoke_app         # build + play\n", .{});
-    std.debug.print("         fushell-build lib/top_bar.dart build/top_bar_bundle\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("debug builds produce a Fushell bundle with:\n", .{});
-    std.debug.print("  <output>/data/icudtl.dat\n", .{});
-    std.debug.print("  <output>/data/flutter_assets/\n", .{});
-    std.debug.print("  <output>/lib/libflutter_engine.so\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("release builds additionally require a prior `flutter build bundle --release`\n", .{});
-    std.debug.print("and produce:\n", .{});
-    std.debug.print("  <output>/lib/libapp.so\n", .{});
+fn printUsage(io: std.Io) void {
+    std.Io.File.stdout().writeStreamingAll(io,
+        \\usage: fushell <command> [options]
+        \\
+        \\commands:
+        \\  build [--debug|--profile|--release] [project-dir|entry.dart] [output-dir]
+        \\  run   [--debug|--profile|--release] [run-options] [project-dir|entry.dart] [output-dir]
+        \\  sdk   [output-dir]
+        \\  help
+        \\
+        \\run options:
+        \\  --devtools                 start local Dart DevTools after VM Service discovery
+        \\  --no-launch-browser        do not open a browser for DevTools
+        \\  --vm-service-port=<port>   fixed VM Service port; 0 selects a random port
+        \\  --no-hot-reload            disable debug-mode automatic hot reload
+        \\
+        \\defaults:
+        \\  mode: --debug
+        \\  project: current directory
+        \\  entry: lib/main.dart
+        \\  output: build/linux/x64/<mode>
+        \\
+        \\examples:
+        \\  fushell build --release ./app
+        \\  fushell run --debug --devtools ./app
+        \\  fushell run --profile --devtools --no-launch-browser ./app
+        \\  fushell run --debug --vm-service-port=8181 ./app
+        \\
+        \\VM Service authentication remains enabled and binds to localhost.
+        \\Release mode does not support DevTools or VM Service options.
+        \\
+    ) catch |err| std.log.err("failed to write CLI help: {s}", .{@errorName(err)});
 }
 
 fn buildBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !void {
@@ -574,7 +598,7 @@ fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []
 }
 
 fn targetPlatform() []const u8 {
-    if (builtin.os.tag != .linux) @compileError("fushell-build currently supports Linux hosts only");
+    if (builtin.os.tag != .linux) @compileError("fushell currently supports Linux hosts only");
     return switch (builtin.cpu.arch) {
         .x86_64 => "linux-x64",
         .aarch64 => "linux-arm64",
