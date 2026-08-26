@@ -197,13 +197,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     b.installArtifact(build_tool);
 
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(build_tool);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run fushell-runner (plays the bundle in its own directory)");
+    const run_step = b.step("run", "Run the fushell CLI");
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
