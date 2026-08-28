@@ -1,3 +1,9 @@
+//! Dart 到 native 窗口生命周期协议的解码器。
+//!
+//! standard-method-codec payload 属于不可信应用输入，因此在创建任何 Wayland
+//! 对象前，解析器会拒绝尾随字段、重复或未知 key、无效 UTF-8、非有限尺寸及分配
+//! 溢出。返回的字符串由分配器拥有，必须通过对应 request 的 `deinit` 释放。
+
 const std = @import("std");
 
 pub const channel_name = "dev.fushell/surface";
@@ -35,11 +41,13 @@ pub const Request = union(enum) {
     }
 };
 
-/// window.open: 创建新窗口 (可指定父窗口), 成功后回复窗口 id (= Flutter view_id)。
+/// 添加一个 Flutter view 与 Wayland surface role 的已验证请求。
+///
+/// `parent` 表示临时 xdg 关系而非所有权；关闭任一 view 都不会递归关闭另一个。
+/// native reply 返回所分配的 Flutter `view_id`，它同时也是公开的 Fushell 窗口 ID。
 pub const OpenWindowRequest = struct {
     id: i64,
     role: Role,
-    /// 父窗口 id (= 父 view_id); null = 无父。
     parent: ?i64 = null,
 
     pub fn deinit(self: OpenWindowRequest, gpa: std.mem.Allocator) void {
@@ -55,6 +63,10 @@ pub const OpenWindowRequest = struct {
     }
 };
 
+/// 移除 Flutter view 及其 native surface 的异步请求。
+///
+/// method response 会延迟到 Flutter 的 RemoveView 回调确认移除；只有此后才能销毁
+/// EGL 与 Wayland 资源。
 pub const CloseWindowRequest = struct {
     id: i64,
     window_id: i64,
@@ -87,6 +99,10 @@ pub const Role = union(enum) {
     layer: LayerRole,
 };
 
+/// surface 首次 commit 前使用的 xdg_toplevel 属性。
+///
+/// width 与 height 存在时必须严格为正。null 表示初始尺寸交给 Host 默认值或
+/// compositor；后续 configure 事件具有最终权威。
 pub const WindowRole = struct {
     title: []u8,
     app_id: []u8,
@@ -94,6 +110,11 @@ pub const WindowRole = struct {
     height: ?i32 = null,
 };
 
+/// surface 首次 commit 前使用的 zwlr_layer_surface_v1 属性。
+///
+/// 零尺寸是 layer-shell 的拉伸哨兵值，仅当对应轴同时锚定两侧边缘时有效。
+/// `exclusive_zone=-1` 请求 compositor 自行决定策略；非负值表示沿锚定边缘保留
+/// 相应数量的逻辑像素。
 pub const LayerRole = struct {
     namespace: []u8,
     layer: Layer,

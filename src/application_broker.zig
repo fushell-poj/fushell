@@ -1,3 +1,13 @@
+//! 基于会话 D-Bus 实现的原生单实例代理。
+//!
+//! 名称所有权在 Flutter、Wayland 和 EGL 初始化之前确定，因此 secondary
+//! 调用只需作为轻量运输进程存在。primary 独占一条私有 D-Bus 连接，并将
+//! watch/timeout 合并到 Fushell 平台线程的事件泵；工作线程不得修改代理状态。
+//!
+//! 代理有意把 argv 和 cwd 视为字节串。Dart 接收无损十六进制表示，自行定义
+//! 全部命令语义，并异步完成被保留的 D-Bus 方法调用。即使 Dart handler 停滞，
+//! 队列、载荷和回复上限也能限制内存占用与等待时间。
+
 const std = @import("std");
 const c = @import("c");
 const application_config = @import("application_config.zig");
@@ -10,6 +20,10 @@ const client_timeout_ms: i32 = command_timeout_ms + 5_000;
 const max_external_fds = 8;
 const max_invocation_payload_size = 8 * 1024 * 1024;
 
+/// 跨进程返回的应用命令完成结果。
+///
+/// 两个输出缓冲区均由该值拥有；D-Bus 回复或 secondary 的 stdout/stderr
+/// 复制完成后必须调用 [deinit]。
 pub const CommandResult = struct {
     exit_code: i32,
     stdout: []u8,
@@ -22,6 +36,11 @@ pub const CommandResult = struct {
     }
 };
 
+/// 排入 Dart 应用 handler 的无损调用。
+///
+/// `arguments` 不包含 argv[0]；其中每个切片以及 `cwd` 均由分配器拥有。
+/// `is_initial` 区分创建 daemon 的首次命令与 secondary 进程发来的命令，
+/// 使应用无需维护两套参数解析器。
 pub const InvocationData = struct {
     id: u64,
     arguments: [][]u8,
@@ -56,12 +75,21 @@ const TimeoutEntry = struct {
     deadline: std.Io.Timestamp,
 };
 
+/// 引擎启动前完成的实例所有权判定结果。
+///
+/// `.disabled` 保留普通多实例启动；`.secondary` 表示命令已由 primary 完成，
+/// 调用方应输出返回流并退出，不得初始化 Flutter 或图形栈。
 pub const OpenResult = union(enum) {
     disabled,
     primary: *Broker,
     secondary: CommandResult,
 };
 
+/// primary 进程中的 D-Bus 状态机。
+///
+/// 除 [open] 和 secondary 转发路径外，所有方法都只能在 Flutter 平台线程调用。
+/// D-Bus 方法消息会一直保留到 Dart 完成；超时命令仍占用 active 槽，直到迟到的
+/// completion 到达，以维持“同一时刻最多一个 handler 活跃”的不变量。
 pub const Broker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -527,6 +555,8 @@ fn cloneInvocationData(
     };
 }
 
+/// 将 argv/cwd 编码为 D-Bus 方法使用的有界二进制载荷。
+/// 长度前缀采用小端序，并保留内嵌 NUL 与非 UTF-8 字节。
 pub fn encodeInvocation(gpa: std.mem.Allocator, arguments: []const []const u8, cwd: []const u8) ![]u8 {
     if (arguments.len > std.math.maxInt(u32) or cwd.len > std.math.maxInt(u32))
         return error.InvocationTooLarge;
@@ -553,6 +583,8 @@ pub fn encodeInvocation(gpa: std.mem.Allocator, arguments: []const []const u8, c
     return result;
 }
 
+/// 解码一份线协议载荷，并为参数与 cwd 分配独立存储。
+/// 尾随字节、过多参数及超过协议总上限的载荷都会被拒绝，而非静默截断。
 pub fn decodeInvocation(gpa: std.mem.Allocator, id: u64, payload: []const u8) !InvocationData {
     if (payload.len > max_invocation_payload_size) return error.InvocationTooLarge;
     var cursor: usize = 0;

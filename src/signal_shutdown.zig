@@ -1,3 +1,9 @@
+//! 把 SIGINT 与 SIGTERM 转换为可 poll 的事件循环输入。
+//!
+//! 进程级 handler 只执行 async-signal-safe 的 eventfd 写入；全部 Flutter、Wayland、
+//! D-Bus 与子进程清理仍留在正常平台线程。每个进程只能有一个活动 watcher，因为
+//! POSIX signal disposition 与目标描述符都是进程全局状态。
+
 const std = @import("std");
 
 const linux = std.os.linux;
@@ -13,9 +19,10 @@ fn signalHandler(_: posix.SIG) callconv(.c) void {
     _ = linux.write(fd, std.mem.asBytes(&one).ptr, @sizeOf(u64));
 }
 
-/// Process-local SIGINT/SIGTERM watcher. The signal handler only performs an
-/// async-signal-safe eventfd write; normal teardown remains on the platform
-/// thread after the descriptor becomes readable.
+/// 拥有 eventfd 以及 `init` 期间替换的 signal disposition。
+///
+/// 描述符为非阻塞，可直接注册到 EventPump。`deinit` 会先禁止 handler 写入，再关闭
+/// fd 并恢复两项旧 disposition，避免迟到信号写入已经复用的描述符。
 pub const Watcher = struct {
     fd: c_int,
     old_int: posix.Sigaction,

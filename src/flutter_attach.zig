@@ -1,3 +1,9 @@
+//! `flutter attach --machine` 的最小客户端。
+//!
+//! Flutter Tool 仅在 Debug 模式用于提供 DDS，以及 DevTools Inspector/Debugger
+//! 所需的前端表达式编译器。本模块解析按行分隔的 machine 协议，发布带认证信息的
+//! DDS URI，并把子进程与读取线程作为一个整体清理单元拥有。
+
 const std = @import("std");
 const managed_process = @import("managed_process.zig");
 
@@ -5,6 +11,8 @@ const poll_interval_ns: u64 = 20 * std.time.ns_per_ms;
 const default_wait_timeout_ms: usize = 20_000;
 const default_stop_grace_ms: usize = 2_000;
 
+/// 受管 Flutter Tool attach 会话的进程与超时策略。
+/// `executable` 可在测试中注入；生产调用方使用 `flutter`。
 pub const Config = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -13,6 +21,10 @@ pub const Config = struct {
     stop_grace_ms: usize = default_stop_grace_ms,
 };
 
+/// 拥有一个 Flutter Tool 进程、其 stdout 读取器及探测到的 DDS URI。
+///
+/// 必须调用 [destroy]：它先请求有界的子进程终止，再关闭管道并 join 读取线程，
+/// 避免 CLI 关闭时 Flutter Tool 继续写入已经关闭的 stdout 通道。
 pub const Session = struct {
     config: Config,
     child: std.process.Child,

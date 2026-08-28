@@ -1,14 +1,9 @@
-//! 进程级共享 Wayland 连接 + EGL display (多窗口共享)。
+//! 进程级 Wayland 连接、EGL display 与协议全局对象所有权。
 //!
-//! 多窗口架构中,每个窗口不再独占 wl_display/EGL display,而是共享
-//! 这一个 DisplayState:
-//!   - 单一 wl_display 连接 (唯一 fd)
-//!   - 单一 EGLDisplay (由 wl_display 派生)
-//!   - 全局对象 (registry/compositor/wm_base/.../seat/pointer) 唯一
-//!   - 引用计数: Runner 与窗口 Host 持有引用, 归零时完整清理
-//!
-//! 线程模型: 全局对象与所有窗口对象绑定同一 event queue,由平台线程统一
-//! dispatch。raster 线程仅通过受控回调访问呈现资源。
+//! 全部 Flutter view 共享一个 wl_display、一个 EGLDisplay、一条 event queue，以及
+//! compositor、xdg_wm_base、seat、data-control、text-input 等 registry global 的单个
+//! 实例。只有平台线程分发 Wayland；raster/resource 线程通过受控 host callback 访问
+//! EGL。引用计数让连接持续存活，直到 Runner 与每个 Host 都释放它。
 
 const std = @import("std");
 
@@ -39,13 +34,20 @@ pub const KeyboardEventCallback = *const fn (event: KeyboardEvent, surface: ?*wl
 pub const PointerEventCallback = *const fn (event: wl.Pointer.Event, surface: ?*wl.Surface, context: ?*anyopaque) void;
 pub const ScaleChangeCallback = *const fn (context: ?*anyopaque) void;
 
+/// 一个活动 wl_output 的 registry 标识与最新整数 scale。
+/// `name=0` 表示未使用槽；surface membership 存储 registry name 而非 proxy 地址，
+/// 使 output 移除时可以确定性地让 membership 失效。
 pub const OutputState = struct {
     name: u32 = 0,
     output: ?*wl.Output = null,
     scale: i32 = 1,
 };
 
-/// 进程级共享显示状态 (单例)。
+/// 一个 Fushell 进程的共享 native display 状态。
+///
+/// 除 callback context 外，本值拥有所有字段。创建窗口 role 前必须完成
+/// `bindGlobals`；所有 Host 与共享 service 释放引用本连接的协议对象后，才能执行
+/// `deinit`。
 pub const DisplayState = struct {
     display: ?*wl.Display = null,
     registry: ?*wl.Registry = null,
@@ -55,9 +57,9 @@ pub const DisplayState = struct {
     viewporter: ?*wp.Viewporter = null,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
     seat: ?*wl.Seat = null,
-    /// seat 通告的输入能力 (capabilities 事件)。无能力时不 get_pointer/get_keyboard
-    /// — 无头 compositor (cage + 无输入设备) 下 seat 无 pointer/keyboard,
-    /// 无条件调用会触发协议错误 (wl_seat.get_pointer called when no pointer capability)。
+    /// wl_seat 宣告的 capability。只有对应 bit 存在时才创建 pointer/keyboard proxy；
+    /// 无头 compositor 可能宣告一个两项 capability 都没有的 seat，此时无条件调用
+    /// get_pointer/get_keyboard 会产生协议错误。
     seat_capabilities: wl.Seat.Capability = .{},
 
     keyboard_event_callback: ?KeyboardEventCallback = null,

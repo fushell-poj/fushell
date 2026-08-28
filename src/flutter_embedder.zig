@@ -1,6 +1,15 @@
+//! Flutter Embedder C ABI 的动态加载器。
+//!
+//! Fushell 构建时不链接固定引擎。打包 bundle 选择与自身同目录的
+//! `libflutter_engine.so`；[Api.load] 解析 runner 使用的全部符号，并在 ABI 不完整时
+//! 于启动前失败。回调与快照状态会保留这些函数指针，因此动态库必须保持映射，直到
+//! 引擎关闭且 AOT data 收集完成。
+
 const std = @import("std");
 const c = @import("c");
 
+/// 由一个自有 `dlopen` handle 支撑的引擎 ABI 解析表。
+/// 调用 [deinit] 后，所有字段立即失效。
 pub const Api = struct {
     handle: ?*anyopaque,
     run: EngineRunFn,

@@ -1,21 +1,21 @@
-//! 热重载: VM service WebSocket 客户端 + JSON-RPC (最小实现)。
+//! Fushell 热重载使用的最小 Dart VM Service 客户端。
 //!
-//! VM service = Dart VM 内建的调试服务 (WebSocket + JSON-RPC):
-//!   - 地址: http://127.0.0.1:PORT/TOKEN/ (从引擎日志解析, 见 flutter_runner)
-//!   - 热重载: reloadSources(isolateId) 替换已加载代码
-//!             ext.flutter.reassemble 重建 widget 树
-//!
-//! 本模块只实现客户端最小子集: TCP 连接 + HTTP Upgrade 握手 +
-//! text 帧编解码 + JSON-RPC 请求/响应。
+//! 实现范围仅包括带认证的 localhost HTTP upgrade、WebSocket 文本帧传输，以及定位
+//! root isolate、重新加载源码和触发 Flutter reassembly 所需的 JSON-RPC 调用。
+//! 它同时支持原始引擎端点与受管 `flutter attach` 生成的 DDS 端点；刻意不实现通用
+//! VM Service 客户端。
 
-/// VM service 响应等待超时 (ms)。VM service 对 JSON-RPC 请求通常毫秒级响应,
-/// 5s 是保守上限 (frontend_server 编译期间 VM 繁忙时也不会超过)。
+/// 单个 VM Service JSON-RPC 响应的上限。超时会报告给 CLI，而不是让热重载 worker
+/// 在应用关闭后无限存活。
 const vm_service_poll_timeout_ms: i32 = 5000;
 
 const std = @import("std");
 const net = std.Io.net;
 
-/// 解析 VM service URI: http://127.0.0.1:PORT/TOKEN/
+/// 带认证 `http://host:port/token/` URI 的借用组件。
+///
+/// 切片指向原始输入。传输层按设计只连接 loopback；保留解析后的 host 是为了生成正确
+/// 的 HTTP Host header，它必须来自 Fushell 仅限 localhost 的 VM/DDS 配置。
 pub const Uri = struct {
     host: []const u8,
     port: u16,
@@ -43,7 +43,10 @@ pub fn parseUri(uri: []const u8) !Uri {
     return .{ .host = host, .port = port, .token = token_trimmed };
 }
 
-/// VM service 连接 (已升级为 WebSocket)。
+/// 到 VM Service 端点的一条已 upgrade WebSocket 连接。
+///
+/// 固定 64 KiB 接收缓冲区限制内存使用；超大或分片响应超出支持的协议子集时会明确
+/// 失败。该值限制在单线程使用，并在 `close` 前拥有 `stream`。
 pub const VmService = struct {
     stream: net.Stream,
     io: std.Io,
@@ -52,7 +55,8 @@ pub const VmService = struct {
     recv_end: usize = 0,
     next_id: u32 = 1,
 
-    /// TCP 连接 + HTTP Upgrade 握手。
+    /// 建立 TCP，并验证完整 WebSocket upgrade 响应。
+    /// 认证信息承载在 URI path 中；这里不会记录 token。
     pub fn connect(io: std.Io, uri: Uri) !VmService {
         const addr = try net.IpAddress.parseIp4("127.0.0.1", uri.port);
         const stream = try addr.connect(io, .{ .mode = .stream });

@@ -1,3 +1,14 @@
+//! 拥有一个 Flutter 引擎，并协调 Fushell 的平台线程运行时。
+//!
+//! 引擎以无头方式启动并禁用 implicit view。Dart 通过 platform channel 创建和移除
+//! 显式 view；每个 view 映射到 [WindowRegistry] 中的一个 Wayland Host，而全部
+//! view 共享同一个 isolate、compositor、输入状态与事件泵。平台回调、D-Bus dispatch
+//! 和生命周期迁移均在本线程串行执行。raster 回调可能并发进入 compositor，因此只能
+//! 接触已同步的渲染状态。
+//!
+//! 关闭顺序是刻意规定的：先停止引擎，再销毁 view 与共享 Wayland 服务，最后释放
+//! display 和动态加载的引擎。改变顺序可能让回调继续指向已释放的 Host。
+
 const std = @import("std");
 const c = @import("c");
 const egl = @import("wayland_egl_host.zig");
@@ -109,9 +120,15 @@ const PendingClipboardRead = struct {
     deadline_ns: u64,
 };
 
+/// 构造 Flutter 引擎时使用的不可变进程配置。
+///
+/// 所有路径与参数切片在 `run` 期间均为借用。shutdown 描述符和可选 broker 仍由
+/// 进程入口拥有；runner 清理时不会关闭或反初始化它们。
 pub const Options = struct {
     io: std.Io,
+    /// 使用 `dlopen` 加载的绝对路径或相对 bundle 的引擎库路径。
     engine_library: []const u8,
+    /// 包含 `data/flutter_assets` 以及可选 AOT 库的 bundle 根目录。
     bundle_path: []const u8,
     /// null disables VM Service; 0 requests a random localhost port.
     vm_service_port: ?u16 = null,
@@ -124,6 +141,10 @@ pub const Options = struct {
     dart_entrypoint_arguments: []const []const u8 = &.{},
 };
 
+/// 引擎与全部进程级运行时服务的平台线程所有者。
+///
+/// `registry` 是 view 生命周期的唯一权威；只有对应 registry 状态允许时才能借用
+/// 原始 Host 指针。`broker` 为可选值，因此多实例应用无需承担 D-Bus 运行时成本。
 const Runner = struct {
     gpa: std.mem.Allocator,
     /// 进程级共享显示状态 (窗口创建 / IME / 剪贴板用)。
@@ -641,6 +662,10 @@ fn encodeApplicationInvocation(gpa: std.mem.Allocator, invocation: *const applic
     return output.toOwnedSlice(gpa);
 }
 
+/// 运行打包应用，直到 Dart 请求退出、收到终止信号，或 compositor/session bus 断开。
+///
+/// 调用方必须在进入本函数前完成单实例所有权判定；若传入 primary broker，其所有权
+/// 在引擎生命周期内交给 Runner，并在有序清理阶段释放。
 pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     vm_service.clear(options.io);
     var api = try flutter.Api.load(gpa, options.engine_library);

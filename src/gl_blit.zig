@@ -1,12 +1,9 @@
-//! GLES2 blit 模块: 将引擎 compositor 产出的 backing store 纹理合成到
-//! 窗口 EGL surface。
+//! 对 Flutter compositor backing store 执行状态隔离合成的 GLES2 blitter。
 //!
-//! 使用前提: 调用时 GL context 必须 current (present_view_callback 在
-//! raster 线程执行, 引擎已 make_current)。每次 blit 保存/恢复其触碰的
-//! GL 状态, 不污染引擎下一次光栅化 (blit 状态卫生, view-compositor-rendering spec)。
-//!
-//! 坐标约定: layer offset/size 与视口均为物理像素; 纹理 v=0 对应图像顶部
-//! (NDC y 向上, 顶点 Y 翻转以匹配 surface 顶部原点)。
+//! 调用前必须让目标窗口 context 与默认 framebuffer 处于 current 状态。返回前会
+//! 恢复 blit 触及的每个 GL binding/capability，确保 Flutter 下一次 raster pass
+//! 看到自己的状态。layer 几何使用左上角为原点的物理像素；顶点 Y 轴会为 GLES
+//! NDC 坐标系翻转。
 const std = @import("std");
 const c = @import("c");
 
@@ -36,6 +33,10 @@ const Vertex = struct {
     v: f32,
 };
 
+/// 延迟编译的 shader 程序与可复用顶点缓冲区。
+///
+/// GL 名称属于首次执行 `init` 时的 context share group，因此调用 `deinit` 时必须
+/// 让兼容 context 处于 current 状态。该类型限制在渲染线程使用，不提供同步机制。
 pub const Blitter = struct {
     program: c.GLuint = 0,
     vbo: c.GLuint = 0,

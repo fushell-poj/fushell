@@ -21,21 +21,30 @@ final class FushellCommandInvocation {
     required this.isInitial,
   });
 
+  /// 进程入口收到的原始参数字节串，不包含可执行文件名本身。
   final List<Uint8List> arguments;
+
+  /// 调用进程中捕获的 cwd 字节。
   final Uint8List workingDirectory;
 
   /// Whether this invocation started the primary daemon process.
   final bool isInitial;
 
+  /// 供常规文本命令解析器使用的有损 UTF-8 视图。
+  /// 文件名或参数可能包含非 UTF-8 字节时应改用 [arguments]。
   List<String> get textArguments => arguments
       .map((Uint8List value) => utf8.decode(value, allowMalformed: true))
       .toList(growable: false);
 
+  /// [workingDirectory] 的有损 UTF-8 视图。
   String get textWorkingDirectory =>
       utf8.decode(workingDirectory, allowMalformed: true);
 }
 
-/// Result returned to the secondary process that invoked the application.
+/// 返回给应用命令调用进程的完成结果。
+///
+/// 输出会先缓冲，再与退出状态原子交付，因此本 API 适合命令规模的响应，不适合无界
+/// 流式传输。native broker 将每个输出流限制为 16 MiB，并串行执行回调。
 final class FushellCommandResult {
   FushellCommandResult({
     this.exitCode = 0,
@@ -63,11 +72,17 @@ final class FushellCommandResult {
   final Uint8List stderr;
 }
 
+/// 由应用拥有的首次启动与远程调用命令分发器。
+///
+/// Fushell 同一时刻最多调用一个 handler。远程调用方在 30 秒后收到超时，但 Future
+/// 不会被取消；后续命令继续排队，直到该 Future 完成，从而保持 FIFO 与不可重入性。
 typedef FushellCommandHandler =
     FutureOr<FushellCommandResult> Function(FushellCommandInvocation command);
 
-/// Registers the application-owned command handler used by single-instance
-/// bundles. Fushell transports argv/cwd but never parses or declares commands.
+/// 把单实例 Dart 应用连接到 native invocation broker。
+///
+/// Fushell 只运输不透明 argv/cwd 字节与命令结果，从不定义命令语法或行为。普通窗口
+/// API 不依赖本类；仅 `fushell.json` 声明 `instance: "single"` 的 bundle 需要使用。
 final class FushellApplication {
   FushellApplication._();
 
@@ -77,9 +92,10 @@ final class FushellApplication {
   );
   static FushellCommandHandler? _handler;
 
-  /// Installs [onCommand] and declares the Dart side ready for queued process
-  /// invocations. Calling this again replaces the handler without changing the
-  /// native singleton ownership.
+  /// 安装 [onCommand]，并释放 Dart 启动期间排队的 invocation。
+  ///
+  /// 必须等待返回的 Future 完成，才能假定 native broker 已可分发。再次调用只替换
+  /// Dart callback，不会重新申请 D-Bus 名称，也不会创建第二个 broker。
   static Future<void> run({required FushellCommandHandler onCommand}) async {
     WidgetsFlutterBinding.ensureInitialized();
     _handler = onCommand;
@@ -143,10 +159,10 @@ final class FushellApplication {
   }
 }
 
-/// 窗口管理: fushell 以无头引擎启动 (无隐式窗口), 窗口全部由 Dart 通过
-/// [FushellWindow.openWindow] 创建。每个窗口对应一个 Flutter view
-/// (`PlatformDispatcher.views` 中的 `FlutterView`, viewId = 窗口 id),
-/// 窗口内容用框架的 `View` widget 渲染到对应 view:
+/// 为无头 Flutter 引擎创建并控制 native surface。
+///
+/// 每个 native 窗口拥有一个 `FlutterView`；返回的窗口 ID 与 `FlutterView.viewId`
+/// 相同。应用必须把每个 view 放入以 `runWidget` 为根的框架 `ViewCollection`：
 ///
 /// ```dart
 /// final id = await FushellWindow.openWindow(title: 'Main', appId: '...');
@@ -154,21 +170,20 @@ final class FushellApplication {
 /// runWidget(ViewCollection(views: [View(view: view, child: const MainApp())]));
 /// ```
 ///
-/// 关闭全部窗口不会退出进程; 退出用 [FushellProcess.exit]。
+/// 关闭全部窗口后 isolate 与 command broker 仍继续运行。需要主动结束进程时调用
+/// [FushellProcess.exit]。
 final class FushellWindow {
   FushellWindow._();
 
   static int _nextRequestId = 1;
   static Future<void>? _fontFallbackLoad;
 
-  /// 创建新窗口, 返回窗口 id (= Flutter view_id)。
+  /// 创建 native surface，并在 Flutter 接受新 view 后完成。
   ///
-  /// [parent] 指定父窗口 id: 子窗口经 xdg `set_parent` 绑定到父窗口
-  /// (transient 语义: 子窗口堆叠于父窗口之上; 父窗口关闭时 compositor 自动
-  /// 解除绑定, 不级联关闭子窗口)。
-  ///
-  /// [layer] 提供时创建 layer-shell 角色窗口 (参数同旧 LayerSurfaceRole,
-  /// 与 xdg 窗口互斥; title/appId 被忽略)。
+  /// [parent] 只应用 xdg transient-parent 层叠关系；关闭父窗口不会级联关闭子窗口。
+  /// 提供 [layer] 时创建 layer-shell surface 而非 xdg toplevel，此时忽略 [title]
+  /// 和 [appId]。省略尺寸表示让 compositor 决定 xdg 大小，或由相对锚点推导 layer
+  /// 大小。
   static Future<int> openWindow({
     required String title,
     required String appId,
@@ -202,7 +217,8 @@ final class FushellWindow {
     return windowId;
   }
 
-  /// 关闭窗口 (引擎移除对应 view 后销毁其 Wayland surface)。
+  /// 移除 Flutter view，再销毁其 EGL 与 Wayland 资源。
+  /// 只有引擎确认 `RemoveView` 后 Future 才会完成。
   static Future<void> closeWindow(int windowId) async {
     await _sendRequest(<String, Object?>{
       'method': 'window.close',
@@ -210,7 +226,7 @@ final class FushellWindow {
     });
   }
 
-  /// 更新窗口的 mutable 属性 (title / appId)。
+  /// 更新可变 xdg-toplevel 元数据；传入 layer-surface ID 时拒绝请求。
   static Future<void> updateWindow(
     int windowId,
     WindowSurfaceUpdate update,
@@ -222,7 +238,8 @@ final class FushellWindow {
     });
   }
 
-  /// 更新 layer 角色窗口的 mutable 属性。
+  /// 应用可变 layer-shell 状态并 commit surface。
+  /// 拒绝 xdg-toplevel ID 以及更新后无效的几何配置。
   static Future<void> updateLayer(
     int windowId,
     LayerSurfaceUpdate update,
@@ -234,10 +251,10 @@ final class FushellWindow {
     });
   }
 
-  /// 在 `PlatformDispatcher.views` 中查找窗口 id 对应的 FlutterView。
+  /// 解析与 native 窗口 ID 对应的 [ui.FlutterView]。
   ///
-  /// openWindow 回复时 view 已在引擎注册, 但通知 Dart 侧 `PlatformDispatcher`
-  /// 的通道消息可能还在队列中; 此方法会等待 view 出现 (最多 ~1s)。
+  /// 引擎回调可能早于 `PlatformDispatcher.views` 发布，因此本方法最多等待约一秒，
+  /// 之后才抛出 `ViewNotFound`。
   static Future<ui.FlutterView> viewById(int windowId) async {
     for (var attempt = 0; attempt < 100; attempt++) {
       for (final ui.FlutterView view in ui.PlatformDispatcher.instance.views) {
@@ -347,12 +364,15 @@ final class FushellWindow {
   }
 }
 
-/// 进程控制: 无头 shell 的退出方式。
+/// 无头应用进程的显式生命周期控制。
 final class FushellProcess {
   FushellProcess._();
 
-  /// 显式退出进程: 宿主按序关闭引擎、销毁全部剩余窗口、断开 Wayland 连接,
-  /// 以 [code] 退出。
+  /// 请求以 `0..255` 范围内的状态码有序关闭进程。
+  ///
+  /// platform loop 会在活动应用命令 reply 发出后停止，随后关闭 Flutter、销毁全部
+  /// 窗口，并断开 Wayland/D-Bus。该请求不等待响应，因为 isolate 可能在
+  /// platform-channel response 送达前终止。
   static Future<void> exit([int code = 0]) async {
     final int requestId = FushellWindow._nextRequestId++;
     final ByteData message = _encodeJson(<String, Object?>{
@@ -369,7 +389,11 @@ final class FushellProcess {
   }
 }
 
-/// layer-shell 角色参数 (window.open 的 layer 参数)。
+/// 创建 layer-shell surface 时分配的不可变 role。
+///
+/// 同时设置水平方向或垂直方向的相对锚点，并省略对应尺寸，表示请求 compositor
+/// 控制拉伸。[exclusiveZone] 遵循 layer-shell 协议：`-1` 要求 compositor 根据
+/// surface 尺寸推导；`0` 表示不保留工作区。
 final class LayerSurfaceRole {
   const LayerSurfaceRole({
     required this.namespace,
@@ -404,7 +428,10 @@ final class LayerSurfaceRole {
   };
 }
 
-/// layer 窗口的 mutable 属性更新。
+/// 对现有 layer-shell role 的局部修改。
+///
+/// null 字段保持不变。应用 patch 后会验证几何与 anchor 组合，因此 patch 不会让
+/// 拉伸轴留下不兼容的显式尺寸。
 final class LayerSurfaceUpdate {
   const LayerSurfaceUpdate({
     this.width,
@@ -433,7 +460,8 @@ final class LayerSurfaceUpdate {
   };
 }
 
-/// xdg 窗口的 mutable 属性更新。
+/// 对 compositor 可见 xdg-toplevel 元数据的局部更新。
+/// null 字段保留当前值。
 final class WindowSurfaceUpdate {
   const WindowSurfaceUpdate({this.title, this.appId});
 
@@ -446,6 +474,7 @@ final class WindowSurfaceUpdate {
   };
 }
 
+/// layer-shell 相对于普通桌面窗口的层叠平面。
 enum LayerSurfaceLayer {
   background('background'),
   bottom('bottom'),
@@ -456,6 +485,7 @@ enum LayerSurfaceLayer {
   final String wireName;
 }
 
+/// layer surface 所附着的 output 边缘。
 enum LayerSurfaceAnchor {
   top('top'),
   bottom('bottom'),
@@ -466,6 +496,7 @@ enum LayerSurfaceAnchor {
   final String wireName;
 }
 
+/// 向 layer-shell compositor 请求的键盘焦点策略。
 enum LayerKeyboardInteractivity {
   none('none'),
   exclusive('exclusive'),
@@ -475,6 +506,7 @@ enum LayerKeyboardInteractivity {
   final String wireName;
 }
 
+/// 以 compositor 逻辑坐标表示的有符号 layer-shell 边距。
 final class Margins {
   const Margins({this.top = 0, this.right = 0, this.bottom = 0, this.left = 0});
 
@@ -493,6 +525,7 @@ final class Margins {
   };
 }
 
+/// native surface 或 process channel 失败，带有稳定、机器可读的错误码。
 final class FushellSurfaceException implements Exception {
   const FushellSurfaceException({required this.code, required this.message});
 

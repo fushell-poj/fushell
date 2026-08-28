@@ -1,17 +1,17 @@
-//! frontend_server 集成: 增量 Dart 编译器 (flutter 官方热重载同款)。
+//! JIT 热重载使用的长生命周期 Flutter frontend_server 客户端。
 //!
-//! 协议 (stdin/stdout 文本行):
-//!   请求: "compile <main-uri>\n"
-//!   响应: "result <boundaryKey>"              ← 编译开始
-//!         "<boundaryKey> +file:///...dart"     ← 依赖列表
-//!         "<boundaryKey> <output.dill> <errCount>"  ← 结果 (errCount>0 = 编译错误)
-//!
-//! 产物: --output-dill 指定的完整 kernel dill (frontend_server 内部增量加速)。
-//! 热重载: 新 dill 文件 → VM service reloadSources(rootLibUri=file:///dill)。
+//! 子进程启动时不提供命令行 entrypoint，使其持续运行；编译请求按行写入 stdin，
+//! 响应则在 stdout 使用每次请求独有的边界 token。成功编译会替换完整 kernel dill，
+//! 再由 VM Service 通过 `reloadSources` 加载。子进程拥有独立进程组，因此 CLI
+//! 关闭时可以回收编译器及其后代进程。
 
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// 拥有一个增量编译器进程及其 stdin/stdout 管道端点。
+///
+/// 路径借自调用方，必须比该对象存活更久。方法均为同步调用且限制在 CLI 线程；
+/// 即使发生编译或协议失败，也必须调用 `deinit` 终止进程组并关闭两个描述符。
 pub const FrontendServer = struct {
     io: std.Io,
     pid: std.c.pid_t,

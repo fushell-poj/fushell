@@ -8,6 +8,11 @@ const gl_blit = @import("gl_blit.zig");
 
 const gl_rgba8: c.GLint = 0x8058;
 
+/// 为 Flutter 分配一张 RGBA8 GLES 渲染纹理。
+///
+/// 调用时引擎的 resource/render context 必须已经 current。纹理名称在
+/// `collectBackingStore` 前归引擎拥有；尺寸向上取整且至少为一个像素，因为 GLES
+/// 不接受零尺寸存储。
 pub fn createBackingStore(config: *const c.FlutterBackingStoreConfig, output: *c.FlutterBackingStore) bool {
     const width: c.GLsizei = @intFromFloat(@ceil(@max(config.size.width, 1.0)));
     const height: c.GLsizei = @intFromFloat(@ceil(@max(config.size.height, 1.0)));
@@ -37,6 +42,10 @@ pub fn createBackingStore(config: *const c.FlutterBackingStoreConfig, output: *c
     return true;
 }
 
+/// 释放此前交给 Flutter 的 GL 纹理。
+///
+/// 引擎保证 backing store 已不再被任何 layer 引用；调用时必须让 Fushell 的共享
+/// resource context 处于 current 状态。
 pub fn collectBackingStore(backing_store: *const c.FlutterBackingStore) bool {
     if (backing_store.type != c.kFlutterBackingStoreTypeOpenGL) return true;
     const texture = backing_store.unnamed_0.open_gl.unnamed_0.texture;
@@ -47,6 +56,10 @@ pub fn collectBackingStore(backing_store: *const c.FlutterBackingStore) bool {
     return true;
 }
 
+/// 按顺序把 Flutter backing-store layer 合成到一个窗口 surface。
+///
+/// 偏移与尺寸使用左上角为原点的物理像素。目标 EGL surface 及其默认 framebuffer
+/// 必须已经 current；不支持的 platform-view layer 会报告诊断，而不是静默绘制。
 pub fn blitLayers(blitter: *gl_blit.Blitter, info: *const c.FlutterPresentViewInfo, viewport_width: f32, viewport_height: f32) void {
     for (0..info.layers_count) |index| {
         const layer: *const c.FlutterLayer = @ptrCast(info.layers[index]);

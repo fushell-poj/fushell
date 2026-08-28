@@ -1,12 +1,8 @@
-//! wlr-data-control-unstable-v1 客户端: 系统剪贴板读写。
+//! wlr-data-control-unstable-v1 系统剪贴板所有权客户端。
 //!
-//! 写 (复制): manager.createDataSource → source.offer(text/plain) → device.setSelection
-//!            其他应用请求内容时, source 收到 send(mime, fd) 事件 → 写 fd。
-//! 读 (粘贴): device 收到 selection 事件 → offer 对象 → offer 的 offer 事件记录 mime
-//!            → offer.receive(mime, pipe_w) → 读 pipe_r 内容。
-//!
-//! 线程模型: 协议事件、平台消息与剪贴板 API 都在平台线程执行；模块不做
-//!           额外线程同步。读取 pipe 由主事件循环非阻塞驱动。
+//! 发布的数据会保留到其他客户端消费所提供的 source。读取时要求活动 offer 写入
+//! 非阻塞管道，再由 EventPump 增量排空，最大允许 16 MiB。协议回调、管道状态与
+//! platform message 全部限制在平台线程，因此本模块有意不使用锁。
 
 const std = @import("std");
 const wayland = @import("wayland");
@@ -17,6 +13,10 @@ const display_state = @import("wl_display_state.zig");
 
 const max_clipboard_bytes: usize = 16 * 1024 * 1024;
 
+/// 拥有 manager/device/source/offer proxy，以及至多一个进行中的 selection 读取。
+///
+/// 该对象借用 DisplayState，必须先于共享 wl_display 销毁。selection MIME 字符串
+/// 及发布/读取的字节均由分配器拥有。同一时刻只能有一个外部读取；关闭时必须取消。
 pub const DataControl = struct {
     gpa: std.mem.Allocator,
     display: *display_state.DisplayState,
@@ -96,6 +96,9 @@ pub const DataControl = struct {
         self.device.?.setSelection(source);
     }
 
+    /// 排空外部 selection 时返回的增量状态。
+    /// `complete` 把字节切片所有权转给调用方；`too_large` 表示对端超过 16 MiB
+    /// 策略上限，管道已被取消。
     pub const RequestProgress = union(enum) {
         pending,
         complete: ?[]u8,

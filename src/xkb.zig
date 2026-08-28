@@ -1,5 +1,8 @@
-//! xkbcommon 绑定: keycode → keysym / UTF-8 字符翻译。
-//! 链接 libxkbcommon (devshell 提供, nixpkgs 1.13.1)。
+//! 用于 Wayland 按键翻译的最小 libxkbcommon 绑定。
+//!
+//! compositor 提供 keymap 与 modifier 快照。物理按键迁移在查询 keysym/UTF-8 前
+//! 必须且只能更新一次 `Xkb`；repeat 事件复用已经解析的逻辑按键，不得再次修改
+//! xkb 状态。libxkbcommon 对象所有权由 `Xkb.deinit` 封装。
 
 const std = @import("std");
 
@@ -62,7 +65,10 @@ extern "c" fn xkb_keysym_to_utf8(keysym: u32, buffer: [*]u8, size: usize) c_int;
 extern "c" fn xkb_keymap_min_keycode(keymap: ?*anyopaque) u32;
 extern "c" fn xkb_keymap_max_keycode(keymap: ?*anyopaque) u32;
 
-/// xkb 状态机封装: keymap 字符串 → state, 按键更新 → keysym/utf8。
+/// compositor 当前 keymap 对应的自有 xkb context/keymap/state 三元组。
+///
+/// `setKeymap` 原子替换由 keymap 派生的对象；编译失败时保留旧状态。所有方法均限制
+/// 在平台线程调用。
 pub const Xkb = struct {
     context: ?*anyopaque = null,
     keymap: ?*anyopaque = null,

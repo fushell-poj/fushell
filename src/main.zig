@@ -1,3 +1,10 @@
+//! 嵌入每个打包 Fushell 应用的入口点。
+//!
+//! 本 launcher 不定义面向应用的 flag。它相对自身可执行文件定位 bundle，把每个 argv
+//! 元素视为不透明应用数据；配置单实例时，会在任何 Flutter、Wayland 或 EGL 初始化
+//! 前完成 D-Bus 所有权判定。因此 secondary 进程没有图形副作用，并以 primary 的命令
+//! 结果退出。
+
 const std = @import("std");
 const player = @import("player.zig");
 const signal_shutdown = @import("signal_shutdown.zig");

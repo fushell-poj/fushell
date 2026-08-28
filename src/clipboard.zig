@@ -1,18 +1,17 @@
-//! flutter/platform 通道的剪贴板实现。
+//! 由分配器拥有的进程内剪贴板存储，以及旧版 Flutter JSON 辅助函数。
 //!
-//! 引擎 → 宿主 (flutter/platform channel):
-//!   Clipboard.setData  {"text": "..."}
-//!   Clipboard.getData  {"format": "text/plain"}
-//!
-//! 宿主响应 (JSON 字符串, 非 {method,args} 格式):
-//!   setData 成功 → ""
-//!   getData 成功 → {"text": "..."} ; 空剪贴板 → {}
+//! Wayland data-control 不可用时，ClipboardService 使用该存储作为确定性 fallback。
+//! JSON 辅助函数只描述 flutter/platform 载荷，不执行协议 I/O，也不能代替系统剪贴板。
 
 const std = @import("std");
 
+/// 由单个分配器拥有的可变 UTF-8 剪贴板值。
+///
+/// `getText` 返回的切片借用内部缓冲区，下次 `setText` 或 `deinit` 后立即失效。
+/// 该类型不包含同步机制，由 ClipboardService 保证只在平台线程使用。
 pub const Clipboard = struct {
     gpa: std.mem.Allocator,
-    /// 进程内剪贴板副本 (data-control 可用时同步系统, 不可用时兜底)。
+    /// 进程本地副本，既作为读取 fallback，也作为发布到 Wayland 的数据源。
     text: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Clipboard {

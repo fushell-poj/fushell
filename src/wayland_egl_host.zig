@@ -1,3 +1,10 @@
+//! 每个 view 独立的 Wayland role、EGL surface、输入与 metrics Host。
+//!
+//! 每个 Host 借用进程级 DisplayState、共享 Wayland 事件队列与 RenderContext，
+//! 但拥有自己的 wl_surface role 对象和 EGL 窗口 surface。Wayland 配置在平台线程
+//! 执行；raster 呈现可在 Flutter raster 线程执行，并通过 `present_mutex` 与 resize
+//! 串行化。绝不在协议 listener 调用栈内销毁 role 对象。
+
 const std = @import("std");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -16,6 +23,8 @@ const btn_left = 0x110;
 const btn_right = 0x111;
 const btn_middle = 0x112;
 
+/// 单个 view 上报给 Flutter 的物理 backing-store 尺寸与逻辑到物理缩放比。
+/// width 和 height 始终使用像素尺寸。
 pub const Metrics = struct {
     width: usize,
     height: usize,
@@ -44,6 +53,10 @@ pub const PointerEvent = struct {
 
 pub const MetricsCallback = *const fn (host: *Host, context: ?*anyopaque, metrics: Metrics) void;
 pub const PointerCallback = *const fn (host: *Host, context: ?*anyopaque, event: PointerEvent) void;
+/// 平台循环用来消费 Flutter task 与可选子系统描述符的适配器，不取得其状态所有权。
+///
+/// 回调顺序具有语义：producer 在同一 tick 内必须以相同顺序 report/fill/handle
+/// 外部描述符。即使 readiness 来自其他线程，所有回调仍在平台线程执行。
 pub const EventLoopSource = struct {
     fd: c_int,
     context: ?*anyopaque,
@@ -118,9 +131,12 @@ fn integerScaleForMembership(membership: *const OutputMembership, outputs: []con
     return scale;
 }
 
-/// 进程级单一 EGL render context: raster 渲染 (bootstrap pbuffer) 与全部
-/// 窗口的呈现共用 (compositor 路径下两者同在引擎 raster 线程, 无跨线程
-/// EGL 绑定冲突)。backing store 纹理也创建于此 context。
+/// raster、resource 与 presentation 共用的进程级 EGL 对象命名空间。
+///
+/// Flutter raster 线程使用 `egl_context` 在 bootstrap pbuffer 上渲染 backing-store
+/// 纹理，再把每个窗口 surface 绑定到同一 context 完成合成。resource 线程使用独立但
+/// 共享对象的 context/pbuffer，既避免并发占用 raster context，又保留纹理可见性。
+/// 反初始化本对象前必须先销毁每个 Host 的 EGL surface。
 pub const RenderContext = struct {
     display_state: *display_state.DisplayState = undefined,
     egl_config: c.EGLConfig = null,
@@ -218,8 +234,13 @@ pub const RenderContext = struct {
     }
 };
 
+/// 恰好对应一个 Flutter view 的 native 呈现与输入端点。
+///
+/// Host 只会拥有 xdg_toplevel 或 layer-shell role 之一，绝不会同时拥有两者。它借用
+/// 进程级 connection/context，并拥有全部 surface 级 Wayland/EGL 对象。只有 Flutter
+/// 确认 RemoveView 后才能执行 `deinit`，否则 raster 回调可能访问已销毁的 EGL surface。
 pub const Host = struct {
-    /// 进程级共享连接 (wl_display + EGL display + 全局对象)。
+    /// 共享进程连接（wl_display、EGL display 与 globals）；仅借用。
     display_state: *display_state.DisplayState = undefined,
     /// 进程级单一 event queue (引用, 不拥有): 窗口对象 (surface/xdg/toplevel)
     /// 与全局对象都绑它, 由主线程单一事件循环 dispatch。
@@ -235,19 +256,18 @@ pub const Host = struct {
     egl_window_width: i32 = 0,
     egl_window_height: i32 = 0,
 
-    /// 进程级共享 render context (config/context/bootstrap 都在其中);
-    /// 窗口只持有自己的 EGL surface。
+    /// 共享 render context/config；本 Host 只拥有 `egl_surface`。
     render_context: *RenderContext = undefined,
     egl_surface: c.EGLSurface = null,
-    /// 本窗口的 Flutter view_id (0 = 非窗口/implicit)。
+    /// Flutter view ID；零保留给无头 implicit view。
     view_id: i64 = 0,
-    /// resize (主线程) 与 present (引擎线程) 互斥。
-    /// 使用阻塞 mutex，避免高负载下的无界自旋。
+    /// 把平台线程 resize 与 raster 线程 presentation 串行化。这里刻意使用阻塞
+    /// mutex；跳过任一操作都会破坏 EGL 状态。
     io: std.Io = undefined,
     present_mutex: std.Io.Mutex = .init,
     configured: bool = false,
-    /// Wayland compositor 请求关闭该窗口。平台线程下一次 tick 消费并提交
-    /// FlutterEngineRemoveView；不得在协议 listener 栈内直接销毁 Wayland 对象。
+    /// 由 xdg close listener 设置，并在下一个平台 tick 消费。不能在协议回调内开始
+    /// 移除，因为只有 Flutter 异步回调完成后才会销毁 listener 自己的 Wayland 对象。
     close_requested: bool = false,
     width: i32 = default_width,
     height: i32 = default_height,
@@ -267,11 +287,10 @@ pub const Host = struct {
     pointer_callback: ?PointerCallback = null,
     pointer_context: ?*anyopaque = null,
 
-    /// 绑定到共享 DisplayState: acquire + 引用进程级单一 event queue
-    /// (shared_queue, 由 run() 启动时 bindGlobals 创建)。窗口对象后续
-    /// 都 bind 到这个共享 queue (单线程事件循环模型)。
-    /// attach 先于 bindGlobals/render_context.init (attach 触发连接建立),
-    /// 故 queue 引用在角色初始化前刷新, render_context 由 run() 注入。
+    /// 获取共享 display 生命周期，并采用当前 output scale。
+    ///
+    /// 进程启动建立连接时，`attach` 可能早于 global binding。role 初始化稍后刷新共享
+    /// queue；只有 EGL/global 初始化成功后，调用方才能注入 RenderContext。
     pub fn attach(self: *Host, state: *display_state.DisplayState, io: std.Io) !void {
         self.display_state = state;
         self.io = io;

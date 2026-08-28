@@ -1,16 +1,15 @@
-//! flutter/textinput 通道: TextField 输入状态机。
+//! Flutter `flutter/textinput` 编辑状态机。
 //!
-//! 引擎 → 宿主 (setClient/setEditingState/show/hide/clearClient)
-//! 宿主 → 引擎 (TextInputClient.<id>: updateEditingState / performAction)
-//!
-//! 协议格式与引擎 TextInputPlugin (flutter engine shell/platform) 一致:
-//!   updateEditingState: {"method": "TextInputClient.updateEditingState",
-//!                        "args": [clientId, {text, selection, composing}]}
-//!   performAction:      {"method": "TextInputClient.performAction",
-//!                        "args": [clientId, action]}
+//! Flutter 以 UTF-16 code-unit offset 报告 selection/composing range，本模块则在
+//! UTF-8 文本中存储 byte offset，并在每个协议边界转换。物理按键与 IME
+//! preedit/commit 都修改同一个 `Client`，随后由它发送
+//! `TextInputClient.updateEditingState` 消息。每个 native 窗口拥有一个 client，view
+//! 之间不共享状态。
 
 const std = @import("std");
 
+/// 使用 byte index 表示 selection 与 composing range 的 UTF-8 编辑缓冲区。
+/// composing range 为 `-1, -1` 表示当前没有活动 IME composition。
 pub const EditingState = struct {
     text: std.ArrayListUnmanaged(u8) = .empty,
     selection_base: i64 = 0,
@@ -21,6 +20,10 @@ pub const EditingState = struct {
 
 pub const SendFn = *const fn (client_id: i64, msg: []const u8, context: ?*anyopaque) void;
 
+/// 每个 view 独立的 text-input 状态与 framework 消息回调。
+///
+/// 所有修改都限制在平台线程。geometry 以 Flutter 根坐标缓存，以便 scale 或 view
+/// 位置变化时重新计算 Wayland IME cursor rectangle。`deinit` 释放可增长文本缓冲区。
 pub const Client = struct {
     gpa: std.mem.Allocator,
     client_id: i64 = -1,

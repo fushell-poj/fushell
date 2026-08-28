@@ -1,3 +1,10 @@
+//! 监管 `fushell run --devtools` 所启动的 Flutter 工具链。
+//!
+//! Debug 模式先以 machine mode 附加 Flutter Tool，由 DDS 提供 Inspector 与
+//! Debugger 所需的表达式编译器；Profile 模式可让 DevTools 直接连接原始 VM
+//! Service。监管器不拥有应用进程，只观察 `stop`，把工具进程组与终端信号隔离，
+//! 并执行有界清理，避免卡死的子进程阻止 CLI 退出。
+
 const std = @import("std");
 const flutter_attach = @import("flutter_attach.zig");
 const managed_process = @import("managed_process.zig");
@@ -7,6 +14,11 @@ const uri_wait_timeout_ms: usize = 20_000;
 const default_stop_grace_ms: usize = 2_000;
 const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
 
+/// 传给 DevTools 监管线程的借用状态。
+///
+/// 所有指针都必须比 [threadMain] 存活更久。`service_state` 发布 runner 的原始
+/// VM URI；Debug 模式下 `reload_service_state` 会被替换为 DDS URI，使文件监视器
+/// 与浏览器共享同一个端点。
 pub const Context = struct {
     io: std.Io,
     gpa: std.mem.Allocator = std.heap.page_allocator,
@@ -20,6 +32,8 @@ pub const Context = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+/// 在应用停止前持续管理 attach/DevTools 生命周期。
+/// 工具启动失败只产生诊断，不会终止应用。
 pub fn threadMain(context: *Context) void {
     var uri_buf: [512]u8 = undefined;
     const uri = waitForVmService(context, &uri_buf) orelse return;

@@ -1,3 +1,10 @@
+//! 校验 Fushell bundle，并准备交给引擎的项目参数。
+//!
+//! JIT bundle 直接让 Flutter 读取 kernel/assets；AOT bundle 还会 `dlopen`
+//! 应用快照库，并解析 `FlutterEngineRunsAOTCompiledDartCode` 所要求的四个符号。
+//! 两条路径都可能为 Fushell 自有字体 fallback 创建临时资产 overlay；只有在引擎
+//! 不再使用相关路径后，才能调用 [Bundle.deinit]。
+
 const std = @import("std");
 const c = @import("c");
 
@@ -6,6 +13,10 @@ const fallback_font_config = "fushell_system_fonts/fallback.json";
 const fallback_font_aliases = [_][]const u8{ "Roboto", "monospace", "sans-serif" };
 
 /// Validated Flutter bundle paths plus an optional temporary font overlay.
+///
+/// 路径使用哨兵结尾，因为 Flutter C ABI 会在整个引擎生命周期内保留它们；释放时
+/// 必须保持精确的 `[:0]u8` 类型。overlay 如存在，是叠加在应用资产之上的进程私有
+/// 目录，必须存活到 Flutter 释放全部资产引用。
 pub const Bundle = struct {
     assets_path: [:0]u8,
     icu_data_path: [:0]u8,
@@ -33,6 +44,7 @@ const FontconfigFont = struct {
     }
 };
 
+/// 加载 Debug/JIT bundle，并在启动引擎前确认 kernel 与资产输入存在。
 pub fn loadJit(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
     if (!try pathExists(gpa, bundle_path)) {
         std.debug.print("Flutter bundle path does not exist: {s}\n", .{bundle_path});
@@ -60,6 +72,9 @@ pub fn loadJit(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
     return error.InvalidFlutterBundle;
 }
 
+/// 加载 Profile/Release bundle，并解析其 AOT 快照符号。
+/// 若打包的 `libapp.so` 不兼容或不完整，会在 Flutter 启动前报错，避免留下
+/// 部分初始化的引擎状态。
 pub fn loadAot(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
     if (!try pathExists(gpa, bundle_path)) {
         std.debug.print("Flutter bundle path does not exist: {s}\n", .{bundle_path});

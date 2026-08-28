@@ -1,5 +1,15 @@
+//! 带认证 Dart VM Service URI 的线程安全交接。
+//!
+//! 引擎日志回调发布 URI，CLI worker 线程轮询它以启动热重载、Flutter attach 或
+//! DevTools。固定缓冲区避免在回调内分配。超大值会被拒绝而不是截断，因为不完整的
+//! 认证 token 无法使用。
+
 const std = @import("std");
 
+/// 由 runtime I/O mutex 保护的单 URI 槽。
+///
+/// `get` 把内容复制到调用方存储，调用方不会持有指向可变共享状态的视图。启动后或
+/// clear 后，零长度表示“尚不可用”。
 pub const State = struct {
     mutex: std.Io.Mutex = .init,
     uri: [512]u8 = undefined,

@@ -1,14 +1,26 @@
+//! 构建工具与打包 runner 共享的应用实例策略。
+//!
+//! 项目可省略 `fushell.json`，此时会明确选择相互独立的进程，并避免依赖会话总线。
+//! 单实例项目在构建时完成校验并写入规范化 bundle manifest，因此 runner 无需从
+//! 可变的源文件推断策略。
+
 const std = @import("std");
 
 pub const source_file_name = "fushell.json";
 pub const bundle_file_name = "fushell_application.json";
 const max_config_bytes = 64 * 1024;
 
+/// 决定 runner 是独立启动，还是通过会话总线协调。
+/// `.single` 是硬性要求：缺少 D-Bus 时必须报错，不得隐式退化为 `.multiple`。
 pub const InstanceMode = enum {
     multiple,
     single,
 };
 
+/// 打包应用经解析后的实例所有权策略。
+///
+/// `application_id` 由该值拥有，必须通过 [deinit] 释放。多实例模式下它可以省略；
+/// 当 `instance` 为 `.single` 时则必须提供，并按 D-Bus well-known name 校验。
 pub const Config = struct {
     application_id: ?[]u8 = null,
     instance: InstanceMode = .multiple,
@@ -18,16 +30,24 @@ pub const Config = struct {
     }
 };
 
+/// 从当前项目目录加载可选的源 manifest。
+/// 文件不存在不算错误，而是返回多实例默认值。
 pub fn loadProject(allocator: std.mem.Allocator, io: std.Io) !Config {
     return loadOptionalFile(allocator, io, .cwd(), source_file_name);
 }
 
+/// 加载打包 runner 旁的规范化 manifest。
+///
+/// bundle manifest 缺失时按普通多实例 bundle 处理；格式错误或版本不受支持时
+/// 则按失败关闭原则拒绝启动。
 pub fn loadBundle(allocator: std.mem.Allocator, io: std.Io, bundle_path: []const u8) !Config {
     const path = try std.fs.path.join(allocator, &.{ bundle_path, "data", bundle_file_name });
     defer allocator.free(path);
     return loadOptionalFile(allocator, io, .cwd(), path);
 }
 
+/// 在 [bundle_path] 中写入确定性的 runner manifest。
+/// 生成文件只包含运行时策略，不包含构建工具内部状态。
 pub fn writeBundle(allocator: std.mem.Allocator, io: std.Io, bundle_path: []const u8, config: Config) !void {
     const path = try std.fs.path.join(allocator, &.{ bundle_path, "data", bundle_file_name });
     defer allocator.free(path);
@@ -56,6 +76,10 @@ fn loadOptionalFile(
     return parse(allocator, bytes);
 }
 
+/// 按 schema version 1 严格校验字段与类型。
+///
+/// 未知键会被拒绝，避免拼错的安全或生命周期策略被静默忽略。返回的 application id
+/// 如存在，则由调用方使用的分配器拥有。
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return error.InvalidApplicationConfig;
     defer parsed.deinit();
@@ -92,6 +116,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Config {
     return config;
 }
 
+/// 校验应用总线名称所采用的 D-Bus well-known-name 子集。
+/// 名称至少包含两个由点分隔的段；每段以 ASCII 字母或下划线开头，并受 D-Bus
+/// 255 字节总长度限制。
 pub fn isValidApplicationId(value: []const u8) bool {
     if (value.len == 0 or value.len > 255 or value[0] == '.' or value[value.len - 1] == '.') return false;
 

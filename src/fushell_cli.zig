@@ -1,3 +1,9 @@
+//! 开发者 CLI 语法的纯解析器。
+//!
+//! 本模块不执行文件系统或进程 I/O。返回的路径与应用参数借用调用方 argv 存储，
+//! 因此不能比它存活更久。`--` 是硬边界：其后的每个参数都属于打包 Dart 应用，
+//! 并保持原样而不作解释。
+
 const std = @import("std");
 
 pub const Command = enum {
@@ -13,6 +19,10 @@ pub const Mode = enum {
     release,
 };
 
+/// 解析后的命令，其中切片借用原始 argv。
+///
+/// DevTools 与 VM Service 设置只允许用于 `run`；Release 引擎刻意不暴露 service，
+/// 因而 Release 模式拒绝两者。
 pub const Options = struct {
     command: Command = .help,
     help: bool = false,
@@ -23,7 +33,7 @@ pub const Options = struct {
     devtools: bool = false,
     launch_browser: bool = true,
     vm_service_port: ?u16 = null,
-    /// Opaque application argv after `--`; parsed only by the Dart application.
+    /// `--` 后的不透明应用 argv；只由 Dart 应用解析。
     application_args: []const [:0]const u8 = &.{},
 
     pub fn positional(self: Options, index: usize) ?[]const u8 {
@@ -36,6 +46,10 @@ pub const Options = struct {
     }
 };
 
+/// 解析 `fushell` 可执行文件名之后的参数。
+///
+/// 语法刻意保持严格：mode flag 互斥，开发者选项不会泄漏到 `build`/`sdk`，且只有
+/// `run` 接受 `--` 后的不透明应用参数。本函数不执行分配。
 pub fn parse(args: []const [:0]const u8) !Options {
     if (args.len == 0) return .{};
 

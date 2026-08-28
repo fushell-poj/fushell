@@ -1,3 +1,10 @@
+//! 面向开发者的 `fushell` 命令实现。
+//!
+//! 应用所需的 runner、选定 Flutter 引擎、ICU 数据、Fushell SDK 与 libdbus 会在
+//! 构建时嵌入本可执行文件。`build` 生成自包含 bundle；`run` 监管该 bundle 以及
+//! 可选的热重载/DevTools 工具；`sdk` 导出与 CLI 嵌入内容完全一致的 Dart 包。
+//! `--` 之后的应用参数是不透明数据，绝不会按 Fushell 选项解析。
+
 const std = @import("std");
 const builtin = @import("builtin");
 const application_config = @import("application_config.zig");
