@@ -5,10 +5,13 @@ const c = @import("c");
 const surface_channel = @import("surface_channel.zig");
 const clipboard_service = @import("clipboard_service.zig");
 
+pub const application_channel_name = "dev.fushell/application";
+
 pub const Channel = enum {
     surface,
     text_input,
     platform,
+    application,
     unsupported,
 };
 
@@ -16,6 +19,7 @@ pub fn classify(name: []const u8) Channel {
     if (std.mem.eql(u8, name, surface_channel.channel_name)) return .surface;
     if (std.mem.eql(u8, name, "flutter/textinput")) return .text_input;
     if (std.mem.eql(u8, name, "flutter/platform")) return .platform;
+    if (std.mem.eql(u8, name, application_channel_name)) return .application;
     return .unsupported;
 }
 
@@ -71,6 +75,16 @@ pub fn encodeMethodError(gpa: std.mem.Allocator, code: []const u8, message: []co
     const escaped_message = try escapeJsonString(gpa, message);
     defer gpa.free(escaped_message);
     return std.fmt.allocPrint(gpa, "[\"{s}\",\"{s}\",null]", .{ escaped_code, escaped_message });
+}
+
+pub fn decodeHexAlloc(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len % 2 != 0) return error.InvalidHex;
+    const decoded = try gpa.alloc(u8, encoded.len / 2);
+    errdefer gpa.free(decoded);
+    for (decoded, 0..) |*byte, index| {
+        byte.* = try std.fmt.parseInt(u8, encoded[index * 2 .. index * 2 + 2], 16);
+    }
+    return decoded;
 }
 
 pub fn escapeJsonString(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -408,6 +422,91 @@ pub fn handlePlatformChannelMessage(runner: anytype, message: c.FlutterPlatformM
     }
     // SystemSound / HapticFeedback / SystemChrome 等: 空响应 (引擎不阻塞)。
     runner.sendEmptyPlatformResponse(message.response_handle);
+}
+
+pub fn handleApplicationChannelMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8) void {
+    var parsed = std.json.parseFromSlice(std.json.Value, runner.gpa, payload, .{}) catch {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "invalid JSON request");
+        return;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "request must be an object");
+            return;
+        },
+    };
+    const method = if (root.get("method")) |value| switch (value) {
+        .string => |string| string,
+        else => null,
+    } else null;
+
+    if (method != null and std.mem.eql(u8, method.?, "ready")) {
+        runner.applicationSetReady();
+        runner.sendPlatformResponse(message.response_handle, "[null]");
+        return;
+    }
+    if (method == null or !std.mem.eql(u8, method.?, "complete")) {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "unsupported application method");
+        return;
+    }
+
+    const args = if (root.get("args")) |value| switch (value) {
+        .object => |object| object,
+        else => null,
+    } else null;
+    const fields = args orelse {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete args must be an object");
+        return;
+    };
+    const id_value = fields.get("id") orelse {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete id is required");
+        return;
+    };
+    const exit_value = fields.get("exitCode") orelse {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete exitCode is required");
+        return;
+    };
+    const id = switch (id_value) {
+        .integer => |value| if (value >= 0) @as(?u64, @intCast(value)) else null,
+        else => null,
+    } orelse {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete id is invalid");
+        return;
+    };
+    const exit_code = switch (exit_value) {
+        .integer => |value| if (value >= std.math.minInt(i32) and value <= std.math.maxInt(i32)) @as(?i32, @intCast(value)) else null,
+        else => null,
+    } orelse {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete exitCode is invalid");
+        return;
+    };
+    const stdout_hex = if (fields.get("stdoutHex")) |value| switch (value) {
+        .string => |string| string,
+        else => null,
+    } else "";
+    const stderr_hex = if (fields.get("stderrHex")) |value| switch (value) {
+        .string => |string| string,
+        else => null,
+    } else "";
+    if (stdout_hex == null or stderr_hex == null or stdout_hex.?.len > 8 * 1024 * 1024 or stderr_hex.?.len > 8 * 1024 * 1024) {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete output is invalid or too large");
+        return;
+    }
+    const stdout_bytes = decodeHexAlloc(runner.gpa, stdout_hex.?) catch {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "stdoutHex is invalid");
+        return;
+    };
+    defer runner.gpa.free(stdout_bytes);
+    const stderr_bytes = decodeHexAlloc(runner.gpa, stderr_hex.?) catch {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "stderrHex is invalid");
+        return;
+    };
+    defer runner.gpa.free(stderr_bytes);
+
+    runner.applicationComplete(id, exit_code, stdout_bytes, stderr_bytes);
+    runner.sendPlatformResponse(message.response_handle, "[null]");
 }
 
 pub fn handleSurfaceChannelMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8) void {

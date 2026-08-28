@@ -16,6 +16,7 @@
   zlib,
   fontconfig,
   freetype,
+  dbus,
   stdenv,
   flutter,
   depot-tools,
@@ -72,6 +73,7 @@ in
       zlib
       fontconfig
       freetype
+      dbus
       stdenv.cc.cc.lib
 
       # gclient 的运行环境 (zig build pull-flutter 需要)
@@ -88,6 +90,7 @@ in
 
     FUSHELL_NIX_FLUTTER_SDK = "${flutter}";
     FUSHELL_WAYLAND_PROTOCOLS = "${wayland-protocols}/share/wayland-protocols";
+    FUSHELL_DBUS_LIB_DIR = "${dbus.lib}/lib";
 
     shellHook = ''
       export PATH="$PATH:$PWD/zig-out/bin"
@@ -100,6 +103,7 @@ in
         zlib
         fontconfig
         freetype
+        dbus
         stdenv.cc.cc.lib
       ]}"
       export LD_LIBRARY_PATH="$FUSHELL_NIX_LIBRARY_PATH:''${LD_LIBRARY_PATH:-}"

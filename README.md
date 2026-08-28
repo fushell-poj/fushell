@@ -66,12 +66,44 @@ DevTools is enabled.
 
 Release mode does not expose the VM Service and rejects DevTools options.
 
+## Single-instance applications
+
+Applications default to multiple independent processes. To opt into a
+single-instance daemon, add `fushell.json` at the Flutter project root:
+
+```json
+{
+  "schemaVersion": 1,
+  "applicationId": "dev.example.MyApp",
+  "instance": "single"
+}
+```
+
+The first process owns the application ID on the session D-Bus and starts the
+headless Flutter engine. Later executions forward their opaque argv and working
+directory to the daemon without initializing Flutter, Wayland, or EGL. Command
+syntax and behavior remain entirely application-defined through
+`FushellApplication.run`; fushell does not reserve application arguments.
+Single-instance bundles fail explicitly when no session D-Bus is available.
+
+The bundle contains its validated application manifest and `libdbus-1` runtime;
+the internal runner locates those resources relative to itself. See
+[`examples/singleton_app`](examples/singleton_app) for a complete daemon that
+implements application-defined `open`, `list`, `close`, `status`, `quit`, and
+`help` commands while managing a dynamic `ViewCollection`.
+
 ## Validation
 
 ```bash
 zig build test
+zig build integration-test
 zig build -Doptimize=ReleaseFast
 ```
+
+The integration step uses a private session bus and headless Cage compositor.
+It covers primary/secondary startup, binary argv and cwd transport, output and
+exit-code propagation, application-defined window commands, signal handling,
+ownership races, secondary fast-path loading, and idle CPU/FD stability.
 
 See [`packages/fushell/README.md`](packages/fushell/README.md) for the Dart API,
 window ownership model, parent relationships, layer surfaces, and multi-view

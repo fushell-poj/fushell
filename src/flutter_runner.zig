@@ -15,6 +15,7 @@ const flutter_task_queue = @import("flutter_task_queue.zig");
 const flutter_compositor = @import("flutter_compositor.zig");
 const window_registry = @import("window_registry.zig");
 const bundle_loader = @import("bundle_loader.zig");
+const application_broker = @import("application_broker.zig");
 const service_uri = @import("service_uri.zig");
 const WindowEntry = window_registry.Entry;
 const WindowRegistry = window_registry.Registry;
@@ -116,6 +117,11 @@ pub const Options = struct {
     vm_service_port: ?u16 = null,
     /// SIGINT/SIGTERM notification owned by the process entry point.
     shutdown_fd: c_int = -1,
+    /// Optional single-instance D-Bus broker owned by the process entry point.
+    application_broker: ?*application_broker.Broker = null,
+    /// Opaque application argv delivered to Dart main in multiple-instance mode.
+    /// Single-instance mode leaves this empty and uses the application channel.
+    dart_entrypoint_arguments: []const []const u8 = &.{},
 };
 
 const Runner = struct {
@@ -141,6 +147,11 @@ const Runner = struct {
     first_present_logged: bool = false,
     /// Stack-owned guard for the synchronous platform message currently being dispatched.
     active_platform_response: ?*platform_channels.Response = null,
+    application_broker: ?*application_broker.Broker = null,
+    application_ready: bool = false,
+    /// A command handler may request process exit before its D-Bus reply is sent.
+    /// Defer the event-loop stop until applicationComplete flushes that reply.
+    exit_after_application_command: bool = false,
 
     // ── compositor 呈现路径 ────────────────────────
     /// backing store 纹理 → 窗口 surface 的 GLES2 blit 模块。
@@ -556,9 +567,79 @@ const Runner = struct {
                 @intCast(@min((self.repeat_next_time_ns - now_nanos + 999_999) / 1_000_000, @as(u64, std.math.maxInt(i32))));
             if (timeout < 0 or repeat_timeout < timeout) timeout = repeat_timeout;
         }
+        if (self.application_broker) |broker| {
+            const application_timeout = broker.nextTimeoutMs();
+            if (application_timeout >= 0 and (timeout < 0 or application_timeout < timeout)) timeout = application_timeout;
+        }
         return timeout;
     }
+
+    pub fn applicationSetReady(self: *Runner) void {
+        self.application_ready = true;
+        self.dispatchNextApplicationInvocation() catch |err| {
+            std.debug.print("[error] failed to dispatch application invocation: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    pub fn applicationComplete(self: *Runner, id: u64, exit_code: i32, stdout_bytes: []const u8, stderr_bytes: []const u8) void {
+        const broker = self.application_broker orelse return;
+        broker.complete(id, .{
+            .exit_code = exit_code,
+            .stdout = @constCast(stdout_bytes),
+            .stderr = @constCast(stderr_bytes),
+        }) catch |err| {
+            std.debug.print("[error] failed to complete application invocation: {s}\n", .{@errorName(err)});
+        };
+        if (self.exit_after_application_command) {
+            self.exit_after_application_command = false;
+            self.quit_requested.store(true, .release);
+            return;
+        }
+        self.dispatchNextApplicationInvocation() catch |err| {
+            std.debug.print("[error] failed to dispatch queued application invocation: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    fn dispatchNextApplicationInvocation(self: *Runner) !void {
+        if (!self.application_ready or self.engine == null) return;
+        const broker = self.application_broker orelse return;
+        const invocation = broker.nextInvocation() orelse return;
+        const payload = try encodeApplicationInvocation(self.gpa, invocation);
+        defer self.gpa.free(payload);
+        self.sendToEngine(platform_channels.application_channel_name, payload);
+    }
 };
+
+fn appendHex(gpa: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    const alphabet = "0123456789abcdef";
+    try output.ensureUnusedCapacity(gpa, bytes.len * 2);
+    for (bytes) |byte| {
+        output.appendAssumeCapacity(alphabet[byte >> 4]);
+        output.appendAssumeCapacity(alphabet[byte & 0x0f]);
+    }
+}
+
+fn encodeApplicationInvocation(gpa: std.mem.Allocator, invocation: *const application_broker.InvocationData) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(gpa);
+
+    try output.appendSlice(gpa, "{\"method\":\"dispatch\",\"args\":{\"id\":");
+    var id_buffer: [32]u8 = undefined;
+    try output.appendSlice(gpa, try std.fmt.bufPrint(&id_buffer, "{d}", .{invocation.id}));
+    try output.appendSlice(gpa, ",\"isInitial\":");
+    try output.appendSlice(gpa, if (invocation.is_initial) "true" else "false");
+    try output.appendSlice(gpa, ",\"cwdHex\":\"");
+    try appendHex(gpa, &output, invocation.cwd);
+    try output.appendSlice(gpa, "\",\"argumentsHex\":[");
+    for (invocation.arguments, 0..) |argument, index| {
+        if (index != 0) try output.append(gpa, ',');
+        try output.append(gpa, '"');
+        try appendHex(gpa, &output, argument);
+        try output.append(gpa, '"');
+    }
+    try output.appendSlice(gpa, "]}}\n");
+    return output.toOwnedSlice(gpa);
+}
 
 pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     vm_service.clear(options.io);
@@ -630,7 +711,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
 
     var task_queue = try flutter_task_queue.TaskQueue.init(gpa, options.io);
     defer task_queue.deinit();
-    var runner: Runner = .{ .gpa = gpa, .state = state, .registry = &registry, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .task_queue = &task_queue, .engine_library = options.engine_library, .bundle_path = options.bundle_path };
+    var runner: Runner = .{ .gpa = gpa, .state = state, .registry = &registry, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .task_queue = &task_queue, .engine_library = options.engine_library, .bundle_path = options.bundle_path, .application_broker = options.application_broker };
     runner.ime = state.ime;
     runner.text_client = text_input.Client.init(gpa);
     runner.text_client.send_fn = textInputSendCallback;
@@ -677,6 +758,20 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     custom_task_runners.struct_size = @sizeOf(c.FlutterCustomTaskRunners);
     custom_task_runners.platform_task_runner = &platform_task_runner;
 
+    var dart_argument_strings = try gpa.alloc([:0]u8, options.dart_entrypoint_arguments.len);
+    defer gpa.free(dart_argument_strings);
+    var initialized_dart_arguments: usize = 0;
+    errdefer for (dart_argument_strings[0..initialized_dart_arguments]) |argument| gpa.free(argument);
+    for (options.dart_entrypoint_arguments, 0..) |argument, index| {
+        dart_argument_strings[index] = try gpa.dupeZ(u8, argument);
+        initialized_dart_arguments += 1;
+    }
+    defer for (dart_argument_strings) |argument| gpa.free(argument);
+
+    var dart_argument_pointers = try gpa.alloc([*c]const u8, dart_argument_strings.len);
+    defer gpa.free(dart_argument_pointers);
+    for (dart_argument_strings, 0..) |argument, index| dart_argument_pointers[index] = argument.ptr;
+
     var project_args: c.FlutterProjectArgs = std.mem.zeroes(c.FlutterProjectArgs);
     project_args.struct_size = @sizeOf(c.FlutterProjectArgs);
     project_args.assets_path = bundle.assets_path.ptr;
@@ -688,6 +783,10 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     project_args.shutdown_dart_vm_when_done = true;
     project_args.log_message_callback = logMessageCallback;
     project_args.log_tag = "fushell";
+    if (dart_argument_pointers.len > 0) {
+        project_args.dart_entrypoint_argc = @intCast(dart_argument_pointers.len);
+        project_args.dart_entrypoint_argv = dart_argument_pointers.ptr;
+    }
     if (is_aot) project_args.aot_data = aot_data;
 
     // The Flutter tool enables checked mode for debug engines. Without this
@@ -742,18 +841,23 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
 
     std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
     var event_loop_error: ?anyerror = null;
-    host.runEventLoop(&runner.quit_requested, "Engine event loop active (headless shell).", .{
+    host.runEventLoop(gpa, &runner.quit_requested, "Engine event loop active (headless shell).", .{
         .fd = task_queue.wake_fd,
         .context = &runner,
         .tick = flutterTaskPumpCallback,
         .timeout_ms = flutterTaskTimeoutCallback,
         .consume_wake = flutterTaskWakeCallback,
         .auxiliary_fd = clipboardReadFdCallback,
+        .external_fd_count = applicationPollFdCountCallback,
+        .fill_external_fds = applicationPollFdsCallback,
+        .handle_external_fds = applicationPollReadyCallback,
         .shutdown_fd = options.shutdown_fd,
     }) catch |err| {
         event_loop_error = err;
         std.debug.print("[error] engine event loop stopped: {s}\n", .{@errorName(err)});
     };
+
+    if (runner.application_broker) |broker| broker.failPending("application is shutting down\n");
 
     if (runner.pending_clipboard_read) |pending| {
         runner.clipboard.cancelReadText();
@@ -801,6 +905,24 @@ fn clipboardReadFdCallback(context: ?*anyopaque) c_int {
     return runner.clipboard.requestFd() orelse -1;
 }
 
+fn applicationPollFdCountCallback(context: ?*anyopaque) usize {
+    const runner = runnerFromContext(context);
+    const broker = runner.application_broker orelse return 0;
+    return broker.pollFdCount();
+}
+
+fn applicationPollFdsCallback(context: ?*anyopaque, destination: []std.posix.pollfd) usize {
+    const runner = runnerFromContext(context);
+    const broker = runner.application_broker orelse return 0;
+    return broker.fillPollFds(destination);
+}
+
+fn applicationPollReadyCallback(context: ?*anyopaque, ready: []const std.posix.pollfd) !void {
+    const runner = runnerFromContext(context);
+    const broker = runner.application_broker orelse return;
+    try broker.handlePollFds(ready);
+}
+
 fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_data: ?*anyopaque) callconv(.c) void {
     const context = user_data orelse {
         std.debug.print("[error] Flutter task post received null context\n", .{});
@@ -817,6 +939,10 @@ test "Flutter task callbacks reject null context" {
 
 fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     const runner = fromUserData(user_data);
+    if (runner.application_broker) |broker| {
+        try broker.pump();
+        try runner.dispatchNextApplicationInvocation();
+    }
     processViewLifecycleResults(runner);
     processCompositorCloseRequests(runner);
     runner.checkKeyRepeat();
@@ -903,6 +1029,7 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
         .surface => platform_channels.handleSurfaceChannelMessage(runner, message, payload),
         .text_input => platform_channels.handleTextInputMessage(runner, message, payload, sendGuardedPlatformResponse),
         .platform => platform_channels.handlePlatformChannelMessage(runner, message, payload, sendGuardedPlatformResponse),
+        .application => platform_channels.handleApplicationChannelMessage(runner, message, payload),
         .unsupported => {
             std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
             runner.sendPlatformResponse(message.response_handle, "");
@@ -1206,6 +1333,13 @@ pub fn updateWindowSurface(runner: *Runner, response_handle: ?*const c.FlutterPl
 /// process.exit: 停止事件循环 → run() 退出序列 (关引擎 → 毁窗口 → 断连接)。
 pub fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.ExitRequest) !void {
     sendSurfaceSuccess(runner, response_handle, request.id);
+    if (runner.application_broker) |broker| {
+        if (broker.hasActiveInvocation()) {
+            runner.exit_after_application_command = true;
+            std.debug.print("process.exit({d}) requested; deferring shutdown until the active command reply is sent.\n", .{request.code});
+            return;
+        }
+    }
     runner.quit_requested.store(true, .release);
     std.debug.print("process.exit({d}) requested; stopping event loop.\n", .{request.code});
 }

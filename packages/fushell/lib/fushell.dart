@@ -1,11 +1,147 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 
 const String _surfaceChannel = 'dev.fushell/surface';
+const String _applicationChannel = 'dev.fushell/application';
+
+/// One process invocation delivered by Fushell's native application broker.
+///
+/// [arguments] and [workingDirectory] preserve the original Unix bytes. The
+/// convenience text accessors use UTF-8 and replace malformed sequences.
+final class FushellCommandInvocation {
+  const FushellCommandInvocation({
+    required this.arguments,
+    required this.workingDirectory,
+    required this.isInitial,
+  });
+
+  final List<Uint8List> arguments;
+  final Uint8List workingDirectory;
+
+  /// Whether this invocation started the primary daemon process.
+  final bool isInitial;
+
+  List<String> get textArguments => arguments
+      .map((Uint8List value) => utf8.decode(value, allowMalformed: true))
+      .toList(growable: false);
+
+  String get textWorkingDirectory =>
+      utf8.decode(workingDirectory, allowMalformed: true);
+}
+
+/// Result returned to the secondary process that invoked the application.
+final class FushellCommandResult {
+  FushellCommandResult({
+    this.exitCode = 0,
+    Uint8List? stdout,
+    Uint8List? stderr,
+  }) : stdout = stdout ?? Uint8List(0),
+       stderr = stderr ?? Uint8List(0) {
+    if (exitCode < 0 || exitCode > 255) {
+      throw RangeError.range(exitCode, 0, 255, 'exitCode');
+    }
+  }
+
+  factory FushellCommandResult.text({
+    int exitCode = 0,
+    String stdout = '',
+    String stderr = '',
+  }) => FushellCommandResult(
+    exitCode: exitCode,
+    stdout: Uint8List.fromList(utf8.encode(stdout)),
+    stderr: Uint8List.fromList(utf8.encode(stderr)),
+  );
+
+  final int exitCode;
+  final Uint8List stdout;
+  final Uint8List stderr;
+}
+
+typedef FushellCommandHandler =
+    FutureOr<FushellCommandResult> Function(FushellCommandInvocation command);
+
+/// Registers the application-owned command handler used by single-instance
+/// bundles. Fushell transports argv/cwd but never parses or declares commands.
+final class FushellApplication {
+  FushellApplication._();
+
+  static const MethodChannel _channel = MethodChannel(
+    _applicationChannel,
+    JSONMethodCodec(),
+  );
+  static FushellCommandHandler? _handler;
+
+  /// Installs [onCommand] and declares the Dart side ready for queued process
+  /// invocations. Calling this again replaces the handler without changing the
+  /// native singleton ownership.
+  static Future<void> run({required FushellCommandHandler onCommand}) async {
+    WidgetsFlutterBinding.ensureInitialized();
+    _handler = onCommand;
+    _channel.setMethodCallHandler(_handleMethodCall);
+    await _channel.invokeMethod<void>('ready');
+  }
+
+  static Future<void> _handleMethodCall(MethodCall call) async {
+    if (call.method != 'dispatch' || call.arguments is! Map<Object?, Object?>) {
+      throw PlatformException(
+        code: 'ApplicationProtocol',
+        message: 'unsupported application invocation',
+      );
+    }
+    final Map<Object?, Object?> fields =
+        call.arguments! as Map<Object?, Object?>;
+    final Object? idValue = fields['id'];
+    final Object? cwdValue = fields['cwdHex'];
+    final Object? argumentsValue = fields['argumentsHex'];
+    final Object? initialValue = fields['isInitial'];
+    if (idValue is! int ||
+        cwdValue is! String ||
+        argumentsValue is! List<Object?> ||
+        initialValue is! bool) {
+      throw PlatformException(
+        code: 'ApplicationProtocol',
+        message: 'malformed application invocation',
+      );
+    }
+
+    final FushellCommandInvocation invocation = FushellCommandInvocation(
+      arguments: argumentsValue
+          .map((Object? value) {
+            if (value is! String) {
+              throw const FormatException('argument is not a hex string');
+            }
+            return _decodeHex(value);
+          })
+          .toList(growable: false),
+      workingDirectory: _decodeHex(cwdValue),
+      isInitial: initialValue,
+    );
+
+    FushellCommandResult result;
+    try {
+      final FushellCommandHandler handler = _handler!;
+      result = await handler(invocation);
+    } catch (error, stackTrace) {
+      result = FushellCommandResult.text(
+        exitCode: 70,
+        stderr: 'Unhandled application command error: $error\n$stackTrace\n',
+      );
+    }
+
+    await _channel.invokeMethod<void>('complete', <String, Object?>{
+      'id': idValue,
+      'exitCode': result.exitCode,
+      'stdoutHex': _encodeHex(result.stdout),
+      'stderrHex': _encodeHex(result.stderr),
+    });
+  }
+}
 
 /// 窗口管理: fushell 以无头引擎启动 (无隐式窗口), 窗口全部由 Dart 通过
 /// [FushellWindow.openWindow] 创建。每个窗口对应一个 Flutter view
@@ -365,6 +501,28 @@ final class FushellSurfaceException implements Exception {
 
   @override
   String toString() => 'FushellSurfaceException($code): $message';
+}
+
+Uint8List _decodeHex(String value) {
+  if (value.length.isOdd) throw const FormatException('odd-length hex data');
+  final Uint8List bytes = Uint8List(value.length ~/ 2);
+  for (var index = 0; index < bytes.length; index++) {
+    final int? byte = int.tryParse(
+      value.substring(index * 2, index * 2 + 2),
+      radix: 16,
+    );
+    if (byte == null) throw const FormatException('invalid hex data');
+    bytes[index] = byte;
+  }
+  return bytes;
+}
+
+String _encodeHex(Uint8List bytes) {
+  final StringBuffer output = StringBuffer();
+  for (final int byte in bytes) {
+    output.write(byte.toRadixString(16).padLeft(2, '0'));
+  }
+  return output.toString();
 }
 
 ByteData _encodeJson(Map<String, Object?> value) {

@@ -54,6 +54,11 @@ pub const EventLoopSource = struct {
     /// The next loop tick consumes readiness, keeping subsystem state on the
     /// platform thread instead of introducing worker-thread completion races.
     auxiliary_fd: ?*const fn (context: ?*anyopaque) c_int = null,
+    /// Optional event sources (for example D-Bus watches) owned by the same
+    /// platform thread. The count/fill/handle callbacks MUST preserve descriptor order.
+    external_fd_count: ?*const fn (context: ?*anyopaque) usize = null,
+    fill_external_fds: ?*const fn (context: ?*anyopaque, destination: []std.posix.pollfd) usize = null,
+    handle_external_fds: ?*const fn (context: ?*anyopaque, ready: []const std.posix.pollfd) anyerror!void = null,
     /// Process shutdown notification (SIGINT/SIGTERM). A negative descriptor
     /// disables it; readiness makes the event loop stop without dispatching
     /// further Wayland work.
@@ -481,8 +486,11 @@ pub const Host = struct {
         return self.state == .ready;
     }
 
-    pub fn runEventLoop(self: *Host, quit: *const std.atomic.Value(bool), message: []const u8, source: EventLoopSource) !void {
+    pub fn runEventLoop(self: *Host, allocator: std.mem.Allocator, quit: *const std.atomic.Value(bool), message: []const u8, source: EventLoopSource) !void {
         std.debug.print("{s}\n", .{message});
+        var fds: std.ArrayList(std.posix.pollfd) = .empty;
+        defer fds.deinit(allocator);
+
         while (!quit.load(.acquire)) {
             try source.tick(source.context);
             if (quit.load(.acquire)) break;
@@ -490,41 +498,56 @@ pub const Host = struct {
             if (quit.load(.acquire)) break;
             self.display_state.flush();
 
-            var fds = [_]std.posix.pollfd{
-                .{
-                    .fd = self.display_state.display.?.getFd(),
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
-                .{
-                    .fd = source.fd,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
-                .{
-                    .fd = if (source.auxiliary_fd) |get_fd| get_fd(source.context) else -1,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
-                .{
-                    .fd = source.shutdown_fd,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
+            const base_fd_count = 4;
+            const requested_external_count = if (source.external_fd_count) |count|
+                count(source.context)
+            else
+                0;
+            try fds.resize(allocator, base_fd_count + requested_external_count);
+            @memset(fds.items, .{ .fd = -1, .events = 0, .revents = 0 });
+            fds.items[0] = .{
+                .fd = self.display_state.display.?.getFd(),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
             };
-            _ = std.posix.poll(&fds, source.timeout_ms(source.context)) catch return error.EventLoopPollFailed;
-            if ((fds[3].revents & std.posix.POLL.IN) != 0) break;
-            if ((fds[3].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.ShutdownPollFailed;
-            if ((fds[1].revents & std.posix.POLL.IN) != 0) source.consume_wake(source.context);
-            if ((fds[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.TaskWakePollFailed;
-            if ((fds[2].revents & std.posix.POLL.NVAL) != 0) return error.AuxiliaryPollFailed;
-            if ((fds[0].revents & std.posix.POLL.IN) != 0) {
+            fds.items[1] = .{
+                .fd = source.fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+            fds.items[2] = .{
+                .fd = if (source.auxiliary_fd) |get_fd| get_fd(source.context) else -1,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+            fds.items[3] = .{
+                .fd = source.shutdown_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+            const external_count = if (source.fill_external_fds) |fill|
+                fill(source.context, fds.items[base_fd_count..])
+            else
+                0;
+            if (external_count != requested_external_count) return error.ExternalFdCountChanged;
+            _ = std.posix.poll(fds.items, source.timeout_ms(source.context)) catch return error.EventLoopPollFailed;
+            if ((fds.items[3].revents & std.posix.POLL.IN) != 0) break;
+            if ((fds.items[3].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.ShutdownPollFailed;
+            if ((fds.items[1].revents & std.posix.POLL.IN) != 0) source.consume_wake(source.context);
+            if ((fds.items[1].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.TaskWakePollFailed;
+            if ((fds.items[2].revents & std.posix.POLL.NVAL) != 0) return error.AuxiliaryPollFailed;
+            if ((fds.items[0].revents & std.posix.POLL.IN) != 0) {
                 // 单线程模型: 主线程唯一预约读 (无需多线程原子读竞争处理)。
                 if (self.display_state.display.?.prepareReadQueue(self.sharedQueue())) {
                     if (self.display_state.display.?.readEvents() != .SUCCESS) return error.WaylandDispatchFailed;
                 }
             }
-            if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.WaylandDisplayPollFailed;
+            if ((fds.items[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return error.WaylandDisplayPollFailed;
+            if (external_count > 0) {
+                if (source.handle_external_fds) |handle| {
+                    try handle(source.context, fds.items[base_fd_count..]);
+                }
+            }
         }
     }
 

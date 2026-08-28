@@ -11,3 +11,4 @@ zig-pkg
 # Local Flutter raw engine artifacts (user-managed, not vendored)
 flutter_engine_dir
 .dart_tool
+build

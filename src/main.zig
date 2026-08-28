@@ -6,15 +6,9 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const runtime_arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(runtime_arena);
-
-    if (args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) {
-        printUsage();
-        return;
-    }
-    if (args.len != 1) {
-        printUsage();
-        std.process.exit(1);
-    }
+    const application_arguments = try runtime_arena.alloc([]const u8, args.len - 1);
+    for (args[1..], application_arguments) |argument, *destination| destination.* = argument;
+    const cwd = try std.process.currentPathAlloc(init.io, runtime_arena);
 
     // 自动定位: /proc/self/exe 所在目录 = bundle 根
     // (处理 symlink/改名/相对路径, 比 argv[0] 可靠)
@@ -36,26 +30,19 @@ pub fn main(init: std.process.Init) !void {
     };
     defer signal_watcher.deinit();
 
-    player.runPlayer(gpa, init.io, bundle_root, null, signal_watcher.fd) catch |err| {
+    const exit_status = player.runPlayer(
+        gpa,
+        init.io,
+        bundle_root,
+        null,
+        signal_watcher.fd,
+        application_arguments,
+        cwd,
+    ) catch |err| {
+        if (signal_watcher.triggered()) std.process.exit(130);
         std.debug.print("fushell-runner failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     if (signal_watcher.triggered()) std.process.exit(130);
-}
-
-fn printUsage() void {
-    std.debug.print("usage: fushell-runner\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("Plays the Fushell app bundle located in the same directory as this executable.\n", .{});
-    std.debug.print("The Flutter engine belongs to the app bundle.\n", .{});
-    std.debug.print("The app starts headless (no window); windows are created by Dart\n", .{});
-    std.debug.print("via FushellWindow.openWindow (one Flutter view per window). The process\n", .{});
-    std.debug.print("runs until the app calls FushellProcess.exit (closing all windows does\n", .{});
-    std.debug.print("not exit the process).\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("required bundle layout (same directory as this executable):\n", .{});
-    std.debug.print("  <dir>/lib/libflutter_engine.so\n", .{});
-    std.debug.print("  <dir>/data/icudtl.dat\n", .{});
-    std.debug.print("  debug/JIT: <dir>/data/flutter_assets/kernel_blob.bin\n", .{});
-    std.debug.print("  release/AOT: <dir>/lib/libapp.so + lib/libapp.so.symbols\n", .{});
+    if (exit_status != 0) std.process.exit(exit_status);
 }

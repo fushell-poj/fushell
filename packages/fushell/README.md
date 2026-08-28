@@ -56,6 +56,85 @@ loopback-only, and a requested busy port is reported as an error before the
 application starts. DevTools and VM Service options are not available for
 release runs.
 
+## Single-instance daemon and application commands
+
+Multiple independent processes are the default; in that mode the runner passes
+application arguments through unchanged to `main(List<String> arguments)`. Opt
+into a single-instance application with a project-root `fushell.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "applicationId": "dev.example.MyApp",
+  "instance": "single"
+}
+```
+
+The first execution owns `dev.example.MyApp` on the session D-Bus and starts the
+headless Flutter engine. Later executions forward argv and cwd to the daemon
+without initializing Flutter, Wayland, or EGL. Fushell treats argv as opaque
+bytes: the application owns all command names, parsing, help, output, and exit
+codes.
+
+```dart
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/widgets.dart';
+import 'package:fushell/fushell.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await FushellApplication.run(
+    onCommand: (FushellCommandInvocation command) async {
+      final args = command.arguments
+          .map((bytes) => utf8.decode(bytes))
+          .toList(growable: false);
+
+      switch (args) {
+        case ['open', 'window']:
+          final id = await FushellWindow.openWindow(
+            title: 'My App',
+            appId: 'dev.example.MyApp',
+          );
+          // Add the returned FlutterView to the application's ViewCollection.
+          return FushellCommandResult.text(stdout: '$id\n');
+        case ['quit']:
+          // Let native send this command's reply before stopping the daemon.
+          Timer(const Duration(milliseconds: 50), FushellProcess.exit);
+          return FushellCommandResult.text(stdout: 'stopping\n');
+        default:
+          return FushellCommandResult.text(
+            exitCode: 64,
+            stderr: 'unknown command\n',
+          );
+      }
+    },
+  );
+}
+```
+
+For example, after the first process is running headlessly:
+
+```bash
+./my_app open window
+./my_app quit
+```
+
+`FushellCommandInvocation.arguments` and `workingDirectory` preserve raw Unix
+bytes; applications may choose their own decoding policy. `isInitial` marks the
+first process invocation. Commands are processed in arrival order with one
+active callback at a time. Secondary processes mirror the returned stdout,
+stderr, and exit code. A handler exception becomes exit code 70. If a callback
+exceeds 30 seconds, its caller receives 124; the late completion is ignored and
+later callbacks remain serialized behind it rather than overlapping. Closing
+every window does not stop the single-instance daemon.
+
+Single-instance startup fails explicitly if the session D-Bus is unavailable.
+The runner uses a private native `libdbus-1` connection; applications do not
+need a Dart D-Bus package for this protocol. A complete dynamic-window example
+is available at [`examples/singleton_app`](../../examples/singleton_app).
+
 ## Creating windows
 
 ```dart

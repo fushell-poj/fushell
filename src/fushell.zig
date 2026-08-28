@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const application_config = @import("application_config.zig");
 const flutter = @import("flutter_embedder.zig");
 const display_state = @import("wl_display_state.zig");
 const egl = @import("wayland_egl_host.zig");
@@ -18,6 +19,7 @@ comptime {
 }
 
 const embedded_runner = @embedFile("fushell_runner_bin");
+const embedded_dbus_runtime = @embedFile("dbus_runtime");
 
 /// VM service URI 轮询间隔 (ns)。URI 在引擎启动日志回调中写入, 通常在
 /// 引擎 run 后几百 ms 内就绪; 50ms 轮询兼顾及时性与低开销。
@@ -54,6 +56,7 @@ const Options = struct {
     devtools: bool,
     launch_browser: bool,
     vm_service_port: ?u16,
+    application_args: []const [:0]const u8,
     /// 第一个位置参数是目录时: 视为工作目录 (chdir 后打包)。
     workdir: ?[]const u8 = null,
     entrypoint: []const u8,
@@ -110,11 +113,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     if (options.command == .run) {
-        runBundle(gpa, io, options) catch |err| {
+        const exit_status = runBundle(gpa, io, options) catch |err| {
             if (err == error.UserInterrupt) std.process.exit(130);
             std.debug.print("[error] fushell run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
+        if (exit_status != 0) std.process.exit(exit_status);
     }
 }
 
@@ -139,13 +143,14 @@ fn resolveOptions(runtime_arena: std.mem.Allocator, parsed: cli.Options) Options
         .devtools = parsed.devtools,
         .launch_browser = parsed.launch_browser,
         .vm_service_port = parsed.vm_service_port,
+        .application_args = parsed.application_args,
         .workdir = workdir,
         .entrypoint = entrypoint,
         .bundle_dir = bundle_dir,
     };
 }
 
-fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !void {
+fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !u8 {
     std.debug.print("running {s}...\n", .{options.bundle_dir});
     hot_reload_stop.store(false, .release);
 
@@ -188,8 +193,22 @@ fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !void {
     }
 
     const vm_service_port: ?u16 = if (options.vmServiceEnabled()) options.vm_service_port orelse 0 else null;
-    try player.runPlayer(gpa, io, options.bundle_dir, vm_service_port, signal_watcher.fd);
+    const cwd = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd);
+    const application_args = try gpa.alloc([]const u8, options.application_args.len);
+    defer gpa.free(application_args);
+    for (options.application_args, 0..) |argument, index| application_args[index] = argument;
+    const exit_status = try player.runPlayer(
+        gpa,
+        io,
+        options.bundle_dir,
+        vm_service_port,
+        signal_watcher.fd,
+        application_args,
+        cwd,
+    );
     if (signal_watcher.triggered()) return error.UserInterrupt;
+    return exit_status;
 }
 
 /// 热重载线程: 等待引擎报告 VM service URI → 连接 → getVM 验证。
@@ -481,6 +500,9 @@ fn buildBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !void {
 }
 
 fn buildDebugBundle(gpa: std.mem.Allocator, io: std.Io, entrypoint: []const u8, bundle_dir: []const u8) !void {
+    var app_config = try application_config.loadProject(gpa, io);
+    defer app_config.deinit(gpa);
+
     const target_platform = targetPlatform();
     const flutter_root = try queryFlutterRoot(gpa, io);
     defer gpa.free(flutter_root);
@@ -509,7 +531,9 @@ fn buildDebugBundle(gpa: std.mem.Allocator, io: std.Io, entrypoint: []const u8, 
     try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
     try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
     try writeEmbeddedEngine(io, .debug, engine_library);
+    try writeDbusRuntime(gpa, io, lib_dir);
     try writeBundleEntry(gpa, io, bundle_dir);
+    try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 
     std.debug.print("fushell bundle ready: {s}\n", .{bundle_dir});
 }
@@ -517,6 +541,9 @@ fn buildDebugBundle(gpa: std.mem.Allocator, io: std.Io, entrypoint: []const u8, 
 /// release/profile 共用: AOT 编译 app (assemble) + 组装 AOT bundle。
 /// assemble target 名与 -dBuildMode 按模式派生 (release_bundle_... / profile_bundle_...)。
 fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []const u8, bundle_dir: []const u8) !void {
+    var app_config = try application_config.loadProject(gpa, io);
+    defer app_config.deinit(gpa);
+
     const target_platform = targetPlatform();
     const flutter_root = try queryFlutterRoot(gpa, io);
     defer gpa.free(flutter_root);
@@ -592,7 +619,9 @@ fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []
     try runCommand(gpa, io, &.{ "cp", app_so, app_so_dest });
     try runCommand(gpa, io, &.{ "cp", debug_info, debug_info_dest });
     try writeEmbeddedEngine(io, mode, engine_library);
+    try writeDbusRuntime(gpa, io, lib_dir);
     try writeBundleEntry(gpa, io, bundle_dir);
+    try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 
     std.debug.print("fushell {s} bundle ready: {s}\n", .{ @tagName(mode), bundle_dir });
 }
@@ -669,6 +698,14 @@ fn runCommand(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !voi
         },
         .unknown => return error.CommandFailed,
     }
+}
+
+fn writeDbusRuntime(gpa: std.mem.Allocator, io: std.Io, output_lib_dir: []const u8) !void {
+    const destination_path = try std.fs.path.join(gpa, &.{ output_lib_dir, "libdbus-1.so.3" });
+    defer gpa.free(destination_path);
+    var file = try std.Io.Dir.cwd().createFile(io, destination_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, embedded_dbus_runtime);
 }
 
 fn writeEmbeddedEngine(io: std.Io, mode: Mode, path: []const u8) !void {

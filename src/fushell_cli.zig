@@ -23,6 +23,8 @@ pub const Options = struct {
     devtools: bool = false,
     launch_browser: bool = true,
     vm_service_port: ?u16 = null,
+    /// Opaque application argv after `--`; parsed only by the Dart application.
+    application_args: []const [:0]const u8 = &.{},
 
     pub fn positional(self: Options, index: usize) ?[]const u8 {
         return if (index < self.positional_count) self.positionals[index] else null;
@@ -56,9 +58,14 @@ pub fn parse(args: []const [:0]const u8) !Options {
 
     var mode_seen = false;
     var positional_only = false;
-    for (args[1..]) |arg_z| {
-        const arg: []const u8 = arg_z;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg: []const u8 = args[index];
         if (!positional_only and std.mem.eql(u8, arg, "--")) {
+            if (options.command == .run) {
+                options.application_args = args[index + 1 ..];
+                break;
+            }
             positional_only = true;
             continue;
         }
@@ -192,6 +199,24 @@ test "rejects conflicting modes and misplaced run options" {
 
     const sdk_mode = argv(&.{ "sdk", "--debug" });
     try std.testing.expectError(error.OptionNotSupportedBySdk, parse(&sdk_mode));
+}
+
+test "run forwards opaque application arguments after separator" {
+    const args = argv(&.{
+        "run",
+        "--debug",
+        "./app",
+        "--",
+        "open",
+        "window",
+        "--application-owned",
+    });
+    const options = try parse(&args);
+    try std.testing.expectEqualStrings("./app", options.positional(0).?);
+    try std.testing.expectEqual(@as(usize, 3), options.application_args.len);
+    try std.testing.expectEqualStrings("open", options.application_args[0]);
+    try std.testing.expectEqualStrings("window", options.application_args[1]);
+    try std.testing.expectEqualStrings("--application-owned", options.application_args[2]);
 }
 
 test "enforces mode-specific VM service rules" {

@@ -56,6 +56,13 @@ pub fn build(b: *std.Build) void {
         .preferred_link_mode = .dynamic,
         .search_strategy = .mode_first,
     };
+    const dbus_lib_dir = b.option([]const u8, "dbus-lib-dir", "Directory containing libdbus-1.so.3") orelse
+        b.graph.environ_map.get("FUSHELL_DBUS_LIB_DIR") orelse {
+        std.debug.print("error: D-Bus runtime not configured; enter `nix develop` or pass -Ddbus-lib-dir=<path>\n", .{});
+        std.process.exit(1);
+    };
+    const dbus_runtime_so = b.pathJoin(&.{ dbus_lib_dir, "libdbus-1.so.3" });
+    checkRuntimeFile(b, dbus_runtime_so, "D-Bus runtime");
 
     const c_headers = b.addWriteFiles();
     const c_header = c_headers.add("fushell_c_bindings.h",
@@ -70,6 +77,7 @@ pub fn build(b: *std.Build) void {
         \\#include <EGL/egl.h>
         \\#include <GLES2/gl2.h>
         \\#include <fontconfig/fontconfig.h>
+        \\#include <dbus/dbus.h>
         \\#include <poll.h>
         \\#include <flutter_embedder.h>
     );
@@ -125,6 +133,8 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("wayland", wayland_mod);
     linkRuntimeLibraries(exe_mod, dynamic_link_opts);
+    // Packaged app runners resolve bundled runtime libraries before system paths.
+    exe_mod.addRPathSpecial("$ORIGIN/lib");
 
     const exe = b.addExecutable(.{
         // pi-lens-ignore: zls
@@ -148,6 +158,7 @@ pub fn build(b: *std.Build) void {
     build_tool_mod.addImport("c", c_mod);
     build_tool_mod.addImport("wayland", wayland_mod);
     linkRuntimeLibraries(build_tool_mod, dynamic_link_opts);
+    build_tool_mod.addRPathSpecial("$ORIGIN/../lib");
     // workspace 解析后是绝对路径 (或相对构建根), 用 cwd_relative 支持两者
     // 目标平台 arch (Flutter 命名: x64/arm64/riscv64), 注入 fushell CLI
     // 用于默认 bundle 输出目录 build/linux/<arch>/<mode>
@@ -178,6 +189,9 @@ pub fn build(b: *std.Build) void {
     build_tool_mod.addAnonymousImport("fushell_runner_bin", .{
         .root_source_file = exe.getEmittedBin(),
     });
+    build_tool_mod.addAnonymousImport("dbus_runtime", .{
+        .root_source_file = .{ .cwd_relative = dbus_runtime_so },
+    });
     // fushell SDK 包文件内嵌: `fushell sdk` 释放给外部项目
     build_tool_mod.addAnonymousImport("fushell_sdk_pubspec", .{
         .root_source_file = b.path("packages/fushell/pubspec.yaml"),
@@ -196,6 +210,12 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
     b.installArtifact(build_tool);
+    const install_dbus_runtime = b.addInstallFileWithDir(
+        .{ .cwd_relative = dbus_runtime_so },
+        .lib,
+        "libdbus-1.so.3",
+    );
+    b.getInstallStep().dependOn(&install_dbus_runtime.step);
 
     const run_cmd = b.addRunArtifact(build_tool);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -214,11 +234,46 @@ pub fn build(b: *std.Build) void {
     const build_tool_unit_tests = b.addTest(.{ .root_module = build_tool_mod });
     const run_build_tool_unit_tests = b.addRunArtifact(build_tool_unit_tests);
     test_step.dependOn(&run_build_tool_unit_tests.step);
+
+    const build_singleton_fixture = b.addRunArtifact(build_tool);
+    build_singleton_fixture.step.dependOn(b.getInstallStep());
+    build_singleton_fixture.addArgs(&.{ "build", "--debug", "examples/singleton_app" });
+    const run_single_instance_integration = b.addSystemCommand(&.{
+        "bash",
+        "tests/single_instance_integration.sh",
+    });
+    run_single_instance_integration.setEnvironmentVariable(
+        "FUSHELL_SINGLE_INSTANCE_TEST_BUILT",
+        "1",
+    );
+    run_single_instance_integration.step.dependOn(&build_singleton_fixture.step);
+    const integration_test_step = b.step(
+        "integration-test",
+        "Run the single-instance D-Bus integration test",
+    );
+    integration_test_step.dependOn(&run_single_instance_integration.step);
 }
 
 /// 检查引擎 .so 是否存在, 缺失时给明确指引 (先构建对应引擎) 并退出。
+fn checkRuntimeFile(b: *std.Build, path: []const u8, description: []const u8) void {
+    const io = b.graph.io;
+    const exists = if (std.fs.path.isAbsolute(path))
+        (std.Io.Dir.accessAbsolute(io, path, .{}) catch null) != null
+    else blk: {
+        const cwd = std.process.currentPathAlloc(io, b.allocator) catch break :blk false;
+        defer b.allocator.free(cwd);
+        const abs = std.fs.path.join(b.allocator, &.{ cwd, path }) catch break :blk false;
+        defer b.allocator.free(abs);
+        break :blk (std.Io.Dir.accessAbsolute(io, abs, .{}) catch null) != null;
+    };
+    if (!exists) {
+        std.debug.print("error: {s} not found: {s}\n", .{ description, path });
+        std.process.exit(1);
+    }
+}
+
 fn checkEngineSo(b: *std.Build, path: []const u8, mode_name: []const u8) void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = b.graph.io;
     const exists = if (std.fs.path.isAbsolute(path))
         (std.Io.Dir.accessAbsolute(io, path, .{}) catch null) != null
     else blk: {
@@ -246,6 +301,7 @@ fn linkRuntimeLibraries(module: *std.Build.Module, options: std.Build.Module.Lin
     module.linkSystemLibrary("GLESv2", options);
     module.linkSystemLibrary("xkbcommon", options);
     module.linkSystemLibrary("fontconfig", options);
+    module.linkSystemLibrary("dbus-1", options);
     module.linkSystemLibrary("dl", options);
 }
 
@@ -255,4 +311,5 @@ fn linkTranslateCLibraries(translate_c: *std.Build.Step.TranslateC, options: std
     translate_c.linkSystemLibrary("EGL", options);
     translate_c.linkSystemLibrary("GLESv2", options);
     translate_c.linkSystemLibrary("fontconfig", options);
+    translate_c.linkSystemLibrary("dbus-1", options);
 }
