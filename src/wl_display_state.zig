@@ -17,8 +17,6 @@ const zwlr = wayland.client.zwlr;
 const zwp = wayland.client.zwp;
 const c = @import("c");
 
-pub const max_outputs = 16;
-
 /// Input and scale callbacks carry explicit owner context so DisplayState does
 /// not depend on process-global runner pointers.
 pub const KeyboardEvent = union(enum) {
@@ -49,6 +47,7 @@ pub const OutputState = struct {
 /// `bindGlobals`；所有 Host 与共享 service 释放引用本连接的协议对象后，才能执行
 /// `deinit`。
 pub const DisplayState = struct {
+    allocator: std.mem.Allocator = undefined,
     display: ?*wl.Display = null,
     registry: ?*wl.Registry = null,
     compositor: ?*wl.Compositor = null,
@@ -78,7 +77,7 @@ pub const DisplayState = struct {
     data_control_manager_version: u32 = 0,
     ime_manager_name: u32 = 0,
     ime_manager_version: u32 = 0,
-    outputs: [max_outputs]OutputState = [_]OutputState{.{}} ** max_outputs,
+    outputs: std.ArrayListUnmanaged(OutputState) = .empty,
 
     egl_display: c.EGLDisplay = null,
     gles_library: ?std.DynLib = null,
@@ -90,8 +89,9 @@ pub const DisplayState = struct {
     // ── 初始化 / 生命周期 ──────────────────────────────
 
     /// 首次获取时建立连接。返回是否首次 (新连接)。
-    pub fn acquire(self: *DisplayState) !bool {
+    pub fn acquire(self: *DisplayState, allocator: std.mem.Allocator) !bool {
         if (self.ref_count == 0) {
+            self.allocator = allocator;
             try self.init();
         }
         self.ref_count += 1;
@@ -140,10 +140,8 @@ pub const DisplayState = struct {
         // 对象的全部当前属性事件)。没有这一步, output.scale 会停在 1, 窗口按
         // 1x 渲染 → 在 2x 屏幕上模糊。
         if (self.display.?.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
-        for (&self.outputs) |*output_state| {
-            if (output_state.output != null) {
-                std.debug.print("output {d} scale={d}\n", .{ output_state.name, output_state.scale });
-            }
+        for (self.outputs.items) |output_state| {
+            std.debug.print("output {d} scale={d}\n", .{ output_state.name, output_state.scale });
         }
 
         self.egl_display = c.eglGetDisplay(@ptrCast(self.display.?));
@@ -164,10 +162,11 @@ pub const DisplayState = struct {
         if (self.pointer) |pointer| pointer.release();
         if (self.keyboard) |keyboard| keyboard.release();
         if (self.seat) |seat| seat.release();
-        for (&self.outputs) |*output_state| {
+        for (self.outputs.items) |output_state| {
             if (output_state.output) |output| output.release();
-            output_state.* = .{};
         }
+        self.outputs.deinit(self.allocator);
+        self.outputs = .empty;
         if (self.layer_shell) |layer_shell| layer_shell.destroy();
         if (self.fractional_scale_manager) |manager| manager.destroy();
         if (self.viewporter) |viewporter| viewporter.destroy();
@@ -203,7 +202,7 @@ pub const DisplayState = struct {
         if (self.layer_shell) |layer_shell| layer_shell.setQueue(queue);
         if (self.viewporter) |viewporter| viewporter.setQueue(queue);
         if (self.fractional_scale_manager) |manager| manager.setQueue(queue);
-        for (&self.outputs) |*output_state| {
+        for (self.outputs.items) |output_state| {
             if (output_state.output) |output| output.setQueue(queue);
         }
         if (self.seat) |seat| {
@@ -242,25 +241,32 @@ pub const DisplayState = struct {
 
     // ── 输出 / scale ──────────────────────────────────
 
-    pub fn emptyOutputSlot(self: *DisplayState) ?*OutputState {
-        for (&self.outputs) |*slot| {
-            if (slot.output == null) return slot;
-        }
-        return null;
+    fn addOutput(self: *DisplayState, state: OutputState) !void {
+        try self.outputs.append(self.allocator, state);
     }
 
     pub fn outputSlotByName(self: *DisplayState, name: u32) ?*OutputState {
-        for (&self.outputs) |*slot| {
+        for (self.outputs.items) |*slot| {
             if (slot.name == name) return slot;
         }
         return null;
     }
 
     pub fn outputSlotByObject(self: *DisplayState, output: *wl.Output) ?*OutputState {
-        for (&self.outputs) |*slot| {
+        for (self.outputs.items) |*slot| {
             if (slot.output == output) return slot;
         }
         return null;
+    }
+
+    fn removeOutput(self: *DisplayState, name: u32) bool {
+        for (self.outputs.items, 0..) |slot, index| {
+            if (slot.name != name) continue;
+            if (slot.output) |output| output.release();
+            _ = self.outputs.swapRemove(index);
+            return true;
+        }
+        return false;
     }
 
     // ── flush ──────────────────────────────────────────
@@ -287,13 +293,12 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
             if (bindGlobal(registry, global, wl.Compositor)) |compositor| {
                 self.compositor = compositor;
             } else if (bindGlobal(registry, global, wl.Output)) |output| {
-                if (self.emptyOutputSlot()) |slot| {
-                    slot.* = .{ .name = global.name, .output = output };
-                    output.setListener(*DisplayState, outputListener, self);
-                } else {
-                    std.debug.print("Ignoring Wayland output {d}: output tracking slots are full.\n", .{global.name});
+                self.addOutput(.{ .name = global.name, .output = output }) catch |err| {
+                    std.debug.print("Unable to track Wayland output {d}: {}\n", .{ global.name, err });
                     output.release();
-                }
+                    return;
+                };
+                output.setListener(*DisplayState, outputListener, self);
             } else if (bindGlobal(registry, global, wl.Seat)) |seat| {
                 if (self.seat == null) {
                     self.seat = seat;
@@ -332,10 +337,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
             }
         },
         .global_remove => |global_remove| {
-            if (self.outputSlotByName(global_remove.name)) |slot| {
-                if (slot.output) |output| output.release();
-                slot.* = .{};
-            }
+            _ = self.removeOutput(global_remove.name);
         },
     }
 }

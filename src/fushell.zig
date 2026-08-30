@@ -539,6 +539,7 @@ fn buildDebugBundle(gpa: std.mem.Allocator, io: std.Io, entrypoint: []const u8, 
     try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
     try writeEmbeddedEngine(io, .debug, engine_library);
     try writeDbusRuntime(gpa, io, lib_dir);
+    try copyNixRuntimeLibraries(gpa, io, lib_dir);
     try writeBundleEntry(gpa, io, bundle_dir);
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 
@@ -627,6 +628,7 @@ fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, mode: Mode, entrypoint: []
     try runCommand(gpa, io, &.{ "cp", debug_info, debug_info_dest });
     try writeEmbeddedEngine(io, mode, engine_library);
     try writeDbusRuntime(gpa, io, lib_dir);
+    try copyNixRuntimeLibraries(gpa, io, lib_dir);
     try writeBundleEntry(gpa, io, bundle_dir);
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 
@@ -713,6 +715,17 @@ fn writeDbusRuntime(gpa: std.mem.Allocator, io: std.Io, output_lib_dir: []const 
     var file = try std.Io.Dir.cwd().createFile(io, destination_path, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, embedded_dbus_runtime);
+}
+
+/// Nix package 会把可随应用携带的用户态共享库物化到一个 store 目录，并通过环境变量
+/// 传入。这里复制的是普通文件而非 symlink；未设置变量的开发构建继续依赖宿主环境。
+fn copyNixRuntimeLibraries(gpa: std.mem.Allocator, io: std.Io, output_lib_dir: []const u8) !void {
+    const runtime_root = try envValue(gpa, "FUSHELL_RUNTIME_LIBS") orelse return;
+    defer gpa.free(runtime_root);
+
+    const source_dir = try std.fs.path.join(gpa, &.{ runtime_root, "lib", "." });
+    defer gpa.free(source_dir);
+    try runCommand(gpa, io, &.{ "cp", "-R", source_dir, output_lib_dir });
 }
 
 fn writeEmbeddedEngine(io: std.Io, mode: Mode, path: []const u8) !void {

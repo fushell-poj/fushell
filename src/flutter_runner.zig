@@ -705,7 +705,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     defer local_host.deinit();
 
     // 进程级初始化: attach (acquire → 建连接) 后绑单一 event queue 到全部对象。
-    try host.attach(state, options.io);
+    try host.attach(state, options.io, gpa);
     try state.bindGlobals();
     // 进程级单一 EGL render context (raster + 呈现)。
     var render_context: egl.RenderContext = .{};
@@ -1114,7 +1114,7 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
         runner.registry.releaseLocked(entry);
         runner.registry.unlock();
     }
-    try host.attach(runner.state, runner.task_queue.io);
+    try host.attach(runner.state, runner.task_queue.io, runner.gpa);
     switch (request.role) {
         .window => |w| try host.initializeWindowRole(w, parent_toplevel),
         .layer => |l| try host.initializeLayerRole(l),

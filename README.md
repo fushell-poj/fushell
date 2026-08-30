@@ -17,6 +17,29 @@ This installs:
 - `zig-out/bin/fushell` — development CLI
 - `zig-out/bin/fushell-runner` — internal bundle player embedded by the CLI
 
+## NixOS package
+
+NixOS 是当前正式支持的发布环境。完整 CLI 需要匹配 revision 的 debug、profile、release Flutter engine artifacts；flake 暴露参数化的 `lib.mkFushell`，不会在纯 derivation 中读取开发机路径。
+
+使用本地 engine workspace 构建完整 Nix package：
+
+```bash
+nix run .#build-local -- /path/to/flutter-engine
+
+./result/bin/fushell help
+```
+
+`fushell build` 从该 package 运行时，会为生成的应用写入 Nix loader，并复制 runner 直接依赖的用户态运行库；这些库的传递依赖由 Nix closure 保留。EGL 驱动仍由 NixOS 的 `/run/opengl-driver/lib` 提供。
+
+Zig 依赖由 zon2nix 生成的 `deps.nix` 固定：
+
+```bash
+nix run github:nix-community/zon2nix > deps.nix
+nix flake check
+```
+
+参数化 package、应用包装与依赖更新细节见 [`nix/README.md`](nix/README.md)。跨发行版 portable bundle 暂不承诺支持。
+
 ## CLI
 
 Bare `fushell` prints help and does not build implicitly.

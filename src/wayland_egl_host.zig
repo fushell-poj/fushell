@@ -17,8 +17,6 @@ const display_state = @import("wl_display_state.zig");
 
 const default_width = 800;
 const default_height = 600;
-const max_outputs = display_state.max_outputs;
-
 const btn_left = 0x110;
 const btn_right = 0x111;
 const btn_middle = 0x112;
@@ -87,33 +85,25 @@ pub const State = enum {
 };
 
 const OutputMembership = struct {
-    names: [max_outputs]u32 = [_]u32{0} ** max_outputs,
+    names: std.ArrayListUnmanaged(u32) = .empty,
 
-    fn enter(self: *OutputMembership, name: u32) void {
+    fn deinit(self: *OutputMembership, allocator: std.mem.Allocator) void {
+        self.names.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn enter(self: *OutputMembership, allocator: std.mem.Allocator, name: u32) !void {
         if (name == 0 or self.contains(name)) return;
-        for (&self.names) |*slot| {
-            if (slot.* == 0) {
-                slot.* = name;
-                return;
-            }
-        }
-        std.debug.print("[warn] window output membership capacity exhausted.\n", .{});
+        try self.names.append(allocator, name);
     }
 
     fn leave(self: *OutputMembership, name: u32) void {
-        for (&self.names) |*slot| {
-            if (slot.* == name) {
-                slot.* = 0;
-                return;
-            }
-        }
+        const index = std.mem.indexOfScalar(u32, self.names.items, name) orelse return;
+        _ = self.names.swapRemove(index);
     }
 
     fn contains(self: *const OutputMembership, name: u32) bool {
-        for (self.names) |entered_name| {
-            if (entered_name == name) return true;
-        }
-        return false;
+        return std.mem.indexOfScalar(u32, self.names.items, name) != null;
     }
 };
 
@@ -291,10 +281,10 @@ pub const Host = struct {
     ///
     /// 进程启动建立连接时，`attach` 可能早于 global binding。role 初始化稍后刷新共享
     /// queue；只有 EGL/global 初始化成功后，调用方才能注入 RenderContext。
-    pub fn attach(self: *Host, state: *display_state.DisplayState, io: std.Io) !void {
+    pub fn attach(self: *Host, state: *display_state.DisplayState, io: std.Io, allocator: std.mem.Allocator) !void {
         self.display_state = state;
         self.io = io;
-        _ = try state.acquire();
+        _ = try state.acquire(allocator);
         self.event_queue = state.shared_queue;
         self.adoptProvisionalScaleFromOutputs();
     }
@@ -581,6 +571,7 @@ pub const Host = struct {
 
     pub fn deinit(self: *Host) void {
         self.state = .shutting_down;
+        self.entered_outputs.deinit(self.display_state.allocator);
         if (self.display_state.egl_display != null and self.display_state.egl_display != c.EGL_NO_DISPLAY) {
             _ = c.eglMakeCurrent(self.display_state.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
             if (self.egl_surface != null and self.egl_surface != c.EGL_NO_SURFACE) _ = c.eglDestroySurface(self.display_state.egl_display, self.egl_surface);
@@ -724,7 +715,7 @@ pub const Host = struct {
 
     fn outputName(self: *const Host, output: ?*wl.Output) ?u32 {
         if (output == null) return null;
-        for (self.display_state.outputs) |output_state| {
+        for (self.display_state.outputs.items) |output_state| {
             if (output_state.output == output) return output_state.name;
         }
         return null;
@@ -733,7 +724,7 @@ pub const Host = struct {
     fn adoptProvisionalScaleFromOutputs(self: *Host) void {
         var next_scale: i32 = 1;
         var output_count: usize = 0;
-        for (self.display_state.outputs) |output_state| {
+        for (self.display_state.outputs.items) |output_state| {
             if (output_state.output != null) {
                 output_count += 1;
                 if (output_state.scale > next_scale) next_scale = output_state.scale;
@@ -746,7 +737,7 @@ pub const Host = struct {
 
     pub fn recomputeScale(self: *Host) void {
         if (self.fractional_scale_120 > 0) return;
-        const next_scale = integerScaleForMembership(&self.entered_outputs, &self.display_state.outputs);
+        const next_scale = integerScaleForMembership(&self.entered_outputs, self.display_state.outputs.items);
         if (next_scale == self.scale) return;
         const old_scale = self.scale;
         self.scale = next_scale;
@@ -946,7 +937,10 @@ fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, self: *Host) void {
     switch (event) {
         .enter => |enter| {
             if (self.outputName(enter.output)) |name| {
-                self.entered_outputs.enter(name);
+                self.entered_outputs.enter(self.display_state.allocator, name) catch |err| {
+                    std.debug.print("Unable to record output membership for global {d}: {}\n", .{ name, err });
+                    return;
+                };
                 self.recomputeScale();
             }
         },
@@ -1007,9 +1001,11 @@ test "output membership is isolated per window" {
         .{ .name = 22, .scale = 2 },
     };
     var first: OutputMembership = .{};
+    defer first.deinit(std.testing.allocator);
     var second: OutputMembership = .{};
-    first.enter(11);
-    second.enter(22);
+    defer second.deinit(std.testing.allocator);
+    try first.enter(std.testing.allocator, 11);
+    try second.enter(std.testing.allocator, 22);
 
     try std.testing.expectEqual(@as(i32, 1), integerScaleForMembership(&first, &outputs));
     try std.testing.expectEqual(@as(i32, 2), integerScaleForMembership(&second, &outputs));
@@ -1017,12 +1013,49 @@ test "output membership is isolated per window" {
 
 test "output membership uses global names rather than reusable slots" {
     var membership: OutputMembership = .{};
-    membership.enter(11);
+    defer membership.deinit(std.testing.allocator);
+    try membership.enter(std.testing.allocator, 11);
 
     const after_removal = [_]display_state.OutputState{.{ .name = 22, .scale = 2 }};
     try std.testing.expectEqual(@as(i32, 1), integerScaleForMembership(&membership, &after_removal));
 
     membership.leave(11);
-    membership.enter(22);
+    try membership.enter(std.testing.allocator, 22);
     try std.testing.expectEqual(@as(i32, 2), integerScaleForMembership(&membership, &after_removal));
+}
+
+test "output membership grows beyond the former fixed capacity" {
+    var membership: OutputMembership = .{};
+    defer membership.deinit(std.testing.allocator);
+
+    var name: u32 = 1;
+    while (name <= 64) : (name += 1) {
+        try membership.enter(std.testing.allocator, name);
+    }
+
+    try std.testing.expectEqual(@as(usize, 64), membership.names.items.len);
+    try std.testing.expect(membership.contains(64));
+    membership.leave(32);
+    try std.testing.expect(!membership.contains(32));
+    try std.testing.expectEqual(@as(usize, 63), membership.names.items.len);
+}
+
+test "scale calculation includes outputs beyond the former fixed capacity" {
+    var membership: OutputMembership = .{};
+    defer membership.deinit(std.testing.allocator);
+
+    var outputs: [64]display_state.OutputState = undefined;
+    for (&outputs, 0..) |*output_state, index| {
+        const name: u32 = @intCast(index + 1);
+        output_state.* = .{
+            .name = name,
+            .scale = if (index == outputs.len - 1) 4 else 1,
+        };
+        try membership.enter(std.testing.allocator, name);
+    }
+
+    try std.testing.expectEqual(@as(i32, 4), integerScaleForMembership(&membership, &outputs));
+
+    membership.leave(outputs.len);
+    try std.testing.expectEqual(@as(i32, 1), integerScaleForMembership(&membership, &outputs));
 }

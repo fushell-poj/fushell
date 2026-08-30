@@ -6,46 +6,51 @@ const build_support = @import("build_support.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const runner_interpreter = b.option([]const u8, "runner-interpreter", "ELF interpreter written into installed and embedded runners");
+    const strip = b.option(bool, "strip", "Strip installed and embedded executables") orelse false;
     const optimize = b.standardOptimizeOption(.{});
 
-    // Flutter 引擎工作区 (pull-flutter / build-engine 共享), 无默认值, 必须指定:
-    //   ① -Dflutter-workspace=X  ② FLUTTER_ENGINE_DIR  ③ ./flutter_engine_dir
-    // zig 0.16: b.graph.io 自带完整环境, spawn 可解析 PATH (gclient/gn/ninja)。
     const io = b.graph.io;
-    const flutter_workspace = build_support.resolveWorkspaceConfig(io, b.allocator, b.option([]const u8, "flutter-workspace", "Flutter engine workspace path (or FLUTTER_ENGINE_DIR, or ./flutter_engine_dir)")) catch |err| {
+    const workspace_option = b.option([]const u8, "flutter-workspace", "Flutter engine workspace path (or FLUTTER_ENGINE_DIR, or ./flutter_engine_dir)");
+    const engine_debug_option = b.option([]const u8, "flutter-engine-debug-so", "Path to the debug (JIT) Flutter engine shared library");
+    const engine_profile_option = b.option([]const u8, "flutter-engine-profile-so", "Path to the profile (AOT+profiling) Flutter engine shared library");
+    const engine_release_option = b.option([]const u8, "flutter-engine-release-so", "Path to the release (AOT) Flutter engine shared library");
+    const has_explicit_engines = engine_debug_option != null and engine_profile_option != null and engine_release_option != null;
+
+    // Nix derivation 将三种 engine artifact 作为独立 store 输入传入，此时不应要求
+    // 仅用于源码管理的 Flutter workspace。只要有一种 artifact 未显式提供，就继续
+    // 要求完整 workspace，避免部分模式悄悄回退到开发机路径。
+    const flutter_workspace: ?[]const u8 = if (has_explicit_engines) null else build_support.resolveWorkspaceConfig(io, b.allocator, workspace_option) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
 
-    // zig build pull-flutter: 拉取引擎源码
-    const pull_flutter = flutter_pull.PullFlutter.create(b, flutter_workspace);
-    const pull_flutter_step = b.step("pull-flutter", "Fetch the Flutter engine source tree into the workspace via gclient");
-    pull_flutter_step.dependOn(&pull_flutter.step);
+    // 源码管理与 engine 编译步骤只在 workspace 模式下存在。显式 artifact 模式只
+    // 消费预构建输入，不能宣称支持 pull/build engine。
+    if (flutter_workspace) |workspace| {
+        const pull_flutter = flutter_pull.PullFlutter.create(b, workspace);
+        const pull_flutter_step = b.step("pull-flutter", "Fetch the Flutter engine source tree into the workspace via gclient");
+        pull_flutter_step.dependOn(&pull_flutter.step);
 
-    // zig build build-engine-release: 编译 release (AOT) 引擎
-    // zig build build-engine-profile: 编译 profile (AOT+剖析) 引擎
-    // zig build build-engine-debug:   编译 debug (JIT) 引擎
-    const no_lto = b.option(bool, "no-lto", "Pass --no-lto to gn (faster first build, slower binaries; release only)") orelse false;
-    const build_engine_release = engine_build.BuildEngine.create(b, flutter_workspace, no_lto, .release);
-    const build_engine_release_step = b.step("build-engine-release", "Build the release (AOT) Flutter engine in the workspace");
-    build_engine_release_step.dependOn(&build_engine_release.step);
-    const build_engine_profile = engine_build.BuildEngine.create(b, flutter_workspace, no_lto, .profile);
-    const build_engine_profile_step = b.step("build-engine-profile", "Build the profile (AOT + profiling) Flutter engine in the workspace");
-    build_engine_profile_step.dependOn(&build_engine_profile.step);
-    const build_engine_debug = engine_build.BuildEngine.create(b, flutter_workspace, no_lto, .debug);
-    const build_engine_debug_step = b.step("build-engine-debug", "Build the debug (JIT) Flutter engine in the workspace");
-    build_engine_debug_step.dependOn(&build_engine_debug.step);
+        const no_lto = b.option(bool, "no-lto", "Pass --no-lto to gn (faster first build, slower binaries; release only)") orelse false;
+        const build_engine_release = engine_build.BuildEngine.create(b, workspace, no_lto, .release);
+        const build_engine_release_step = b.step("build-engine-release", "Build the release (AOT) Flutter engine in the workspace");
+        build_engine_release_step.dependOn(&build_engine_release.step);
+        const build_engine_profile = engine_build.BuildEngine.create(b, workspace, no_lto, .profile);
+        const build_engine_profile_step = b.step("build-engine-profile", "Build the profile (AOT + profiling) Flutter engine in the workspace");
+        build_engine_profile_step.dependOn(&build_engine_profile.step);
+        const build_engine_debug = engine_build.BuildEngine.create(b, workspace, no_lto, .debug);
+        const build_engine_debug_step = b.step("build-engine-debug", "Build the debug (JIT) Flutter engine in the workspace");
+        build_engine_debug_step.dependOn(&build_engine_debug.step);
+    }
 
-    // 三个引擎 .so 全部内嵌进 fushell CLI (打包时按模式选), 各自可覆盖:
-    //   debug   → 打包 JIT bundle (kernel_blob.bin)
-    //   profile → 打包 AOT+剖析 bundle
-    //   release → 打包 AOT bundle (默认)
-    const flutter_engine_debug_so = b.option([]const u8, "flutter-engine-debug-so", "Path to the debug (JIT) Flutter engine shared library (default: <workspace>/engine/src/out/linux_debug_x64/libflutter_engine.so)") orelse
-        b.pathJoin(&.{ flutter_workspace, "engine/src/out/linux_debug_x64/libflutter_engine.so" });
-    const flutter_engine_profile_so = b.option([]const u8, "flutter-engine-profile-so", "Path to the profile (AOT+profiling) Flutter engine shared library (default: <workspace>/engine/src/out/linux_profile_x64/libflutter_engine.so)") orelse
-        b.pathJoin(&.{ flutter_workspace, "engine/src/out/linux_profile_x64/libflutter_engine.so" });
-    const flutter_engine_release_so = b.option([]const u8, "flutter-engine-release-so", "Path to the release (AOT) Flutter engine shared library (default: <workspace>/engine/src/out/linux_release_x64/libflutter_engine.so)") orelse
-        b.pathJoin(&.{ flutter_workspace, "engine/src/out/linux_release_x64/libflutter_engine.so" });
+    // 三个引擎 .so 全部内嵌进 fushell CLI (打包时按模式选)。
+    const flutter_engine_debug_so = engine_debug_option orelse
+        b.pathJoin(&.{ flutter_workspace.?, "engine/src/out/linux_debug_x64/libflutter_engine.so" });
+    const flutter_engine_profile_so = engine_profile_option orelse
+        b.pathJoin(&.{ flutter_workspace.?, "engine/src/out/linux_profile_x64/libflutter_engine.so" });
+    const flutter_engine_release_so = engine_release_option orelse
+        b.pathJoin(&.{ flutter_workspace.?, "engine/src/out/linux_release_x64/libflutter_engine.so" });
 
     // 存在性检查: 缺失时给明确指引 (而不是 @embedFile 的裸错误)
     checkEngineSo(b, flutter_engine_debug_so, "debug");
@@ -90,6 +95,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     translate_c.addIncludePath(flutter_embedder.path("."));
+    // Zig 0.16 的 translate-c 会把 glibc fortify 包装器里的比较表达式翻译成
+    // bool，但 std 的 object_size builtin 仍要求 c_int；显式关闭仅影响头文件翻译，
+    // 不改变 Zig 代码的 ReleaseSafe 检查或最终链接器加固。
+    translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
     linkTranslateCLibraries(translate_c, dynamic_link_opts);
     const c_mod = translate_c.createModule();
 
@@ -98,8 +107,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     exe_mod.addImport("c", c_mod);
+    exe_mod.addLibraryPath(.{ .cwd_relative = dbus_lib_dir });
 
     const scanner = Scanner.create(b, .{
         // Custom protocols are added explicitly below, so this only satisfies
@@ -142,12 +153,27 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
         .use_llvm = true,
     });
+    // NixOS bundle 不能依赖事后的 install fixup：CLI 会在编译期内嵌 runner。
+    // 因此先复制并修补 emitted binary，再同时用于安装和 @embedFile。
+    const runner_bin = if (runner_interpreter) |interpreter| blk: {
+        const patch_runner = b.addSystemCommand(&.{
+            "sh",
+            "-c",
+            "set -eu; cp \"$1\" \"$2\"; chmod u+w \"$2\"; patchelf --set-interpreter \"$3\" \"$2\"",
+            "_",
+        });
+        patch_runner.addFileArg(exe.getEmittedBin());
+        const output = patch_runner.addOutputFileArg("fushell-runner");
+        patch_runner.addArg(interpreter);
+        break :blk output;
+    } else exe.getEmittedBin();
 
     const build_tool_mod = b.createModule(.{
         .root_source_file = b.path("src/fushell.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     build_tool_mod.addImport("build_support", b.createModule(.{
         .root_source_file = b.path("build_support.zig"),
@@ -157,6 +183,7 @@ pub fn build(b: *std.Build) void {
     // fushell run: 进程内播放 (player.zig → flutter_runner → c/wayland/EGL)
     build_tool_mod.addImport("c", c_mod);
     build_tool_mod.addImport("wayland", wayland_mod);
+    build_tool_mod.addLibraryPath(.{ .cwd_relative = dbus_lib_dir });
     linkRuntimeLibraries(build_tool_mod, dynamic_link_opts);
     build_tool_mod.addRPathSpecial("$ORIGIN/../lib");
     // workspace 解析后是绝对路径 (或相对构建根), 用 cwd_relative 支持两者
@@ -187,7 +214,7 @@ pub fn build(b: *std.Build) void {
     // runner 可执行文件内嵌进 fushell CLI: 打包时写出为 bundle 入口
     // (getEmittedBin LazyPath, 构建顺序自动: runner 先编译)
     build_tool_mod.addAnonymousImport("fushell_runner_bin", .{
-        .root_source_file = exe.getEmittedBin(),
+        .root_source_file = runner_bin,
     });
     build_tool_mod.addAnonymousImport("dbus_runtime", .{
         .root_source_file = .{ .cwd_relative = dbus_runtime_so },
@@ -208,7 +235,12 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    b.installArtifact(exe);
+    if (runner_interpreter != null) {
+        const install_runner = b.addInstallFileWithDir(runner_bin, .bin, "fushell-runner");
+        b.getInstallStep().dependOn(&install_runner.step);
+    } else {
+        b.installArtifact(exe);
+    }
     b.installArtifact(build_tool);
     const install_dbus_runtime = b.addInstallFileWithDir(
         .{ .cwd_relative = dbus_runtime_so },

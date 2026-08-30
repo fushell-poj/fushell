@@ -22,15 +22,24 @@ if ! command -v cage >/dev/null 2>&1; then
   exec nix shell nixpkgs#cage -c env \
     FUSHELL_SINGLE_INSTANCE_TEST_BUILT=1 \
     FUSHELL_SINGLE_INSTANCE_TEST_MODE="$mode" \
+    FUSHELL_SINGLE_INSTANCE_TEST_RUNNER="${FUSHELL_SINGLE_INSTANCE_TEST_RUNNER:-}" \
     bash "$0"
 fi
 
-bundle="$root/examples/singleton_app/build/linux/x64/$mode"
-runner="$(find "$bundle" -maxdepth 1 -type f -perm -0100 -print -quit)"
-[[ -n "$runner" && -x "$runner" ]] || {
-  echo "missing bundle executable under: $bundle" >&2
-  exit 1
-}
+if [[ -n "${FUSHELL_SINGLE_INSTANCE_TEST_RUNNER:-}" ]]; then
+  runner="$FUSHELL_SINGLE_INSTANCE_TEST_RUNNER"
+  [[ -x "$runner" ]] || {
+    echo "configured test runner is not executable: $runner" >&2
+    exit 1
+  }
+else
+  bundle="$root/examples/singleton_app/build/linux/x64/$mode"
+  runner="$(find "$bundle" -maxdepth 1 -type f -perm -0100 -print -quit)"
+  [[ -n "$runner" && -x "$runner" ]] || {
+    echo "missing bundle executable under: $bundle" >&2
+    exit 1
+  }
+fi
 
 tmp="$(mktemp -d)"
 cleanup() {
