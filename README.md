@@ -89,6 +89,12 @@ DevTools is enabled.
 
 Release mode does not expose the VM Service and rejects DevTools options.
 
+## Pointer input and system cursors
+
+Pointer focus follows Wayland `wl_pointer.enter` independently from keyboard focus, so motion, button, scroll, and Flutter hover updates remain routed to the entered view even though those later protocol events do not carry a surface. Flutter `SystemMouseCursors` are translated through `flutter/mousecursor` to compositor-managed cursor-shape-v1 shapes, including directional resize cursors and `SystemMouseCursors.none`.
+
+cursor-shape-v1 is optional. A compositor without it keeps its default cursor; fushell does not add a client-side cursor theme or `libwayland-cursor` fallback.
+
 ## Single-instance applications
 
 Applications default to multiple independent processes. To opt into a

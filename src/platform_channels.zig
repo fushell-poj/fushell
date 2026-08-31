@@ -1,8 +1,9 @@
-//! Flutter platform-channel classification, exactly-once response handling, and JSON codecs.
+//! Flutter platform-channel classification, exactly-once response handling, and channel codecs.
 
 const std = @import("std");
 const c = @import("c");
 const surface_channel = @import("surface_channel.zig");
+const mouse_cursor = @import("mouse_cursor.zig");
 const clipboard_service = @import("clipboard_service.zig");
 
 pub const application_channel_name = "dev.fushell/application";
@@ -12,6 +13,7 @@ pub const Channel = enum {
     surface,
     text_input,
     platform,
+    mouse_cursor,
     application,
     unsupported,
 };
@@ -20,6 +22,7 @@ pub fn classify(name: []const u8) Channel {
     if (std.mem.eql(u8, name, surface_channel.channel_name)) return .surface;
     if (std.mem.eql(u8, name, "flutter/textinput")) return .text_input;
     if (std.mem.eql(u8, name, "flutter/platform")) return .platform;
+    if (std.mem.eql(u8, name, mouse_cursor.channel_name)) return .mouse_cursor;
     if (std.mem.eql(u8, name, application_channel_name)) return .application;
     return .unsupported;
 }
@@ -433,6 +436,35 @@ pub fn handlePlatformChannelMessage(runner: anytype, message: c.FlutterPlatformM
     runner.sendEmptyPlatformResponse(message.response_handle);
 }
 
+pub fn handleMouseCursorMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8, send_fn: SendFn) void {
+    var reply: Response = .{
+        .context = runner,
+        .handle = message.response_handle,
+        .send_fn = send_fn,
+    };
+    runner.active_platform_response = &reply;
+    defer runner.active_platform_response = null;
+    defer reply.deinit();
+
+    const request = mouse_cursor.decodeRequest(payload) catch {
+        reply.send(mouse_cursor.bad_arguments_envelope);
+        return;
+    };
+    switch (request) {
+        .unsupported => reply.empty(),
+        .activate_system_cursor => |activate| {
+            // Flutter 的 device 对应 engine pointer device id；Fushell 当前只向引擎
+            // 注册 device 0 和单个 wl_pointer，因此验证 wire type 后由共享 pointer 处理。
+            _ = activate.device;
+            if (!runner.state.activateCursorShape(activate.shape)) {
+                reply.empty();
+                return;
+            }
+            reply.send(mouse_cursor.success_envelope);
+        },
+    }
+}
+
 pub fn handleApplicationChannelMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8) void {
     var parsed = std.json.parseFromSlice(std.json.Value, runner.gpa, payload, .{}) catch {
         runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "invalid JSON request");
@@ -539,6 +571,70 @@ fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "classify Flutter mouse cursor channel" {
+    try std.testing.expectEqual(.mouse_cursor, classify(mouse_cursor.channel_name));
+}
+
+test "mouse cursor channel returns codec-compatible responses exactly once" {
+    const FakeState = struct {
+        available: bool,
+        call_count: usize = 0,
+        last_shape: ?mouse_cursor.Shape = null,
+
+        fn activateCursorShape(self: *@This(), shape: mouse_cursor.Shape) bool {
+            if (!self.available) return false;
+            self.call_count += 1;
+            self.last_shape = shape;
+            return true;
+        }
+    };
+    const FakeRunner = struct {
+        state: *FakeState,
+        active_platform_response: ?*Response = null,
+        response_count: usize = 0,
+        response_payload: []const u8 = "",
+
+        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, payload: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.response_count += 1;
+            self.response_payload = payload;
+        }
+    };
+    const message = std.mem.zeroes(c.FlutterPlatformMessage);
+
+    const click = try decodeHexAlloc(std.testing.allocator, "0714616374697661746553797374656d437572736f720d020706646576696365030100000007046b696e640705636c69636b");
+    defer std.testing.allocator.free(click);
+    var available_state: FakeState = .{ .available = true };
+    var success_runner: FakeRunner = .{ .state = &available_state };
+    handleMouseCursorMessage(&success_runner, message, click, FakeRunner.send);
+    try std.testing.expectEqual(@as(usize, 1), success_runner.response_count);
+    try std.testing.expectEqualStrings(mouse_cursor.success_envelope, success_runner.response_payload);
+    try std.testing.expectEqual(@as(usize, 1), available_state.call_count);
+    try std.testing.expectEqual(.pointer, available_state.last_shape.?);
+
+    var missing_state: FakeState = .{ .available = false };
+    var missing_runner: FakeRunner = .{ .state = &missing_state };
+    handleMouseCursorMessage(&missing_runner, message, click, FakeRunner.send);
+    try std.testing.expectEqual(@as(usize, 1), missing_runner.response_count);
+    try std.testing.expectEqualStrings("", missing_runner.response_payload);
+
+    const malformed = try decodeHexAlloc(std.testing.allocator, "0714616374697661746553797374656d437572736f720d0107046b696e64070474657874");
+    defer std.testing.allocator.free(malformed);
+    var malformed_runner: FakeRunner = .{ .state = &available_state };
+    handleMouseCursorMessage(&malformed_runner, message, malformed, FakeRunner.send);
+    try std.testing.expectEqual(@as(usize, 1), malformed_runner.response_count);
+    try std.testing.expectEqualStrings(mouse_cursor.bad_arguments_envelope, malformed_runner.response_payload);
+    try std.testing.expectEqual(@as(usize, 1), available_state.call_count);
+
+    const unknown = try decodeHexAlloc(std.testing.allocator, "0712667574757265437572736f724d6574686f640d020706646576696365030100000007046b696e6407056261736963");
+    defer std.testing.allocator.free(unknown);
+    var unknown_runner: FakeRunner = .{ .state = &available_state };
+    handleMouseCursorMessage(&unknown_runner, message, unknown, FakeRunner.send);
+    try std.testing.expectEqual(@as(usize, 1), unknown_runner.response_count);
+    try std.testing.expectEqualStrings("", unknown_runner.response_payload);
+    try std.testing.expectEqual(@as(usize, 1), available_state.call_count);
 }
 
 test "window close event carries the completed view id" {

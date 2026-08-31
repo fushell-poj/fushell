@@ -121,6 +121,10 @@ pub fn build(b: *std.Build) void {
     scanner.addCustomProtocol(wayland_protocols.path("stable/xdg-shell/xdg-shell.xml"));
     scanner.addCustomProtocol(wayland_protocols.path("stable/viewporter/viewporter.xml"));
     scanner.addCustomProtocol(wayland_protocols.path("staging/fractional-scale/fractional-scale-v1.xml"));
+    scanner.addCustomProtocol(wayland_protocols.path("staging/cursor-shape/cursor-shape-v1.xml"));
+    // cursor-shape manager v2 的 XML 含 tablet_tool_v2 参数；即使客户端仅绑定
+    // manager v1，zig-wayland 仍需该类型才能生成完整接口表。
+    scanner.addCustomProtocol(wayland_protocols.path("unstable/tablet/tablet-unstable-v2.xml"));
     const wlr_protocols = b.dependency("wlr-protocols", .{});
     scanner.addCustomProtocol(wlr_protocols.path("unstable/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(wlr_protocols.path("unstable/wlr-data-control-unstable-v1.xml"));
@@ -130,6 +134,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_seat", 8);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
+    scanner.generate("wp_cursor_shape_manager_v1", 1);
+    scanner.generate("zwp_tablet_manager_v2", 1);
     scanner.generate("zwlr_layer_shell_v1", 4);
     scanner.generate("zwlr_data_control_manager_v1", 2);
     scanner.generate("zwp_text_input_manager_v3", 2);
@@ -147,6 +153,7 @@ pub fn build(b: *std.Build) void {
     // Packaged app runners resolve bundled runtime libraries before system paths.
     exe_mod.addRPathSpecial("$ORIGIN/lib");
 
+    // pi-lens-ignore: zls
     const exe = b.addExecutable(.{
         // pi-lens-ignore: zls
         .name = "fushell-runner",

@@ -8,7 +8,7 @@ fushell starts **headless** (no implicit window). The Dart `main()` runs as a
 shell: it creates windows via `FushellWindow.openWindow` and renders each
 window's content to the corresponding `FlutterView` with the framework's
 `View`/`ViewCollection` widgets. Closing **all** windows does not exit the
-process; call `FushellProcess.exit` to terminate.
+process; call `FushellProcess.exit` to terminate. Framework `SystemMouseCursors` work automatically through the native Wayland cursor-shape protocol when the compositor supports it; no Dart-side cursor API is required.
 
 ## Command-line interface
 

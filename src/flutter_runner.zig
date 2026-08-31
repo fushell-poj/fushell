@@ -106,11 +106,34 @@ fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
     runner.handleImeEvent(event);
 }
 
-/// 指针路由: 事件 surface → 目标窗口 host → handlePointerEvent。
-/// 主线程单线程调用 (pointer 绑共享 queue)。
+const PointerFocusAction = enum { enter, leave, current };
+
+fn pointerFocusTarget(comptime T: type, focus: *?*T, action: PointerFocusAction, entered: ?*T) ?*T {
+    return switch (action) {
+        .enter => blk: {
+            focus.* = entered;
+            break :blk entered;
+        },
+        .leave => blk: {
+            const target = focus.*;
+            focus.* = null;
+            break :blk target;
+        },
+        .current => focus.*,
+    };
+}
+
+/// Wayland 只有 enter/leave 携带 surface；其余事件必须沿用最近一次 enter 建立的
+/// Host 引用。该引用只由平台线程读写，并在 Host 释放前清除。
 fn displayPointerRouter(event: wl.Pointer.Event, surface: ?*wl.Surface, context: ?*anyopaque) void {
     const runner = runnerFromContext(context);
-    const target = runner.registry.findHostBySurfaceLocked(surface) orelse return;
+    const action: PointerFocusAction = switch (event) {
+        .enter => .enter,
+        .leave => .leave,
+        else => .current,
+    };
+    const entered = if (action == .enter) runner.registry.findHostBySurfaceLocked(surface) else null;
+    const target = pointerFocusTarget(egl.Host, &runner.pointer_focused_host, action, entered) orelse return;
     target.handlePointerEvent(event);
 }
 
@@ -188,6 +211,8 @@ const Runner = struct {
     /// 键盘焦点窗口 (wl_keyboard.enter 的 surface → 窗口注册表)。
     /// null = 无焦点窗口 (键盘事件被丢弃)。
     focused_host: ?*egl.Host = null,
+    /// 指针 enter 建立的窗口焦点；motion/button/axis 本身不携带 surface。
+    pointer_focused_host: ?*egl.Host = null,
     // 键盘长按重复 (wl_keyboard.repeat_info): delay 后按 rate 模拟 keydown。
     repeat_delay_ms: u32 = 500,
     repeat_rate_per_sec: u32 = 25,
@@ -1092,6 +1117,7 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
         .surface => platform_channels.handleSurfaceChannelMessage(runner, message, payload),
         .text_input => platform_channels.handleTextInputMessage(runner, message, payload, sendGuardedPlatformResponse),
         .platform => platform_channels.handlePlatformChannelMessage(runner, message, payload, sendGuardedPlatformResponse),
+        .mouse_cursor => platform_channels.handleMouseCursorMessage(runner, message, payload, sendGuardedPlatformResponse),
         .application => platform_channels.handleApplicationChannelMessage(runner, message, payload),
         .unsupported => {
             std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
@@ -1354,6 +1380,7 @@ fn processViewLifecycleResults(runner: *Runner) void {
 
         if (release_entry) {
             if (runner.focused_host == &entry.host) runner.focused_host = null;
+            if (runner.pointer_focused_host == &entry.host) runner.pointer_focused_host = null;
             entry.host.deinit();
             runner.registry.lock();
             if (completion == .remove_succeeded) runner.registry.detachChildrenLocked(view_id);
@@ -1682,6 +1709,19 @@ fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, user_data: ?*any
             }
         }
     }
+}
+
+test "pointer focus survives surface-less events and clears before reuse" {
+    var first: u8 = 1;
+    var second: u8 = 2;
+    var focus: ?*u8 = null;
+
+    try std.testing.expectEqual(&first, pointerFocusTarget(u8, &focus, .enter, &first).?);
+    try std.testing.expectEqual(&first, pointerFocusTarget(u8, &focus, .current, null).?);
+    try std.testing.expectEqual(&first, pointerFocusTarget(u8, &focus, .leave, null).?);
+    try std.testing.expect(focus == null);
+    try std.testing.expect(pointerFocusTarget(u8, &focus, .current, null) == null);
+    try std.testing.expectEqual(&second, pointerFocusTarget(u8, &focus, .enter, &second).?);
 }
 
 test "physical key transition is applied exactly once" {

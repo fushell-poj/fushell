@@ -10,6 +10,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const data_control = @import("data_control.zig");
 const ime_v3 = @import("ime_v3.zig");
+const mouse_cursor = @import("mouse_cursor.zig");
 const wl = wayland.client.wl;
 const xdg = wayland.client.xdg;
 const wp = wayland.client.wp;
@@ -55,6 +56,8 @@ pub const DisplayState = struct {
     layer_shell: ?*zwlr.LayerShellV1 = null,
     viewporter: ?*wp.Viewporter = null,
     fractional_scale_manager: ?*wp.FractionalScaleManagerV1 = null,
+    cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
+    cursor_shape_unavailable_logged: bool = false,
     seat: ?*wl.Seat = null,
     /// wl_seat 宣告的 capability。只有对应 bit 存在时才创建 pointer/keyboard proxy；
     /// 无头 compositor 可能宣告一个两项 capability 都没有的 seat，此时无条件调用
@@ -67,9 +70,14 @@ pub const DisplayState = struct {
     pointer_event_callback: ?PointerEventCallback = null,
     pointer_event_context: ?*anyopaque = null,
     current_pointer_surface: ?*wl.Surface = null,
+    /// cursor-shape-v1 与 wl_pointer.set_cursor 都要求最新 pointer.enter serial；
+    /// pointer leave 或 capability 移除后旧 serial 不得复用。
+    pointer_enter_serial: ?u32 = null,
     scale_change_callback: ?ScaleChangeCallback = null,
     scale_change_context: ?*anyopaque = null,
     pointer: ?*wl.Pointer = null,
+    /// 由 cursor_shape_manager 和 pointer 共同派生，必须先于 pointer 销毁。
+    cursor_shape_device: ?*wp.CursorShapeDeviceV1 = null,
     keyboard: ?*wl.Keyboard = null,
     data_control: ?*data_control.DataControl = null,
     ime: ?*ime_v3.ImeV3 = null,
@@ -159,7 +167,7 @@ pub const DisplayState = struct {
             gles_library.close();
             self.gles_library = null;
         }
-        if (self.pointer) |pointer| pointer.release();
+        self.destroyPointer();
         if (self.keyboard) |keyboard| keyboard.release();
         if (self.seat) |seat| seat.release();
         for (self.outputs.items) |output_state| {
@@ -168,6 +176,7 @@ pub const DisplayState = struct {
         self.outputs.deinit(self.allocator);
         self.outputs = .empty;
         if (self.layer_shell) |layer_shell| layer_shell.destroy();
+        if (self.cursor_shape_manager) |manager| manager.destroy();
         if (self.fractional_scale_manager) |manager| manager.destroy();
         if (self.viewporter) |viewporter| viewporter.destroy();
         if (self.wm_base) |wm_base| wm_base.destroy();
@@ -181,8 +190,8 @@ pub const DisplayState = struct {
         self.layer_shell = null;
         self.viewporter = null;
         self.fractional_scale_manager = null;
+        self.cursor_shape_manager = null;
         self.seat = null;
-        self.pointer = null;
     }
 
     // ── 进程级初始化: 单一 queue 绑定全部对象 + 输入 ──────
@@ -202,6 +211,7 @@ pub const DisplayState = struct {
         if (self.layer_shell) |layer_shell| layer_shell.setQueue(queue);
         if (self.viewporter) |viewporter| viewporter.setQueue(queue);
         if (self.fractional_scale_manager) |manager| manager.setQueue(queue);
+        if (self.cursor_shape_manager) |manager| manager.setQueue(queue);
         for (self.outputs.items) |output_state| {
             if (output_state.output) |output| output.setQueue(queue);
         }
@@ -216,15 +226,63 @@ pub const DisplayState = struct {
     }
 
     fn ensurePointer(self: *DisplayState) void {
-        const seat = self.seat orelse return;
-        if (self.pointer != null) return;
-        if (!self.seat_capabilities.pointer) return; // 无头 compositor: seat 无 pointer 能力
-        self.pointer = seat.getPointer() catch {
-            std.debug.print("wl_seat.get_pointer failed.\n", .{});
+        if (!self.seat_capabilities.pointer) {
+            self.destroyPointer();
+            return;
+        }
+        if (self.pointer == null) {
+            const seat = self.seat orelse return;
+            self.pointer = seat.getPointer() catch {
+                std.debug.print("wl_seat.get_pointer failed.\n", .{});
+                return;
+            };
+            self.pointer.?.setListener(*DisplayState, pointerListener, self);
+            if (self.shared_queue) |queue| self.pointer.?.setQueue(queue);
+        }
+        self.ensureCursorShapeDevice();
+    }
+
+    fn ensureCursorShapeDevice(self: *DisplayState) void {
+        if (self.cursor_shape_device != null) return;
+        const manager = self.cursor_shape_manager orelse return;
+        const pointer = self.pointer orelse return;
+        self.cursor_shape_device = manager.getPointer(pointer) catch {
+            std.debug.print("wp_cursor_shape_manager_v1.get_pointer failed.\n", .{});
             return;
         };
-        self.pointer.?.setListener(*DisplayState, pointerListener, self);
-        if (self.shared_queue) |queue| self.pointer.?.setQueue(queue);
+        if (self.shared_queue) |queue| self.cursor_shape_device.?.setQueue(queue);
+    }
+
+    fn destroyPointer(self: *DisplayState) void {
+        if (self.cursor_shape_device) |device| device.destroy();
+        self.cursor_shape_device = null;
+        if (self.pointer) |pointer| pointer.release();
+        self.pointer = null;
+        self.current_pointer_surface = null;
+        self.pointer_enter_serial = null;
+    }
+
+    /// 返回 false 表示 compositor 没有 cursor-shape-v1，调用方应以空 platform
+    /// response 告知 Flutter OptionalMethodChannel。当前无 pointer focus 时请求已被接受，
+    /// 但不会用过期 serial 发送 Wayland request。
+    pub fn activateCursorShape(self: *DisplayState, shape: mouse_cursor.Shape) bool {
+        if (self.cursor_shape_manager == null) {
+            if (!self.cursor_shape_unavailable_logged) {
+                std.debug.print("[info] Wayland compositor does not support cursor-shape-v1; keeping its default cursor.\n", .{});
+                self.cursor_shape_unavailable_logged = true;
+            }
+            return false;
+        }
+        const serial = self.pointer_enter_serial orelse return true;
+        if (shape == .hidden) {
+            const pointer = self.pointer orelse return true;
+            pointer.setCursor(serial, null, 0, 0);
+        } else {
+            const device = self.cursor_shape_device orelse return false;
+            device.setShape(serial, waylandCursorShape(shape));
+        }
+        self.flush();
+        return true;
     }
 
     fn ensureKeyboard(self: *DisplayState) void {
@@ -317,6 +375,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
                 self.viewporter = viewporter;
             } else if (bindGlobal(registry, global, wp.FractionalScaleManagerV1)) |manager| {
                 self.fractional_scale_manager = manager;
+            } else if (bindGlobal(registry, global, wp.CursorShapeManagerV1)) |manager| {
+                self.cursor_shape_manager = manager;
+                if (self.shared_queue) |queue| manager.setQueue(queue);
+                self.ensureCursorShapeDevice();
             } else if (bindGlobal(registry, global, zwlr.LayerShellV1)) |layer_shell| {
                 self.layer_shell = layer_shell;
             } else if (bindGlobal(registry, global, zwlr.DataControlManagerV1)) |manager| {
@@ -443,14 +505,55 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *DisplaySta
     }
 }
 
+fn waylandCursorShape(shape: mouse_cursor.Shape) wp.CursorShapeDeviceV1.Shape {
+    return switch (shape) {
+        .hidden, .default => .default,
+        .context_menu => .context_menu,
+        .help => .help,
+        .pointer => .pointer,
+        .progress => .progress,
+        .wait => .wait,
+        .cell => .cell,
+        .crosshair => .crosshair,
+        .text => .text,
+        .vertical_text => .vertical_text,
+        .alias => .alias,
+        .copy => .copy,
+        .move => .move,
+        .no_drop => .no_drop,
+        .not_allowed => .not_allowed,
+        .grab => .grab,
+        .grabbing => .grabbing,
+        .all_scroll => .all_scroll,
+        .col_resize => .col_resize,
+        .row_resize => .row_resize,
+        .n_resize => .n_resize,
+        .e_resize => .e_resize,
+        .s_resize => .s_resize,
+        .w_resize => .w_resize,
+        .ne_resize => .ne_resize,
+        .nw_resize => .nw_resize,
+        .se_resize => .se_resize,
+        .sw_resize => .sw_resize,
+        .ew_resize => .ew_resize,
+        .ns_resize => .ns_resize,
+        .nesw_resize => .nesw_resize,
+        .nwse_resize => .nwse_resize,
+        .zoom_in => .zoom_in,
+        .zoom_out => .zoom_out,
+    };
+}
+
 fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *DisplayState) void {
     const surface = switch (event) {
         .enter => |enter| blk: {
             self.current_pointer_surface = enter.surface;
+            self.pointer_enter_serial = enter.serial;
             break :blk enter.surface;
         },
         .leave => |leave| blk: {
             self.current_pointer_surface = null;
+            self.pointer_enter_serial = null;
             break :blk leave.surface;
         },
         else => self.current_pointer_surface,
