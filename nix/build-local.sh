@@ -65,6 +65,7 @@ nix build --impure --expr '
     flake.lib.mkFushell {
       inherit pkgs;
       engineArtifacts = {
+        revision = pkgs.flutter.engineVersion;
         debug = importArtifact "fushell-flutter-engine-debug.so" "FUSHELL_NIX_ENGINE_DEBUG";
         profile = importArtifact "fushell-flutter-engine-profile.so" "FUSHELL_NIX_ENGINE_PROFILE";
         release = importArtifact "fushell-flutter-engine-release.so" "FUSHELL_NIX_ENGINE_RELEASE";

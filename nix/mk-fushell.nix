@@ -24,10 +24,20 @@
   zigDeps,
   version ? "0.1.0",
 }:
+assert lib.assertMsg (engineArtifacts ? revision)
+  "mkFushell requires engineArtifacts.revision";
 assert lib.assertMsg (engineArtifacts ? debug && engineArtifacts ? profile && engineArtifacts ? release)
   "mkFushell requires engineArtifacts.debug, engineArtifacts.profile, and engineArtifacts.release";
+assert lib.assertMsg (builtins.isString engineArtifacts.revision && builtins.match "[0-9a-f]{40}" engineArtifacts.revision != null)
+  "mkFushell requires engineArtifacts.revision to be 40 lowercase hexadecimal characters";
+assert lib.assertMsg (flutter ? engineVersion)
+  "mkFushell requires the selected Flutter package to expose engineVersion";
+assert lib.assertMsg (engineArtifacts.revision == flutter.engineVersion)
+  "mkFushell engine artifact revision ${engineArtifacts.revision} does not match Flutter SDK engine revision ${flutter.engineVersion}";
 let
   root = ../.;
+  engineRevision = engineArtifacts.revision;
+  engineArtifactValidator = ./validate-engine-artifacts.sh;
   glibcVersion = lib.versions.majorMinor stdenv.cc.libc.version;
   runtimeLibraryLinks = buildEnv {
     name = "fushell-runtime-library-links";
@@ -124,6 +134,11 @@ stdenv.mkDerivation (finalAttrs: {
   buildPhase = ''
     runHook preBuild
     ${zigCacheSetup}
+    bash ${engineArtifactValidator} \
+      ${lib.escapeShellArg engineRevision} \
+      ${lib.escapeShellArg (toString engineArtifacts.debug)} \
+      ${lib.escapeShellArg (toString engineArtifacts.profile)} \
+      ${lib.escapeShellArg (toString engineArtifacts.release)}
     zig build ${lib.escapeShellArgs finalAttrs.zigBuildFlags}
     runHook postBuild
   '';
@@ -179,7 +194,7 @@ stdenv.mkDerivation (finalAttrs: {
   '';
 
   passthru = {
-    inherit engineArtifacts runtimeLibraries;
+    inherit engineArtifacts engineRevision runtimeLibraries;
   };
 
   meta = {

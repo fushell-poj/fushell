@@ -19,7 +19,7 @@ This installs:
 
 ## NixOS package
 
-NixOS 是当前正式支持的发布环境。完整 CLI 需要匹配 revision 的 debug、profile、release Flutter engine artifacts；flake 暴露参数化的 `lib.mkFushell`，不会在纯 derivation 中读取开发机路径。
+NixOS 是当前正式支持的发布环境。完整 CLI 需要匹配 revision 的 debug、profile、release Flutter engine artifacts；flake 暴露参数化的 `lib.mkFushell`，不会在纯 derivation 中读取开发机路径。构造器要求显式 `engineArtifacts.revision`，并在 Zig 编译前确认它与 Flutter SDK 及三份二进制均一致。
 
 使用本地 engine workspace 构建完整 Nix package：
 
