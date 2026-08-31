@@ -117,6 +117,7 @@ dbus-run-session -- bash -euo pipefail -c '
   "$runner" list | grep -q "^${view_id}[[:space:]]Integration window$"
   "$runner" close "$view_id"
   [[ -z "$("$runner" list)" ]]
+  "$runner" closed | grep -q "^${view_id}$"
 
   set +e
   "$runner" unknown >"$tmp/unknown.out" 2>"$tmp/unknown.err"
@@ -139,6 +140,44 @@ dbus-run-session -- bash -euo pipefail -c '
   sleep 0.9
   "$runner" status | grep -q "daemon running"
 
+  # 回调在宽限期内完成时释放 active 槽，排队命令继续执行且 daemon 不重启。
+  set +e
+  "$runner" wait 60000 >"$tmp/grace.out" 2>"$tmp/grace.err"
+  grace_code=$?
+  set -e
+  [[ $grace_code == 124 ]]
+  grep -q "command timed out" "$tmp/grace.err"
+  "$runner" status | grep -q "daemon running"
+  kill -0 "$cage_pid"
+
+  # 不协作的回调先收到超时回复；取消宽限期结束后 daemon 退出，避免永久阻塞命令队列。
+  set +e
+  "$runner" hang 35000 >"$tmp/timeout.out" 2>"$tmp/timeout.err"
+  timeout_code=$?
+  set -e
+  [[ $timeout_code == 124 ]]
+  grep -q "command timed out" "$tmp/timeout.err"
+  wait "$cage_pid"
+  cage_pid=
+  grep -q "Application command ignored cancellation; restarting daemon" "$tmp/daemon.log"
+
+  # 超时调用不得重放；后续 launcher 成为新 primary，且其首次命令只执行一次。
+  cage -- "$runner" status >"$tmp/restart.log" 2>&1 &
+  cage_pid=$!
+  restarted=0
+  for _ in $(seq 1 100); do
+    if grep -q "daemon running" "$tmp/restart.log" 2>/dev/null; then
+      restarted=1
+      break
+    fi
+    if ! kill -0 "$cage_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.05
+  done
+  [[ $restarted == 1 ]]
+  [[ $(grep -c "daemon running" "$tmp/restart.log") == 1 ]]
+  "$runner" status | grep -q "daemon running"
   "$runner" quit | grep -q "stopping daemon"
   wait "$cage_pid"
   cage_pid=

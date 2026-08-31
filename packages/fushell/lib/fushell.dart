@@ -9,17 +9,25 @@ import 'package:flutter/widgets.dart';
 
 const String _surfaceChannel = 'dev.fushell/surface';
 const String _applicationChannel = 'dev.fushell/application';
+const String _windowEventsChannel = 'dev.fushell/window-events';
 
 /// One process invocation delivered by Fushell's native application broker.
 ///
 /// [arguments] and [workingDirectory] preserve the original Unix bytes. The
 /// convenience text accessors use UTF-8 and replace malformed sequences.
 final class FushellCommandInvocation {
-  const FushellCommandInvocation({
+  FushellCommandInvocation({
     required this.arguments,
     required this.workingDirectory,
     required this.isInitial,
-  });
+  }) : _cancellation = _FushellCommandCancellation();
+
+  FushellCommandInvocation._internal({
+    required this.arguments,
+    required this.workingDirectory,
+    required this.isInitial,
+    required _FushellCommandCancellation cancellation,
+  }) : _cancellation = cancellation;
 
   /// 进程入口收到的原始参数字节串，不包含可执行文件名本身。
   final List<Uint8List> arguments;
@@ -30,6 +38,14 @@ final class FushellCommandInvocation {
   /// Whether this invocation started the primary daemon process.
   final bool isInitial;
 
+  final _FushellCommandCancellation _cancellation;
+
+  /// native broker 是否已请求本次命令尽快结束。
+  bool get isCancellationRequested => _cancellation.isRequested;
+
+  /// native broker 请求取消时完成；重复取消只完成一次。
+  Future<void> get cancelled => _cancellation.whenRequested;
+
   /// 供常规文本命令解析器使用的有损 UTF-8 视图。
   /// 文件名或参数可能包含非 UTF-8 字节时应改用 [arguments]。
   List<String> get textArguments => arguments
@@ -39,6 +55,22 @@ final class FushellCommandInvocation {
   /// [workingDirectory] 的有损 UTF-8 视图。
   String get textWorkingDirectory =>
       utf8.decode(workingDirectory, allowMalformed: true);
+}
+
+final class _FushellCommandCancellation {
+  _FushellCommandCancellation();
+
+  final Completer<void> _requested = Completer<void>();
+
+  bool get isRequested => _requested.isCompleted;
+
+  Future<void> get whenRequested => _requested.future;
+
+  void _request() {
+    if (!_requested.isCompleted) {
+      _requested.complete();
+    }
+  }
 }
 
 /// 返回给应用命令调用进程的完成结果。
@@ -74,8 +106,8 @@ final class FushellCommandResult {
 
 /// 由应用拥有的首次启动与远程调用命令分发器。
 ///
-/// Fushell 同一时刻最多调用一个 handler。远程调用方在 30 秒后收到超时，但 Future
-/// 不会被取消；后续命令继续排队，直到该 Future 完成，从而保持 FIFO 与不可重入性。
+/// Fushell 同一时刻最多调用一个 handler。远程调用方在 30 秒后收到超时，随后
+/// [FushellCommandInvocation.cancelled] 完成；handler 有两秒时间完成清理并返回。
 typedef FushellCommandHandler =
     FutureOr<FushellCommandResult> Function(FushellCommandInvocation command);
 
@@ -91,6 +123,8 @@ final class FushellApplication {
     JSONMethodCodec(),
   );
   static FushellCommandHandler? _handler;
+  static int? _activeCommandId;
+  static _FushellCommandCancellation? _activeCancellation;
 
   /// 安装 [onCommand]，并释放 Dart 启动期间排队的 invocation。
   ///
@@ -104,6 +138,25 @@ final class FushellApplication {
   }
 
   static Future<void> _handleMethodCall(MethodCall call) async {
+    if (call.method == 'cancel') {
+      if (call.arguments is! Map<Object?, Object?>) {
+        throw PlatformException(
+          code: 'ApplicationProtocol',
+          message: 'malformed application cancellation',
+        );
+      }
+      final Object? id = (call.arguments! as Map<Object?, Object?>)['id'];
+      if (id is! int) {
+        throw PlatformException(
+          code: 'ApplicationProtocol',
+          message: 'malformed application cancellation',
+        );
+      }
+      if (_activeCommandId == id) {
+        _activeCancellation?._request();
+      }
+      return;
+    }
     if (call.method != 'dispatch' || call.arguments is! Map<Object?, Object?>) {
       throw PlatformException(
         code: 'ApplicationProtocol',
@@ -126,19 +179,25 @@ final class FushellApplication {
       );
     }
 
-    final FushellCommandInvocation invocation = FushellCommandInvocation(
-      arguments: argumentsValue
-          .map((Object? value) {
-            if (value is! String) {
-              throw const FormatException('argument is not a hex string');
-            }
-            return _decodeHex(value);
-          })
-          .toList(growable: false),
-      workingDirectory: _decodeHex(cwdValue),
-      isInitial: initialValue,
-    );
+    final _FushellCommandCancellation cancellation =
+        _FushellCommandCancellation();
+    final FushellCommandInvocation invocation =
+        FushellCommandInvocation._internal(
+          arguments: argumentsValue
+              .map((Object? value) {
+                if (value is! String) {
+                  throw const FormatException('argument is not a hex string');
+                }
+                return _decodeHex(value);
+              })
+              .toList(growable: false),
+          workingDirectory: _decodeHex(cwdValue),
+          isInitial: initialValue,
+          cancellation: cancellation,
+        );
 
+    _activeCommandId = idValue;
+    _activeCancellation = cancellation;
     FushellCommandResult result;
     try {
       final FushellCommandHandler handler = _handler!;
@@ -148,6 +207,11 @@ final class FushellApplication {
         exitCode: 70,
         stderr: 'Unhandled application command error: $error\n$stackTrace\n',
       );
+    } finally {
+      if (_activeCommandId == idValue) {
+        _activeCommandId = null;
+        _activeCancellation = null;
+      }
     }
 
     await _channel.invokeMethod<void>('complete', <String, Object?>{
@@ -157,6 +221,16 @@ final class FushellApplication {
       'stderrHex': _encodeHex(result.stderr),
     });
   }
+}
+
+/// native 窗口完成 Flutter RemoveView 与 Wayland/EGL 销毁后的通知。
+///
+/// 收到事件时对应 ID 已不能再用于窗口更新或关闭；应用应按 ID 幂等移除
+/// `ViewCollection` 中的 Widget 状态。
+final class FushellWindowClosedEvent {
+  const FushellWindowClosedEvent({required this.windowId});
+
+  final int windowId;
 }
 
 /// 为无头 Flutter 引擎创建并控制 native surface。
@@ -177,6 +251,20 @@ final class FushellWindow {
 
   static int _nextRequestId = 1;
   static Future<void>? _fontFallbackLoad;
+  static bool _windowEventsInitialized = false;
+  static final StreamController<FushellWindowClosedEvent> _closedEvents =
+      StreamController<FushellWindowClosedEvent>.broadcast(sync: true);
+  static const BasicMessageChannel<String> _eventsChannel =
+      BasicMessageChannel<String>(_windowEventsChannel, StringCodec());
+
+  /// 所有窗口的关闭完成事件。
+  ///
+  /// 该广播流不会在单个窗口关闭后结束。`closeWindow` 的 Future 与事件彼此独立；
+  /// 两者都只在 native 资源销毁后完成，但调用方不得依赖二者的先后顺序。
+  static Stream<FushellWindowClosedEvent> get closed {
+    _ensureWindowEventsInitialized();
+    return _closedEvents.stream;
+  }
 
   /// 创建 native surface，并在 Flutter 接受新 view 后完成。
   ///
@@ -192,6 +280,7 @@ final class FushellWindow {
     int? parent,
     LayerSurfaceRole? layer,
   }) async {
+    _ensureWindowEventsInitialized();
     await _ensureSystemFontFallbackLoaded();
     final Map<String, Object?> role = layer == null
         ? <String, Object?>{
@@ -266,6 +355,29 @@ final class FushellWindow {
       code: 'ViewNotFound',
       message: 'view $windowId did not appear in PlatformDispatcher.views',
     );
+  }
+
+  static void _ensureWindowEventsInitialized() {
+    if (_windowEventsInitialized) return;
+    _windowEventsInitialized = true;
+    _eventsChannel.setMessageHandler((String? message) async {
+      if (message == null) return '';
+      final Object? decoded;
+      try {
+        decoded = jsonDecode(message);
+      } on FormatException {
+        return '';
+      }
+      if (decoded is! Map<String, Object?> ||
+          decoded['event'] != 'window.closed') {
+        return '';
+      }
+      final Object? windowId = decoded['windowId'];
+      if (windowId is int) {
+        _closedEvents.add(FushellWindowClosedEvent(windowId: windowId));
+      }
+      return '';
+    });
   }
 
   static Future<void> _ensureSystemFontFallbackLoaded() {

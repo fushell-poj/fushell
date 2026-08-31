@@ -126,9 +126,12 @@ bytes; applications may choose their own decoding policy. `isInitial` marks the
 first process invocation. Commands are processed in arrival order with one
 active callback at a time. Secondary processes mirror the returned stdout,
 stderr, and exit code. A handler exception becomes exit code 70. If a callback
-exceeds 30 seconds, its caller receives 124; the late completion is ignored and
-later callbacks remain serialized behind it rather than overlapping. Closing
-every window does not stop the single-instance daemon.
+exceeds 30 seconds, its caller receives 124, the active invocation's `cancelled`
+future completes, and `isCancellationRequested` becomes true. The handler then
+has a two-second grace period to release resources and return. If it still does not
+finish, the daemon rejects queued calls, exits cleanly, and the next invocation
+starts a fresh daemon; timed-out commands are never replayed. Closing every
+window does not stop the single-instance daemon.
 
 Single-instance startup fails explicitly if the session D-Bus is unavailable.
 The runner uses a private native `libdbus-1` connection; applications do not
@@ -181,8 +184,11 @@ Future<void> main() async {
 // Removes the view and destroys the window's Wayland surface.
 await FushellWindow.closeWindow(settingsWindowId);
 
-// A compositor close request (for example, the title-bar close button) follows
-// the same asynchronous RemoveView lifecycle.
+// compositor 的关闭请求（例如标题栏关闭按钮）同样经过异步 RemoveView 生命周期。
+// 无论关闭由应用还是 compositor 发起，都要同步移除 ViewCollection 中的状态。
+final subscription = FushellWindow.closed.listen((event) {
+  removeViewWidget(event.windowId); // 该更新必须幂等。
+});
 
 // Explicit process exit (headless shell termination).
 await FushellProcess.exit(0);

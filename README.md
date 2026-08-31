@@ -125,8 +125,9 @@ zig build -Doptimize=ReleaseFast
 
 The integration step uses a private session bus and headless Cage compositor.
 It covers primary/secondary startup, binary argv and cwd transport, output and
-exit-code propagation, application-defined window commands, signal handling,
-ownership races, secondary fast-path loading, and idle CPU/FD stability.
+exit-code propagation, application-defined window commands, command timeout
+recovery, signal handling, ownership races, secondary fast-path loading, and
+idle CPU/FD stability.
 
 See [`packages/fushell/README.md`](packages/fushell/README.md) for the Dart API,
 window ownership model, parent relationships, layer surfaces, and multi-view

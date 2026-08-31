@@ -16,8 +16,8 @@ pub const object_path = "/dev/fushell/Application";
 pub const interface_name = "dev.fushell.Application1";
 pub const command_method = "CommandLine";
 pub const command_timeout_ms: i32 = 30_000;
+pub const cancellation_grace_ms: i32 = 2_000;
 const client_timeout_ms: i32 = command_timeout_ms + 5_000;
-const max_external_fds = 8;
 const max_invocation_payload_size = 8 * 1024 * 1024;
 
 /// 跨进程返回的应用命令完成结果。
@@ -59,9 +59,10 @@ const QueuedInvocation = struct {
     data: InvocationData,
     message: ?*c.DBusMessage,
     deadline: std.Io.Timestamp,
-    /// The caller already received a timeout, but Dart still owns this callback.
-    /// Keep the active slot until its late completion to preserve serialization.
+    /// 调用方已收到超时回复，但 Dart 仍拥有此回调。宽限期内保留 active 槽，
+    /// 既避免 handler 重入，也允许协作取消完成清理。
     replied: bool = false,
+    cancellation_deadline: ?std.Io.Timestamp = null,
 
     fn deinit(self: *QueuedInvocation, gpa: std.mem.Allocator) void {
         self.data.deinit(gpa);
@@ -69,6 +70,27 @@ const QueuedInvocation = struct {
         self.* = undefined;
     }
 };
+
+const CommandTimeoutAction = enum {
+    none,
+    timeout,
+    restart,
+};
+
+fn commandTimeoutAction(invocation: QueuedInvocation, now: std.Io.Timestamp) CommandTimeoutAction {
+    if (!invocation.replied)
+        return if (now.nanoseconds >= invocation.deadline.nanoseconds) .timeout else .none;
+    const cancellation_deadline = invocation.cancellation_deadline orelse return .none;
+    return if (now.nanoseconds >= cancellation_deadline.nanoseconds) .restart else .none;
+}
+
+fn recoveryCommandResult() CommandResult {
+    return .{
+        .exit_code = 75,
+        .stdout = @constCast(&[_]u8{}),
+        .stderr = @constCast("application daemon is restarting after an unresponsive command\n"),
+    };
+}
 
 const TimeoutEntry = struct {
     timeout: *c.DBusTimeout,
@@ -99,6 +121,8 @@ pub const Broker = struct {
     timeouts: std.ArrayList(TimeoutEntry) = .empty,
     queued: std.ArrayList(QueuedInvocation) = .empty,
     active: ?QueuedInvocation = null,
+    cancellation_request: ?u64 = null,
+    recovery_exit_requested: bool = false,
     next_id: u64 = 1,
 
     pub fn open(
@@ -216,8 +240,11 @@ pub const Broker = struct {
             result = minimumTimeout(result, deadlineTimeoutMs(now, entry.deadline));
         }
         if (self.active) |active| {
-            if (!active.replied)
+            if (!active.replied) {
                 result = minimumTimeout(result, deadlineTimeoutMs(now, active.deadline));
+            } else if (active.cancellation_deadline) |deadline| {
+                result = minimumTimeout(result, deadlineTimeoutMs(now, deadline));
+            }
         }
         for (self.queued.items) |queued| {
             result = minimumTimeout(result, deadlineTimeoutMs(now, queued.deadline));
@@ -238,6 +265,18 @@ pub const Broker = struct {
 
     pub fn hasActiveInvocation(self: *const Broker) bool {
         return self.active != null;
+    }
+
+    /// 返回一次待发送给 Dart handler 的协作取消请求。
+    pub fn takeCancellationRequest(self: *Broker) ?u64 {
+        const request = self.cancellation_request;
+        self.cancellation_request = null;
+        return request;
+    }
+
+    /// handler 未在取消宽限期内结束时，要求 runner 进入既有有序关闭流程。
+    pub fn recoveryExitRequested(self: *const Broker) bool {
+        return self.recovery_exit_requested;
     }
 
     pub fn complete(self: *Broker, id: u64, result: CommandResult) !void {
@@ -350,9 +389,21 @@ pub const Broker = struct {
         };
 
         if (self.active) |*active| {
-            if (!active.replied and now.nanoseconds >= active.deadline.nanoseconds) {
-                try self.finishInvocation(active.*, timeout_result);
-                active.replied = true;
+            switch (commandTimeoutAction(active.*, now)) {
+                .none => {},
+                .timeout => {
+                    active.replied = true;
+                    active.cancellation_deadline = cancellationDeadline(now);
+                    self.cancellation_request = active.data.id;
+                    self.finishInvocation(active.*, timeout_result) catch |err| {
+                        std.debug.print("[error] failed to send command timeout reply: {s}\n", .{@errorName(err)});
+                    };
+                },
+                .restart => {
+                    active.cancellation_deadline = null;
+                    self.recovery_exit_requested = true;
+                    self.rejectQueuedForRecovery();
+                },
             }
         }
 
@@ -364,7 +415,18 @@ pub const Broker = struct {
             }
             var expired = self.queued.orderedRemove(index);
             defer expired.deinit(self.gpa);
-            try self.finishInvocation(expired, timeout_result);
+            self.finishInvocation(expired, timeout_result) catch |err| {
+                std.debug.print("[error] failed to send queued command timeout reply: {s}\n", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn rejectQueuedForRecovery(self: *Broker) void {
+        const result = recoveryCommandResult();
+        while (self.queued.items.len > 0) {
+            var queued = self.queued.orderedRemove(0);
+            defer queued.deinit(self.gpa);
+            self.finishInvocation(queued, result) catch {};
         }
     }
 
@@ -430,6 +492,11 @@ fn filterCallback(
         return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     if (c.dbus_message_is_method_call(message, interface_name, command_method) == 0)
         return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    if (broker.recovery_exit_requested) {
+        sendCommandReply(broker.connection, message, recoveryCommandResult()) catch {};
+        return c.DBUS_HANDLER_RESULT_HANDLED;
+    }
 
     const payload = readByteArray(message) catch {
         sendErrorReply(broker.connection, message, "dev.fushell.Error.InvalidCommand", "invalid command payload");
@@ -518,6 +585,10 @@ fn timeoutDeadline(io: std.Io, timeout: *c.DBusTimeout) std.Io.Timestamp {
 
 fn commandDeadline(io: std.Io) std.Io.Timestamp {
     return std.Io.Clock.awake.now(io).addDuration(std.Io.Duration.fromMilliseconds(command_timeout_ms));
+}
+
+fn cancellationDeadline(now: std.Io.Timestamp) std.Io.Timestamp {
+    return now.addDuration(std.Io.Duration.fromMilliseconds(cancellation_grace_ms));
 }
 
 fn deadlineTimeoutMs(now: std.Io.Timestamp, deadline: std.Io.Timestamp) i32 {
@@ -748,7 +819,7 @@ test "invocation envelope rejects oversized payload" {
     );
 }
 
-test "timed-out callback remains serialized until late completion" {
+test "cancelled callback remains serialized until late completion" {
     const allocator = std.testing.allocator;
     const deadline = std.Io.Clock.awake.now(std.testing.io);
     var broker: Broker = .{
@@ -776,6 +847,9 @@ test "timed-out callback remains serialized until late completion" {
         .message = null,
         .deadline = deadline,
         .replied = true,
+        .cancellation_deadline = deadline.addDuration(
+            std.Io.Duration.fromMilliseconds(cancellation_grace_ms),
+        ),
     };
     try broker.queued.append(allocator, .{
         .data = .{
@@ -788,13 +862,64 @@ test "timed-out callback remains serialized until late completion" {
         .deadline = deadline,
     });
 
-    try std.testing.expectEqual(deadline.nanoseconds, broker.nextTimeout().?.nanoseconds);
     try std.testing.expect(broker.nextInvocation() == null);
     const empty = @constCast(&[_]u8{});
     try broker.complete(1, .{ .stdout = empty, .stderr = empty });
     const next = broker.nextInvocation() orelse return error.MissingQueuedInvocation;
     try std.testing.expectEqual(@as(u64, 2), next.id);
     try broker.complete(2, .{ .stdout = empty, .stderr = empty });
+}
+
+test "command timeout requests cancellation before daemon restart" {
+    const deadline = std.Io.Timestamp{ .nanoseconds = 100 };
+    var invocation = QueuedInvocation{
+        .data = undefined,
+        .message = null,
+        .deadline = deadline,
+    };
+
+    try std.testing.expectEqual(.none, commandTimeoutAction(invocation, .{ .nanoseconds = 99 }));
+    try std.testing.expectEqual(.timeout, commandTimeoutAction(invocation, deadline));
+
+    invocation.replied = true;
+    invocation.cancellation_deadline = .{ .nanoseconds = 2100 };
+    try std.testing.expectEqual(.none, commandTimeoutAction(invocation, .{ .nanoseconds = 2099 }));
+    try std.testing.expectEqual(.restart, commandTimeoutAction(invocation, .{ .nanoseconds = 2100 }));
+}
+
+test "recovery requests are one-shot and reject queued commands" {
+    const allocator = std.testing.allocator;
+    const deadline = std.Io.Clock.awake.now(std.testing.io);
+    var broker: Broker = .{
+        .gpa = allocator,
+        .io = std.testing.io,
+        .connection = undefined,
+        .bus_name = try allocator.dupeZ(u8, "dev.fushell.Test"),
+    };
+    defer {
+        for (broker.queued.items) |*queued| queued.deinit(allocator);
+        broker.queued.deinit(allocator);
+        broker.watches.deinit(allocator);
+        broker.timeouts.deinit(allocator);
+        allocator.free(broker.bus_name);
+    }
+
+    broker.cancellation_request = 17;
+    try std.testing.expectEqual(@as(?u64, 17), broker.takeCancellationRequest());
+    try std.testing.expectEqual(@as(?u64, null), broker.takeCancellationRequest());
+
+    try broker.queued.append(allocator, .{
+        .data = .{
+            .id = 18,
+            .is_initial = false,
+            .arguments = try allocator.alloc([]u8, 0),
+            .cwd = try allocator.dupe(u8, ""),
+        },
+        .message = null,
+        .deadline = deadline,
+    });
+    broker.rejectQueuedForRecovery();
+    try std.testing.expectEqual(@as(usize, 0), broker.queued.items.len);
 }
 
 test "poll and dbus watch flags round trip" {

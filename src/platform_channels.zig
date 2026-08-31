@@ -6,6 +6,7 @@ const surface_channel = @import("surface_channel.zig");
 const clipboard_service = @import("clipboard_service.zig");
 
 pub const application_channel_name = "dev.fushell/application";
+pub const window_events_channel_name = "dev.fushell/window-events";
 
 pub const Channel = enum {
     surface,
@@ -57,6 +58,14 @@ pub const Response = struct {
         if (!self.completed) self.transferred = true;
     }
 };
+
+pub fn encodeWindowClosedEvent(gpa: std.mem.Allocator, window_id: i64) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "{{\"event\":\"window.closed\",\"windowId\":{d}}}",
+        .{window_id},
+    );
+}
 
 pub fn encodeClipboardText(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     const escaped = try escapeJsonString(gpa, text);
@@ -530,6 +539,16 @@ fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "window close event carries the completed view id" {
+    const payload = try encodeWindowClosedEvent(std.testing.allocator, 42);
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"event\":\"window.closed\",\"windowId\":42}",
+        payload,
+    );
 }
 
 test "response completes exactly once" {

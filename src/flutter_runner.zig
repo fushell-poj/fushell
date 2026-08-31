@@ -595,6 +595,15 @@ const Runner = struct {
         return timeout;
     }
 
+    pub fn notifyWindowClosed(self: *Runner, window_id: i64) void {
+        const payload = platform_channels.encodeWindowClosedEvent(self.gpa, window_id) catch |err| {
+            std.debug.print("[error] failed to encode window close event: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer self.gpa.free(payload);
+        self.sendToEngine(platform_channels.window_events_channel_name, payload);
+    }
+
     pub fn applicationSetReady(self: *Runner) void {
         self.application_ready = true;
         self.dispatchNextApplicationInvocation() catch |err| {
@@ -629,7 +638,21 @@ const Runner = struct {
         defer self.gpa.free(payload);
         self.sendToEngine(platform_channels.application_channel_name, payload);
     }
+
+    fn sendApplicationCancellation(self: *Runner, id: u64) void {
+        var buffer: [96]u8 = undefined;
+        const payload = encodeApplicationCancellation(&buffer, id);
+        self.sendToEngine(platform_channels.application_channel_name, payload);
+    }
 };
+
+fn encodeApplicationCancellation(buffer: *[96]u8, id: u64) []const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "{{\"method\":\"cancel\",\"args\":{{\"id\":{d}}}}}",
+        .{id},
+    ) catch unreachable;
+}
 
 fn appendHex(gpa: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
     const alphabet = "0123456789abcdef";
@@ -957,6 +980,14 @@ fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_dat
     runner.queueFlutterTask(task, target_time_nanos);
 }
 
+test "application cancellation message carries invocation id" {
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"method\":\"cancel\",\"args\":{\"id\":42}}",
+        encodeApplicationCancellation(&buffer, 42),
+    );
+}
+
 test "Flutter task callbacks reject null context" {
     try std.testing.expect(!runsTaskOnCurrentThreadCallback(null));
     postFlutterTaskCallback(std.mem.zeroes(c.FlutterTask), 0, null);
@@ -966,7 +997,14 @@ fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     const runner = fromUserData(user_data);
     if (runner.application_broker) |broker| {
         try broker.pump();
-        try runner.dispatchNextApplicationInvocation();
+        if (broker.takeCancellationRequest()) |id|
+            runner.sendApplicationCancellation(id);
+        if (broker.recoveryExitRequested()) {
+            std.debug.print("Application command ignored cancellation; restarting daemon.\n", .{});
+            runner.quit_requested.store(true, .release);
+        } else {
+            try runner.dispatchNextApplicationInvocation();
+        }
     }
     processViewLifecycleResults(runner);
     processCompositorCloseRequests(runner);
@@ -1250,12 +1288,22 @@ fn removeViewCallback(result: [*c]const c.FlutterRemoveViewResult) callconv(.c) 
     notifyWindowLifecycle(entry);
 }
 
-fn processViewLifecycleResults(runner: *Runner) void {
-    const Completion = enum { none, add_succeeded, add_failed, remove_succeeded, remove_failed };
+const ViewLifecycleCompletion = enum {
+    none,
+    add_succeeded,
+    add_failed,
+    remove_succeeded,
+    remove_failed,
+};
 
+fn emitsWindowClosed(completion: ViewLifecycleCompletion) bool {
+    return completion == .remove_succeeded;
+}
+
+fn processViewLifecycleResults(runner: *Runner) void {
     var index: usize = 0;
     while (true) {
-        var completion: Completion = .none;
+        var completion: ViewLifecycleCompletion = .none;
         var handle: ?*const c.FlutterPlatformMessageResponseHandle = null;
         var request_id: i64 = 0;
         var view_id: i64 = 0;
@@ -1336,7 +1384,17 @@ fn processViewLifecycleResults(runner: *Runner) void {
                 if (handle) |h| runnerSendSurfaceError(runner, h, request_id, "RemoveViewFailed", "engine could not remove the view");
             },
         }
+
+        if (emitsWindowClosed(completion)) runner.notifyWindowClosed(view_id);
     }
+}
+
+test "window close notification requires successful RemoveView completion" {
+    try std.testing.expect(!emitsWindowClosed(.none));
+    try std.testing.expect(!emitsWindowClosed(.add_succeeded));
+    try std.testing.expect(!emitsWindowClosed(.add_failed));
+    try std.testing.expect(emitsWindowClosed(.remove_succeeded));
+    try std.testing.expect(!emitsWindowClosed(.remove_failed));
 }
 
 pub fn updateLayerSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.LayerUpdateRequest) !void {

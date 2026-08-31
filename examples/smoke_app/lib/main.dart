@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -77,21 +78,37 @@ class _SmokeViewCollection extends StatefulWidget {
 }
 
 class _SmokeViewCollectionState extends State<_SmokeViewCollection> {
-  late final List<Widget> _views;
+  late final Map<int, Widget> _views;
+  late final StreamSubscription<FushellWindowClosedEvent> _closedSubscription;
   int _nextSettingsNumber = 2;
 
   @override
   void initState() {
     super.initState();
-    _views = [
-      View(
+    _views = <int, Widget>{
+      widget.mainView.viewId: View(
         view: widget.mainView,
         child: FushellSmokeApp(onOpenSettingsWindow: _openSettingsWindow),
       ),
-      View(view: widget.initialSettingsView, child: const SettingsApp()),
+      widget.initialSettingsView.viewId: View(
+        view: widget.initialSettingsView,
+        child: const SettingsApp(),
+      ),
       if (widget.topBarView case final topBarView?)
-        View(view: topBarView, child: const _TopBar()),
-    ];
+        topBarView.viewId: View(view: topBarView, child: const _TopBar()),
+    };
+    _closedSubscription = FushellWindow.closed.listen((
+      FushellWindowClosedEvent event,
+    ) {
+      if (!mounted || !_views.containsKey(event.windowId)) return;
+      setState(() => _views.remove(event.windowId));
+    });
+  }
+
+  @override
+  void dispose() {
+    unawaited(_closedSubscription.cancel());
+    super.dispose();
   }
 
   Future<void> _openSettingsWindow() async {
@@ -106,12 +123,13 @@ class _SmokeViewCollectionState extends State<_SmokeViewCollection> {
     final view = await FushellWindow.viewById(windowId);
     if (!mounted) return;
     setState(() {
-      _views.add(View(view: view, child: const SettingsApp()));
+      _views[windowId] = View(view: view, child: const SettingsApp());
     });
   }
 
   @override
-  Widget build(BuildContext context) => ViewCollection(views: _views);
+  Widget build(BuildContext context) =>
+      ViewCollection(views: _views.values.toList());
 }
 
 class FushellSmokeApp extends StatelessWidget {

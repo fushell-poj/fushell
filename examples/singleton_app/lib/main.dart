@@ -15,6 +15,7 @@ Future<void> main() async {
 
 final class _DaemonModel extends ChangeNotifier {
   final Map<int, String> _windows = <int, String>{};
+  final Set<int> _closedWindowIds = <int>{};
 
   Map<int, String> get windows => Map<int, String>.unmodifiable(_windows);
 
@@ -85,6 +86,12 @@ final class _DaemonModel extends ChangeNotifier {
         notifyListeners();
         return FushellCommandResult.text();
 
+      case 'closed':
+        final String output = _closedWindowIds.join('\n');
+        return FushellCommandResult.text(
+          stdout: output.isEmpty ? '' : '$output\n',
+        );
+
       case 'status':
         reconcileViews();
         return FushellCommandResult.text(
@@ -109,8 +116,28 @@ final class _DaemonModel extends ChangeNotifier {
             stderr: 'usage: wait <milliseconds>\n',
           );
         }
+        final bool cancelled = await Future.any<bool>(<Future<bool>>[
+          Future<void>.delayed(
+            Duration(milliseconds: milliseconds),
+          ).then((_) => false),
+          invocation.cancelled.then((_) => true),
+        ]);
+        return FushellCommandResult.text(
+          stdout: cancelled ? 'wait cancelled\n' : 'waited\n',
+        );
+
+      case 'hang':
+        final int milliseconds = arguments.length == 2
+            ? int.tryParse(arguments[1]) ?? -1
+            : -1;
+        if (milliseconds < 0) {
+          return FushellCommandResult.text(
+            exitCode: 64,
+            stderr: 'usage: hang <milliseconds>\n',
+          );
+        }
         await Future<void>.delayed(Duration(milliseconds: milliseconds));
-        return FushellCommandResult.text(stdout: 'waited\n');
+        return FushellCommandResult.text(stdout: 'hang completed\n');
 
       case 'quit':
         Timer(const Duration(milliseconds: 50), FushellProcess.exit);
@@ -125,6 +152,11 @@ final class _DaemonModel extends ChangeNotifier {
           stderr: 'unknown command: ${arguments.first}\n$_help',
         );
     }
+  }
+
+  void removeWindow(int windowId) {
+    _closedWindowIds.add(windowId);
+    if (_windows.remove(windowId) != null) notifyListeners();
   }
 
   void reconcileViews() {
@@ -148,14 +180,21 @@ final class _DaemonRoot extends StatefulWidget {
 
 final class _DaemonRootState extends State<_DaemonRoot>
     with WidgetsBindingObserver {
+  late final StreamSubscription<FushellWindowClosedEvent> _closedSubscription;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _closedSubscription = FushellWindow.closed.listen(
+      (FushellWindowClosedEvent event) =>
+          widget.model.removeWindow(event.windowId),
+    );
   }
 
   @override
   void dispose() {
+    unawaited(_closedSubscription.cancel());
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -224,10 +263,12 @@ const String _help = '''fushell singleton example commands:
   open [title]       open a new window
   list               list live windows
   close <window-id>  close one window
+  closed             list completed window closes
   status             show daemon status
   context [args...]   echo invocation context
   raw <bytes...>      echo raw argv bytes as hexadecimal
   wait <milliseconds> wait asynchronously (integration testing)
+  hang <milliseconds> ignore cancellation (integration testing)
   quit               stop the daemon
   help               show this help
 ''';

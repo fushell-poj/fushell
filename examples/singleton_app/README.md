@@ -32,11 +32,17 @@ Available example commands:
 open [title]       open a new window
 list               list live windows
 close <window-id>  close one window
+closed             list completed window-close notifications
 status             show daemon status
+wait <milliseconds> wait asynchronously
+hang <milliseconds> ignore cancellation (integration testing)
 quit               stop the daemon
 help               show this help
 ```
 
 The native runner treats these arguments as opaque bytes. `FushellApplication`
 decodes and dispatches them to the Dart handler, and the handler decides their
-syntax, behavior, output, and exit status.
+syntax, behavior, output, and exit status. Production handlers should observe
+`invocation.cancelled` during long-running work and check
+`invocation.isCancellationRequested` at safe boundaries so they can
+release resources before Fushell's two-second recovery grace period expires.
