@@ -87,6 +87,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await FushellApplication.run(
     onCommand: (FushellCommandInvocation command) async {
+      final FushellCommandOutput output = command.output;
       final args = command.arguments
           .map((bytes) => utf8.decode(bytes))
           .toList(growable: false);
@@ -97,22 +98,25 @@ Future<void> main() async {
             title: 'My App',
             appId: 'dev.example.MyApp',
           );
-          // Add the returned FlutterView to the application's ViewCollection.
-          return FushellCommandResult.text(stdout: '$id\n');
+          await output.writeStdoutText('$id\n');
+          return FushellCommandResult();
         case ['quit']:
-          // Let native send this command's reply before stopping the daemon.
           Timer(const Duration(milliseconds: 50), FushellProcess.exit);
-          return FushellCommandResult.text(stdout: 'stopping\n');
+          await output.writeStdoutText('stopping\n');
+          return FushellCommandResult();
         default:
-          return FushellCommandResult.text(
-            exitCode: 64,
-            stderr: 'unknown command\n',
-          );
+          await output.writeStderrText('unknown command\n');
+          return FushellCommandResult(exitCode: 64);
       }
     },
   );
 }
 ```
+
+`FushellCommandOutput` 提供 `writeStdout`、`writeStderr` 以及对应的 text helper。
+raw frame 最大 32 KiB，stdout 与 stderr 合计最多 8 MiB；每个 invocation 同时只能有
+一个 write 在途。`FushellCommandResult` 只携带 0..255 的 `exitCode`，handler 必须在
+返回前等待业务 output Future。text helper 会先完整 UTF-8 编码，再按 bytes 分片。
 
 For example, after the first process is running headlessly:
 
@@ -124,8 +128,8 @@ For example, after the first process is running headlessly:
 `FushellCommandInvocation.arguments` and `workingDirectory` preserve raw Unix
 bytes; applications may choose their own decoding policy. `isInitial` marks the
 first process invocation. Commands are processed in arrival order with one
-active callback at a time. Secondary processes mirror the returned stdout,
-stderr, and exit code. A handler exception becomes exit code 70. If a callback
+active callback at a time. Secondary processes receive streaming stdout/stderr
+frames before the handler completes and the final exit code afterward. A handler exception becomes exit code 70. If a callback
 exceeds 30 seconds, its caller receives 124, the active invocation's `cancelled`
 future completes, and `isCancellationRequested` becomes true. The handler then
 has a two-second grace period to release resources and return. If it still does not

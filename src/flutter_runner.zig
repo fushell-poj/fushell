@@ -27,6 +27,7 @@ const flutter_compositor = @import("flutter_compositor.zig");
 const window_registry = @import("window_registry.zig");
 const bundle_loader = @import("bundle_loader.zig");
 const application_broker = @import("application_broker.zig");
+const application_output = @import("application_output.zig");
 const service_uri = @import("service_uri.zig");
 const WindowEntry = window_registry.Entry;
 const WindowRegistry = window_registry.Registry;
@@ -143,6 +144,11 @@ const PendingClipboardRead = struct {
     deadline_ns: u64,
 };
 
+const PendingApplicationWriteResponse = struct {
+    id: u64,
+    response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+};
+
 /// 构造 Flutter 引擎时使用的不可变进程配置。
 ///
 /// 所有路径与参数切片在 `run` 期间均为借用。shutdown 描述符和可选 broker 仍由
@@ -168,12 +174,39 @@ pub const Options = struct {
 ///
 /// `registry` 是 view 生命周期的唯一权威；只有对应 registry 状态允许时才能借用
 /// 原始 Host 指针。`broker` 为可选值，因此多实例应用无需承担 D-Bus 运行时成本。
+pub const FatalReason = enum {
+    platform_response_failed,
+    platform_response_encoding_failed,
+    platform_message_failed,
+    application_broker_failed,
+};
+
+pub fn responseFailureIsFatal(result: platform_channels.ResponseSendResult) bool {
+    return platform_channels.responseSendIsFatal(result);
+}
+
+fn completionResponseAllowsDispatch(result: platform_channels.ResponseSendResult) bool {
+    return result == .sent;
+}
+
+pub const CompletionBarrierError = error{ CompletionResponseFailed, CompletionDispatchFailed };
+
+/// 统一执行 complete → response → next dispatch；response 未送达时绝不推进队列。
+pub fn runCompletionBarrier(coordinator: anytype) !void {
+    try coordinator.complete();
+    if (!completionResponseAllowsDispatch(coordinator.sendResponse())) {
+        return error.CompletionResponseFailed;
+    }
+    coordinator.dispatch() catch return error.CompletionDispatchFailed;
+}
+
 const Runner = struct {
     gpa: std.mem.Allocator,
     /// 进程级共享显示状态 (窗口创建 / IME / 剪贴板用)。
     state: *display_state.DisplayState,
     registry: *WindowRegistry,
     quit_requested: std.atomic.Value(bool) = .init(false),
+    fatal_reason: ?FatalReason = null,
     /// 进程级共享 render context (raster + 全部窗口呈现)。
     render_context: *egl.RenderContext,
     api: *flutter.Api,
@@ -191,6 +224,8 @@ const Runner = struct {
     first_present_logged: bool = false,
     /// Stack-owned guard for the synchronous platform message currently being dispatched.
     active_platform_response: ?*platform_channels.Response = null,
+    /// 同一时刻只允许一个 native EAGAIN 对应的 Dart write response。
+    pending_application_write_response: ?PendingApplicationWriteResponse = null,
     application_broker: ?*application_broker.Broker = null,
     application_ready: bool = false,
     /// A command handler may request process exit before its D-Bus reply is sent.
@@ -222,6 +257,15 @@ const Runner = struct {
 
     fn now(self: *Runner) u64 {
         return self.api.get_current_time();
+    }
+
+    fn requestFatal(self: *Runner, reason: FatalReason) void {
+        if (self.fatal_reason == null) self.fatal_reason = reason;
+        self.quit_requested.store(true, .release);
+    }
+
+    pub fn fatalReason(self: *const Runner) ?FatalReason {
+        return self.fatal_reason;
     }
 
     fn beginMetricsUpdate(self: *Runner) u64 {
@@ -495,6 +539,7 @@ const Runner = struct {
         const result = self.api.send_platform_message(self.engine, &c_message);
         if (result != c.kSuccess) {
             std.debug.print("[error] FlutterEngineSendPlatformMessage failed: {s}\n", .{flutter.resultName(result)});
+            self.requestFatal(.platform_message_failed);
         }
     }
 
@@ -584,11 +629,11 @@ const Runner = struct {
     }
 
     pub fn sendPlatformMethodError(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, code: []const u8, message: []const u8) void {
-        runnerSendPlatformMethodError(self, response_handle, code, message);
+        _ = runnerSendPlatformMethodError(self, response_handle, code, message);
     }
 
     pub fn sendPlatformResponse(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
-        runnerSendPlatformResponse(self, response_handle, response);
+        _ = runnerSendPlatformResponse(self, response_handle, response);
     }
 
     pub fn sendEmptyPlatformResponse(self: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle) void {
@@ -633,26 +678,141 @@ const Runner = struct {
         self.application_ready = true;
         self.dispatchNextApplicationInvocation() catch |err| {
             std.debug.print("[error] failed to dispatch application invocation: {s}\n", .{@errorName(err)});
+            self.requestFatal(.application_broker_failed);
         };
     }
 
-    pub fn applicationComplete(self: *Runner, id: u64, exit_code: i32, stdout_bytes: []const u8, stderr_bytes: []const u8) void {
-        const broker = self.application_broker orelse return;
-        broker.complete(id, .{
-            .exit_code = exit_code,
-            .stdout = @constCast(stdout_bytes),
-            .stderr = @constCast(stderr_bytes),
-        }) catch |err| {
-            std.debug.print("[error] failed to complete application invocation: {s}\n", .{@errorName(err)});
+    pub const ApplicationWriteAction = enum { committed, detached, pending, failed };
+
+    pub fn applicationWrite(
+        self: *Runner,
+        response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+        id: u64,
+        stream: application_output.Stream,
+        payload: []const u8,
+    ) ApplicationWriteAction {
+        const broker = self.application_broker orelse {
+            self.requestFatal(.application_broker_failed);
+            self.sendPlatformMethodError(response_handle, "ApplicationBroker", "application broker is unavailable");
+            return .failed;
         };
-        if (self.exit_after_application_command) {
-            self.exit_after_application_command = false;
-            self.quit_requested.store(true, .release);
+        const outcome = broker.write(id, stream, payload) catch |err| {
+            const code = switch (err) {
+                error.NoActiveInvocation, error.InvocationIdMismatch => "ApplicationInvocationStale",
+                error.ApplicationCancelled => "ApplicationCancelled",
+                error.OutputClosed => "ApplicationOutputClosed",
+                error.OutputLimitExceeded => "ApplicationOutputLimit",
+                error.PendingWrite => "ApplicationWriteBusy",
+                else => blk: {
+                    self.requestFatal(.application_broker_failed);
+                    break :blk "ApplicationOutputProtocol";
+                },
+            };
+            self.sendPlatformMethodError(response_handle, code, @errorName(err));
+            return .failed;
+        };
+        return switch (outcome) {
+            .committed => .committed,
+            .detached => .detached,
+            .pending => .pending,
+        };
+    }
+
+    pub fn applicationComplete(
+        self: *Runner,
+        response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+        id: u64,
+        exit_code: i32,
+    ) void {
+        const broker = self.application_broker orelse {
+            self.requestFatal(.application_broker_failed);
+            self.sendPlatformMethodError(response_handle, "ApplicationBroker", "application broker is unavailable");
+            return;
+        };
+        const Coordinator = struct {
+            runner: *Runner,
+            broker: *application_broker.Broker,
+            response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
+            id: u64,
+            exit_code: i32,
+
+            fn complete(coordinator: *@This()) !void {
+                try coordinator.broker.complete(coordinator.id, .{ .exit_code = coordinator.exit_code });
+            }
+            fn sendResponse(coordinator: *@This()) platform_channels.ResponseSendResult {
+                return runnerSendPlatformResponse(coordinator.runner, coordinator.response_handle, "[null]");
+            }
+            fn dispatch(coordinator: *@This()) !void {
+                if (coordinator.runner.exit_after_application_command) {
+                    coordinator.runner.exit_after_application_command = false;
+                    coordinator.runner.quit_requested.store(true, .release);
+                    return;
+                }
+                try coordinator.runner.dispatchNextApplicationInvocation();
+            }
+        };
+        var coordinator = Coordinator{
+            .runner = self,
+            .broker = broker,
+            .response_handle = response_handle,
+            .id = id,
+            .exit_code = exit_code,
+        };
+        runCompletionBarrier(&coordinator) catch |err| {
+            if (err == error.CompletionResponseFailed) {
+                self.requestFatal(.platform_response_failed);
+                return;
+            }
+            if (err == error.CompletionDispatchFailed) {
+                std.debug.print("[error] failed to dispatch queued application invocation\n", .{});
+                self.requestFatal(.application_broker_failed);
+                return;
+            }
+            std.debug.print("[error] failed to complete application invocation: {s}\n", .{@errorName(err)});
+            if (err != error.NoActiveInvocation and err != error.InvocationIdMismatch) self.requestFatal(.application_broker_failed);
+            const error_result = runnerSendPlatformMethodError(self, response_handle, @errorName(err), @errorName(err));
+            if (error_result != .sent) self.requestFatal(.platform_response_failed);
+        };
+    }
+
+    pub fn deferApplicationWriteResponse(self: *Runner, handle: ?*const c.FlutterPlatformMessageResponseHandle, id: u64) void {
+        if (self.pending_application_write_response != null) {
+            self.requestFatal(.application_broker_failed);
             return;
         }
-        self.dispatchNextApplicationInvocation() catch |err| {
-            std.debug.print("[error] failed to dispatch queued application invocation: {s}\n", .{@errorName(err)});
+        self.pending_application_write_response = .{ .id = id, .response_handle = handle };
+    }
+
+    fn flushApplicationWriteResponse(self: *Runner) void {
+        const pending = self.pending_application_write_response orelse return;
+        const broker = self.application_broker orelse {
+            self.pending_application_write_response = null;
+            self.requestFatal(.application_broker_failed);
+            self.sendPlatformMethodError(pending.response_handle, "ApplicationBroker", "application broker is unavailable");
+            return;
         };
+        if (broker.fatalReason() != null) {
+            self.pending_application_write_response = null;
+            self.requestFatal(.application_broker_failed);
+            self.sendPlatformMethodError(pending.response_handle, "ApplicationOutputProtocol", "application broker entered fatal state");
+            return;
+        }
+        const outcome = broker.takePendingWriteOutcome() orelse return;
+        if (outcome.id != pending.id) {
+            self.requestFatal(.application_broker_failed);
+            self.pending_application_write_response = null;
+            self.sendPlatformMethodError(pending.response_handle, "ApplicationInvocationStale", "stale application output response");
+            return;
+        }
+        self.pending_application_write_response = null;
+        switch (outcome.result) {
+            .committed, .detached => self.sendPlatformResponse(pending.response_handle, "[null]"),
+            .cancelled => self.sendPlatformMethodError(pending.response_handle, "ApplicationCancelled", "application invocation was cancelled"),
+            .fatal => {
+                self.requestFatal(.application_broker_failed);
+                self.sendPlatformMethodError(pending.response_handle, "ApplicationOutputProtocol", "application output failed");
+            },
+        }
     }
 
     fn dispatchNextApplicationInvocation(self: *Runner) !void {
@@ -930,7 +1090,9 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
         std.debug.print("[error] engine event loop stopped: {s}\n", .{@errorName(err)});
     };
 
-    if (runner.application_broker) |broker| broker.failPending("application is shutting down\n");
+    if (runner.application_broker) |broker| broker.failPending();
+    runner.flushApplicationWriteResponse();
+    if (runner.fatal_reason != null and event_loop_error == null) event_loop_error = error.FatalRuntime;
 
     if (runner.pending_clipboard_read) |pending| {
         runner.clipboard.cancelReadText();
@@ -993,7 +1155,12 @@ fn applicationPollFdsCallback(context: ?*anyopaque, destination: []std.posix.pol
 fn applicationPollReadyCallback(context: ?*anyopaque, ready: []const std.posix.pollfd) !void {
     const runner = runnerFromContext(context);
     const broker = runner.application_broker orelse return;
-    try broker.handlePollFds(ready);
+    broker.handlePollFds(ready) catch |err| {
+        std.debug.print("[error] application broker poll failed: {s}\n", .{@errorName(err)});
+        runner.requestFatal(.application_broker_failed);
+        return;
+    };
+    if (broker.fatalReason() != null) runner.requestFatal(.application_broker_failed);
 }
 
 fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_data: ?*anyopaque) callconv(.c) void {
@@ -1013,6 +1180,64 @@ test "application cancellation message carries invocation id" {
     );
 }
 
+test "platform response failure classification is injectable" {
+    try std.testing.expect(!responseFailureIsFatal(.sent));
+    try std.testing.expect(!responseFailureIsFatal(.not_requested));
+    try std.testing.expect(responseFailureIsFatal(.engine_unavailable));
+    try std.testing.expect(responseFailureIsFatal(.engine_failed));
+}
+
+test "completion barrier rejects dispatch after an unsent response" {
+    try std.testing.expect(completionResponseAllowsDispatch(.sent));
+    try std.testing.expect(!completionResponseAllowsDispatch(.engine_unavailable));
+    try std.testing.expect(!completionResponseAllowsDispatch(.engine_failed));
+    try std.testing.expect(!completionResponseAllowsDispatch(.not_requested));
+    try std.testing.expect(!completionResponseAllowsDispatch(.already_completed));
+}
+
+test "completion barrier records complete response dispatch order" {
+    const Fake = struct {
+        order: *[3]u8,
+        index: *usize,
+        response: platform_channels.ResponseSendResult,
+        dispatch_count: *usize,
+
+        fn record(fake: *@This(), value: u8) void {
+            fake.order[fake.index.*] = value;
+            fake.index.* += 1;
+        }
+        fn complete(fake: *@This()) !void {
+            fake.record('c');
+        }
+        fn sendResponse(fake: *@This()) platform_channels.ResponseSendResult {
+            fake.record('r');
+            return fake.response;
+        }
+        fn dispatch(fake: *@This()) !void {
+            fake.record('d');
+            fake.dispatch_count.* += 1;
+        }
+    };
+
+    var order = [_]u8{ 0, 0, 0 };
+    var index: usize = 0;
+    var dispatch_count: usize = 0;
+    var fake = Fake{ .order = &order, .index = &index, .response = .sent, .dispatch_count = &dispatch_count };
+    try runCompletionBarrier(&fake);
+    try std.testing.expectEqualSlices(u8, "crd", &order);
+    try std.testing.expectEqual(@as(usize, 1), dispatch_count);
+
+    for ([_]platform_channels.ResponseSendResult{ .engine_failed, .not_requested, .already_completed }) |response| {
+        order = .{ 0, 0, 0 };
+        index = 0;
+        dispatch_count = 0;
+        fake.response = response;
+        try std.testing.expectError(error.CompletionResponseFailed, runCompletionBarrier(&fake));
+        try std.testing.expectEqualSlices(u8, "cr", order[0..index]);
+        try std.testing.expectEqual(@as(usize, 0), dispatch_count);
+    }
+}
+
 test "Flutter task callbacks reject null context" {
     try std.testing.expect(!runsTaskOnCurrentThreadCallback(null));
     postFlutterTaskCallback(std.mem.zeroes(c.FlutterTask), 0, null);
@@ -1021,14 +1246,28 @@ test "Flutter task callbacks reject null context" {
 fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     const runner = fromUserData(user_data);
     if (runner.application_broker) |broker| {
-        try broker.pump();
+        broker.pump() catch |err| {
+            std.debug.print("[error] application broker pump failed: {s}\n", .{@errorName(err)});
+            runner.requestFatal(.application_broker_failed);
+            return;
+        };
+        runner.flushApplicationWriteResponse();
+        if (broker.fatalReason() != null) {
+            runner.requestFatal(.application_broker_failed);
+            return;
+        }
+        if (runner.fatal_reason != null) return;
         if (broker.takeCancellationRequest()) |id|
             runner.sendApplicationCancellation(id);
         if (broker.recoveryExitRequested()) {
             std.debug.print("Application command ignored cancellation; restarting daemon.\n", .{});
             runner.quit_requested.store(true, .release);
         } else {
-            try runner.dispatchNextApplicationInvocation();
+            runner.dispatchNextApplicationInvocation() catch |err| {
+                std.debug.print("[error] failed to dispatch queued application invocation: {s}\n", .{@errorName(err)});
+                runner.requestFatal(.application_broker_failed);
+                return;
+            };
         }
     }
     processViewLifecycleResults(runner);
@@ -1393,10 +1632,11 @@ fn processViewLifecycleResults(runner: *Runner) void {
             .add_succeeded => {
                 const response = surface_channel.openSuccessResponse(runner.gpa, request_id, view_id) catch |err| {
                     std.debug.print("[error] Failed to encode window.open response: {s}\n", .{@errorName(err)});
-                    continue;
+                    runner.requestFatal(.platform_response_encoding_failed);
+                    break;
                 };
                 defer runner.gpa.free(response);
-                if (handle) |h| runnerSendPlatformResponse(runner, h, response);
+                if (handle) |h| _ = runnerSendPlatformResponse(runner, h, response);
             },
             .add_failed => {
                 std.debug.print("[error] FlutterEngineAddView reported added=false for view {d}\n", .{view_id});
@@ -1481,19 +1721,21 @@ fn runnerSurfaceRequestErrorCode(_: *Runner, err: anyerror) []const u8 {
 pub fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: i64) void {
     const response = surface_channel.successResponse(runner.gpa, id) catch |err| {
         std.debug.print("[error] Failed to encode fushell surface success response: {s}\n", .{@errorName(err)});
+        runner.requestFatal(.platform_response_encoding_failed);
         return;
     };
     defer runner.gpa.free(response);
-    runnerSendPlatformResponse(runner, response_handle, response);
+    _ = runnerSendPlatformResponse(runner, response_handle, response);
 }
 
 fn runnerSendSurfaceError(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: ?i64, code: []const u8, message: []const u8) void {
     const response = surface_channel.errorResponse(runner.gpa, id, code, message) catch |err| {
         std.debug.print("[error] Failed to encode fushell surface error response: {s}\n", .{@errorName(err)});
+        runner.requestFatal(.platform_response_encoding_failed);
         return;
     };
     defer runner.gpa.free(response);
-    runnerSendPlatformResponse(runner, response_handle, response);
+    _ = runnerSendPlatformResponse(runner, response_handle, response);
 }
 
 fn runnerSendPlatformMethodError(
@@ -1501,52 +1743,56 @@ fn runnerSendPlatformMethodError(
     response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
     code: []const u8,
     message: []const u8,
-) void {
+) platform_channels.ResponseSendResult {
     const response = platform_channels.encodeMethodError(runner.gpa, code, message) catch |err| {
         std.debug.print("[error] Failed to encode Flutter method error: {s}\n", .{@errorName(err)});
-        runnerSendEmptyPlatformResponse(runner, response_handle);
-        return;
+        runner.requestFatal(.platform_response_encoding_failed);
+        return .engine_failed;
     };
     defer runner.gpa.free(response);
-    runnerSendPlatformResponse(runner, response_handle, response);
+    return runnerSendPlatformResponse(runner, response_handle, response);
 }
 
 fn sendGuardedPlatformResponse(
     context: *anyopaque,
     response_handle: ?*const c.FlutterPlatformMessageResponseHandle,
     response: []const u8,
-) void {
+) platform_channels.ResponseSendResult {
     const runner: *Runner = @ptrCast(@alignCast(context));
-    sendRawPlatformResponse(runner, response_handle, response);
+    return sendRawPlatformResponse(runner, response_handle, response);
 }
 
-fn runnerSendPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
+fn runnerSendPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) platform_channels.ResponseSendResult {
     if (runner.active_platform_response) |reply| {
         if (reply.handle == response_handle) {
-            if (reply.completed) return;
+            if (reply.completed) return .already_completed;
             reply.completed = true;
         }
     }
-    sendRawPlatformResponse(runner, response_handle, response);
+    return sendRawPlatformResponse(runner, response_handle, response);
 }
 
-pub fn sendRawPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) void {
+pub fn sendRawPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) platform_channels.ResponseSendResult {
     if (response_handle == null) {
         std.debug.print("Flutter platform message had no response handle.\n", .{});
-        return;
+        return .not_requested;
     }
     if (runner.engine == null) {
         std.debug.print("[error] Cannot reply to Flutter platform message before engine handle is available.\n", .{});
-        return;
+        runner.requestFatal(.platform_response_failed);
+        return .engine_unavailable;
     }
     const result = runner.api.send_platform_message_response(runner.engine, response_handle, response.ptr, response.len);
     if (result != c.kSuccess) {
         std.debug.print("[error] FlutterEngineSendPlatformMessageResponse failed: {s}\n", .{flutter.resultName(result)});
+        runner.requestFatal(.platform_response_failed);
+        return .engine_failed;
     }
+    return .sent;
 }
 
 fn runnerSendEmptyPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle) void {
-    runnerSendPlatformResponse(runner, response_handle, "");
+    _ = runnerSendPlatformResponse(runner, response_handle, "");
 }
 
 fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {

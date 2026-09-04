@@ -5,6 +5,7 @@ const c = @import("c");
 const surface_channel = @import("surface_channel.zig");
 const mouse_cursor = @import("mouse_cursor.zig");
 const clipboard_service = @import("clipboard_service.zig");
+const application_output = @import("application_output.zig");
 
 pub const application_channel_name = "dev.fushell/application";
 pub const window_events_channel_name = "dev.fushell/window-events";
@@ -27,11 +28,23 @@ pub fn classify(name: []const u8) Channel {
     return .unsupported;
 }
 
+pub const ResponseSendResult = enum {
+    sent,
+    not_requested,
+    engine_unavailable,
+    engine_failed,
+    already_completed,
+};
+
+pub fn responseSendIsFatal(result: ResponseSendResult) bool {
+    return result == .engine_unavailable or result == .engine_failed;
+}
+
 pub const SendFn = *const fn (
     context: *anyopaque,
     handle: ?*const c.FlutterPlatformMessageResponseHandle,
     payload: []const u8,
-) void;
+) ResponseSendResult;
 
 /// Completes a Flutter response handle at most once and sends an empty response
 /// from `deinit` when a malformed or unsupported request takes an early return.
@@ -43,17 +56,17 @@ pub const Response = struct {
     transferred: bool = false,
 
     pub fn deinit(self: *Response) void {
-        if (!self.completed and !self.transferred) self.send("");
+        if (!self.completed and !self.transferred) _ = self.send("");
     }
 
-    pub fn send(self: *Response, payload: []const u8) void {
-        if (self.completed or self.transferred) return;
+    pub fn send(self: *Response, payload: []const u8) ResponseSendResult {
+        if (self.completed or self.transferred) return .already_completed;
         self.completed = true;
-        self.send_fn(self.context, self.handle, payload);
+        return self.send_fn(self.context, self.handle, payload);
     }
 
-    pub fn empty(self: *Response) void {
-        self.send("");
+    pub fn empty(self: *Response) ResponseSendResult {
+        return self.send("");
     }
 
     /// Transfers completion ownership to an asynchronous operation.
@@ -87,6 +100,11 @@ pub fn encodeMethodError(gpa: std.mem.Allocator, code: []const u8, message: []co
     const escaped_message = try escapeJsonString(gpa, message);
     defer gpa.free(escaped_message);
     return std.fmt.allocPrint(gpa, "[\"{s}\",\"{s}\",null]", .{ escaped_code, escaped_message });
+}
+
+pub fn validateWriteDataHex(encoded: []const u8) !void {
+    if (encoded.len > 65_536) return error.OutputFrameTooLarge;
+    if (encoded.len % 2 != 0) return error.InvalidHex;
 }
 
 pub fn decodeHexAlloc(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
@@ -447,20 +465,20 @@ pub fn handleMouseCursorMessage(runner: anytype, message: c.FlutterPlatformMessa
     defer reply.deinit();
 
     const request = mouse_cursor.decodeRequest(payload) catch {
-        reply.send(mouse_cursor.bad_arguments_envelope);
+        _ = reply.send(mouse_cursor.bad_arguments_envelope);
         return;
     };
     switch (request) {
-        .unsupported => reply.empty(),
+        .unsupported => _ = reply.empty(),
         .activate_system_cursor => |activate| {
             // Flutter 的 device 对应 engine pointer device id；Fushell 当前只向引擎
             // 注册 device 0 和单个 wl_pointer，因此验证 wire type 后由共享 pointer 处理。
             _ = activate.device;
             if (!runner.state.activateCursorShape(activate.shape)) {
-                reply.empty();
+                _ = reply.empty();
                 return;
             }
-            reply.send(mouse_cursor.success_envelope);
+            _ = reply.send(mouse_cursor.success_envelope);
         },
     }
 }
@@ -488,8 +506,8 @@ pub fn handleApplicationChannelMessage(runner: anytype, message: c.FlutterPlatfo
         runner.sendPlatformResponse(message.response_handle, "[null]");
         return;
     }
-    if (method == null or !std.mem.eql(u8, method.?, "complete")) {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "unsupported application method");
+    if (method == null) {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "application method is required");
         return;
     }
 
@@ -498,56 +516,91 @@ pub fn handleApplicationChannelMessage(runner: anytype, message: c.FlutterPlatfo
         else => null,
     } else null;
     const fields = args orelse {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete args must be an object");
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "application args must be an object");
         return;
     };
     const id_value = fields.get("id") orelse {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete id is required");
-        return;
-    };
-    const exit_value = fields.get("exitCode") orelse {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete exitCode is required");
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "application id is required");
         return;
     };
     const id = switch (id_value) {
         .integer => |value| if (value >= 0) @as(?u64, @intCast(value)) else null,
         else => null,
     } orelse {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete id is invalid");
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "application id is invalid");
+        return;
+    };
+
+    if (std.mem.eql(u8, method.?, "write")) {
+        if (fields.count() != 3) {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "write args must contain only id, stream, and dataHex");
+            return;
+        }
+        const stream_value = fields.get("stream") orelse {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "write stream is required");
+            return;
+        };
+        const stream = switch (stream_value) {
+            .integer => |value| switch (value) {
+                1 => application_output.Stream.stdout,
+                2 => application_output.Stream.stderr,
+                else => null,
+            },
+            else => null,
+        } orelse {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "write stream must be 1 or 2");
+            return;
+        };
+        const data_value = fields.get("dataHex") orelse {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "write dataHex is required");
+            return;
+        };
+        const data_hex = switch (data_value) {
+            .string => |value| value,
+            else => null,
+        } orelse {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "write dataHex must be a string");
+            return;
+        };
+        validateWriteDataHex(data_hex) catch |err| {
+            const code = if (err == error.OutputFrameTooLarge) "ApplicationOutputLimit" else "ApplicationProtocol";
+            runner.sendPlatformMethodError(message.response_handle, code, "write dataHex has an invalid frame size");
+            return;
+        };
+        const data = decodeHexAlloc(runner.gpa, data_hex) catch {
+            runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "write dataHex is invalid");
+            return;
+        };
+        defer runner.gpa.free(data);
+        switch (runner.applicationWrite(message.response_handle, id, stream, data)) {
+            .committed, .detached => runner.sendPlatformResponse(message.response_handle, "[null]"),
+            .pending => runner.deferApplicationWriteResponse(message.response_handle, id),
+            .failed => {},
+        }
+        return;
+    }
+
+    if (!std.mem.eql(u8, method.?, "complete")) {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "unsupported application method");
+        return;
+    }
+    if (fields.count() != 2) {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete args must contain only id and exitCode");
+        return;
+    }
+    const exit_value = fields.get("exitCode") orelse {
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete exitCode is required");
         return;
     };
     const exit_code = switch (exit_value) {
-        .integer => |value| if (value >= std.math.minInt(i32) and value <= std.math.maxInt(i32)) @as(?i32, @intCast(value)) else null,
+        .integer => |value| if (value >= 0 and value <= 255) @as(?i32, @intCast(value)) else null,
         else => null,
     } orelse {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete exitCode is invalid");
+        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete exitCode must be between 0 and 255");
         return;
     };
-    const stdout_hex = if (fields.get("stdoutHex")) |value| switch (value) {
-        .string => |string| string,
-        else => null,
-    } else "";
-    const stderr_hex = if (fields.get("stderrHex")) |value| switch (value) {
-        .string => |string| string,
-        else => null,
-    } else "";
-    if (stdout_hex == null or stderr_hex == null or stdout_hex.?.len > 8 * 1024 * 1024 or stderr_hex.?.len > 8 * 1024 * 1024) {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "complete output is invalid or too large");
-        return;
-    }
-    const stdout_bytes = decodeHexAlloc(runner.gpa, stdout_hex.?) catch {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "stdoutHex is invalid");
-        return;
-    };
-    defer runner.gpa.free(stdout_bytes);
-    const stderr_bytes = decodeHexAlloc(runner.gpa, stderr_hex.?) catch {
-        runner.sendPlatformMethodError(message.response_handle, "ApplicationProtocol", "stderrHex is invalid");
-        return;
-    };
-    defer runner.gpa.free(stderr_bytes);
 
-    runner.applicationComplete(id, exit_code, stdout_bytes, stderr_bytes);
-    runner.sendPlatformResponse(message.response_handle, "[null]");
+    runner.applicationComplete(message.response_handle, id, exit_code);
 }
 
 pub fn handleSurfaceChannelMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8) void {
@@ -596,10 +649,11 @@ test "mouse cursor channel returns codec-compatible responses exactly once" {
         response_count: usize = 0,
         response_payload: []const u8 = "",
 
-        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, payload: []const u8) void {
+        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, payload: []const u8) ResponseSendResult {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.response_count += 1;
             self.response_payload = payload;
+            return .sent;
         }
     };
     const message = std.mem.zeroes(c.FlutterPlatformMessage);
@@ -647,19 +701,28 @@ test "window close event carries the completed view id" {
     );
 }
 
+test "application write hex validation enforces even 32 KiB frames" {
+    try validateWriteDataHex("");
+    try validateWriteDataHex("00");
+    try validateWriteDataHex(&[_]u8{'a'} ** 65_536);
+    try std.testing.expectError(error.InvalidHex, validateWriteDataHex("0"));
+    try std.testing.expectError(error.OutputFrameTooLarge, validateWriteDataHex(&[_]u8{'a'} ** 65_538));
+}
+
 test "response completes exactly once" {
     const Recorder = struct {
         count: usize = 0,
         payload: []const u8 = "",
-        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, payload: []const u8) void {
+        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, payload: []const u8) ResponseSendResult {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.count += 1;
             self.payload = payload;
+            return .sent;
         }
     };
     var recorder: Recorder = .{};
     var response: Response = .{ .context = &recorder, .handle = null, .send_fn = Recorder.send };
-    response.send("ok");
+    _ = response.send("ok");
     response.empty();
     response.deinit();
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
@@ -669,9 +732,10 @@ test "response completes exactly once" {
 test "response guard completes early return with empty payload" {
     const Recorder = struct {
         count: usize = 0,
-        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, _: []const u8) void {
+        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, _: []const u8) ResponseSendResult {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.count += 1;
+            return .sent;
         }
     };
     var recorder: Recorder = .{};
@@ -680,6 +744,25 @@ test "response guard completes early return with empty payload" {
         defer response.deinit();
     }
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
+}
+
+test "injected response failure remains exactly once and is fatal" {
+    const Recorder = struct {
+        count: usize = 0,
+        fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, _: []const u8) ResponseSendResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.count += 1;
+            return .engine_failed;
+        }
+    };
+    var recorder: Recorder = .{};
+    var response: Response = .{ .context = &recorder, .handle = null, .send_fn = Recorder.send };
+    try std.testing.expectEqual(ResponseSendResult.engine_failed, response.send("failure"));
+    try std.testing.expectEqual(ResponseSendResult.already_completed, response.send("retry"));
+    response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recorder.count);
+    try std.testing.expect(responseSendIsFatal(.engine_failed));
+    try std.testing.expect(!responseSendIsFatal(.sent));
 }
 
 test "method error uses a valid JSONMethodCodec envelope" {

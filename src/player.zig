@@ -9,6 +9,39 @@ comptime {
     _ = @import("surface_channel.zig");
 }
 
+const broker_cleanup_deadline_ns = std.time.ns_per_s;
+const broker_cleanup_attempts: usize = 3;
+
+fn cleanupBrokerWithRetry(broker: *application_broker.Broker, io: std.Io) !void {
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.{ .nanoseconds = broker_cleanup_deadline_ns });
+    var attempts: usize = 0;
+    var last_error: ?anyerror = null;
+    while (attempts < broker_cleanup_attempts) : (attempts += 1) {
+        broker.deinit() catch |err| {
+            last_error = err;
+            if (attempts + 1 >= broker_cleanup_attempts) break;
+            if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) break;
+            std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .real) catch {};
+            continue;
+        };
+        return;
+    }
+    if (broker.initial_helper) |helper| {
+        std.debug.print("[error] broker cleanup still owns helper pid {d} after {d} attempts\n", .{ helper.pid, attempts });
+    }
+    return last_error orelse error.BrokerCleanupFailed;
+}
+
+fn finishPlayerFailure(broker: ?*application_broker.Broker, io: std.Io, run_err: anyerror) !u8 {
+    if (broker) |active_broker| {
+        cleanupBrokerWithRetry(active_broker, io) catch |cleanup_err| {
+            std.debug.print("[error] player failed: {s}; broker cleanup failed: {s}\n", .{ @errorName(run_err), @errorName(cleanup_err) });
+            return error.RunAndCleanupFailed;
+        };
+    }
+    return run_err;
+}
+
 /// Plays a bundle until its Dart process requests exit. Single-instance bundles
 /// acquire their session-bus name before any Flutter or Wayland initialization;
 /// secondary invocations forward argv/cwd and return the Dart handler's status.
@@ -43,17 +76,16 @@ pub fn runPlayer(
         .secondary => |result_value| {
             var result = result_value;
             defer result.deinit(gpa);
-            try std.Io.File.stdout().writeStreamingAll(io, result.stdout);
             try std.Io.File.stderr().writeStreamingAll(io, result.stderr);
             return commandExitStatus(result.exit_code);
         },
     }
-    defer if (broker) |active_broker| active_broker.deinit();
-
-    const engine_library = try resolveBundleEngineLibrary(gpa, bundle_path);
+    const engine_library = resolveBundleEngineLibrary(gpa, bundle_path) catch |run_err| {
+        return finishPlayerFailure(broker, io, run_err);
+    };
     defer gpa.free(engine_library);
 
-    try flutter_runner.run(gpa, .{
+    flutter_runner.run(gpa, .{
         .io = io,
         .engine_library = engine_library,
         .bundle_path = bundle_path,
@@ -61,7 +93,12 @@ pub fn runPlayer(
         .shutdown_fd = shutdown_fd,
         .application_broker = broker,
         .dart_entrypoint_arguments = dart_entrypoint_arguments,
-    });
+    }) catch |run_err| {
+        return finishPlayerFailure(broker, io, run_err);
+    };
+    if (broker) |active_broker| {
+        cleanupBrokerWithRetry(active_broker, io) catch |cleanup_err| return cleanup_err;
+    }
     return 0;
 }
 

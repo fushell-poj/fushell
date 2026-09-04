@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -22,6 +24,7 @@ final class _DaemonModel extends ChangeNotifier {
   Future<FushellCommandResult> handleCommand(
     FushellCommandInvocation invocation,
   ) async {
+    final FushellCommandOutput output = invocation.output;
     if (invocation.arguments.isNotEmpty &&
         utf8.decode(invocation.arguments.first) == 'raw') {
       final String encoded = invocation.arguments
@@ -32,13 +35,12 @@ final class _DaemonModel extends ChangeNotifier {
                 .join(),
           )
           .join('|');
-      return FushellCommandResult.text(stdout: '$encoded\n');
+      await output.writeStdoutText('$encoded\n');
+      return FushellCommandResult();
     }
 
     final List<String> arguments = invocation.textArguments;
-    if (arguments.isEmpty) {
-      return FushellCommandResult.text();
-    }
+    if (arguments.isEmpty) return FushellCommandResult();
 
     switch (arguments.first) {
       case 'open':
@@ -54,103 +56,150 @@ final class _DaemonModel extends ChangeNotifier {
         await FushellWindow.viewById(id);
         _windows[id] = title;
         notifyListeners();
-        return FushellCommandResult.text(stdout: '$id\n');
+        await output.writeStdoutText('$id\n');
+        return FushellCommandResult();
 
       case 'list':
         reconcileViews();
-        final String output = _windows.entries
+        final String listing = _windows.entries
             .map(
               (MapEntry<int, String> entry) => '${entry.key}\t${entry.value}',
             )
             .join('\n');
-        return FushellCommandResult.text(
-          stdout: output.isEmpty ? '' : '$output\n',
-        );
+        await output.writeStdoutText(listing.isEmpty ? '' : '$listing\n');
+        return FushellCommandResult();
 
       case 'close':
         if (arguments.length != 2) {
-          return FushellCommandResult.text(
-            exitCode: 64,
-            stderr: 'usage: close <window-id>\n',
-          );
+          await output.writeStderrText('usage: close <window-id>\n');
+          return FushellCommandResult(exitCode: 64);
         }
         final int? id = int.tryParse(arguments[1]);
         if (id == null || !_windows.containsKey(id)) {
-          return FushellCommandResult.text(
-            exitCode: 66,
-            stderr: 'unknown window: ${arguments[1]}\n',
-          );
+          await output.writeStderrText('unknown window: ${arguments[1]}\n');
+          return FushellCommandResult(exitCode: 66);
         }
         await FushellWindow.closeWindow(id);
         _windows.remove(id);
         notifyListeners();
-        return FushellCommandResult.text();
+        return FushellCommandResult();
 
       case 'closed':
-        final String output = _closedWindowIds.join('\n');
-        return FushellCommandResult.text(
-          stdout: output.isEmpty ? '' : '$output\n',
-        );
+        final String listing = _closedWindowIds.join('\n');
+        await output.writeStdoutText(listing.isEmpty ? '' : '$listing\n');
+        return FushellCommandResult();
 
       case 'status':
         reconcileViews();
-        return FushellCommandResult.text(
-          stdout:
-              'daemon running; windows=${_windows.length}; cwd=${invocation.textWorkingDirectory}\n',
+        await output.writeStdoutText(
+          'daemon running; windows=${_windows.length}; cwd=${invocation.textWorkingDirectory}\n',
         );
+        return FushellCommandResult();
 
       case 'context':
-        return FushellCommandResult.text(
-          stdout:
-              'cwd=${invocation.textWorkingDirectory}; initial=${invocation.isInitial}; '
-              'arguments=${arguments.join('|')}\n',
+        await output.writeStdoutText(
+          'cwd=${invocation.textWorkingDirectory}; initial=${invocation.isInitial}; '
+          'arguments=${arguments.join('|')}\n',
         );
+        return FushellCommandResult();
+
+      case 'exit124':
+        return FushellCommandResult(exitCode: 124);
+
+      case 'stream':
+        await output.writeStdoutText('first marker\n');
+        final int milliseconds = arguments.length == 2
+            ? int.tryParse(arguments[1]) ?? 100
+            : 100;
+        await Future<void>.delayed(Duration(milliseconds: milliseconds));
+        await output.writeStdoutText('rest marker\n');
+        return FushellCommandResult();
+
+      case 'interleaved':
+        await output.writeStdout(Uint8List.fromList(<int>[0, 255, 1]));
+        await output.writeStderr(Uint8List.fromList(<int>[254, 0, 2]));
+        await output.writeStdout(Uint8List.fromList(<int>[3, 0, 4]));
+        return FushellCommandResult();
+
+      case 'exact-limit':
+        final Uint8List chunk = Uint8List(32 * 1024);
+        for (var index = 0; index < 256; index++) {
+          await output.writeStdout(chunk);
+        }
+        return FushellCommandResult();
+
+      case 'overflow':
+        final Uint8List chunk = Uint8List(32 * 1024);
+        for (var index = 0; index < 256; index++) {
+          await output.writeStdout(chunk);
+        }
+        await output.writeStdout(Uint8List.fromList(<int>[0]));
+        return FushellCommandResult();
+
+      case 'late-write':
+        unawaited(output.writeStdoutText('late marker\n'));
+        return FushellCommandResult();
+
+      case 'throw':
+        throw StateError('example handler failure');
+
+      case 'gate':
+        if (arguments.length != 2) {
+          await output.writeStderrText('usage: gate <release-file>\n');
+          return FushellCommandResult(exitCode: 64);
+        }
+        await output.writeStdoutText('waiting\n');
+        final File releaseFile = File(arguments[1]);
+        while (!releaseFile.existsSync()) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        return FushellCommandResult();
 
       case 'wait':
         final int milliseconds = arguments.length == 2
             ? int.tryParse(arguments[1]) ?? -1
             : -1;
         if (milliseconds < 0) {
-          return FushellCommandResult.text(
-            exitCode: 64,
-            stderr: 'usage: wait <milliseconds>\n',
-          );
+          await output.writeStderrText('usage: wait <milliseconds>\n');
+          return FushellCommandResult(exitCode: 64);
         }
+        await output.writeStdoutText('waiting\n');
         final bool cancelled = await Future.any<bool>(<Future<bool>>[
           Future<void>.delayed(
             Duration(milliseconds: milliseconds),
           ).then((_) => false),
           invocation.cancelled.then((_) => true),
         ]);
-        return FushellCommandResult.text(
-          stdout: cancelled ? 'wait cancelled\n' : 'waited\n',
-        );
+        if (cancelled) return FushellCommandResult();
+        await output.writeStdoutText('waited\n');
+        return FushellCommandResult();
 
       case 'hang':
         final int milliseconds = arguments.length == 2
             ? int.tryParse(arguments[1]) ?? -1
             : -1;
         if (milliseconds < 0) {
-          return FushellCommandResult.text(
-            exitCode: 64,
-            stderr: 'usage: hang <milliseconds>\n',
-          );
+          await output.writeStderrText('usage: hang <milliseconds>\n');
+          return FushellCommandResult(exitCode: 64);
         }
         await Future<void>.delayed(Duration(milliseconds: milliseconds));
-        return FushellCommandResult.text(stdout: 'hang completed\n');
+        await output.writeStdoutText('hang completed\n');
+        return FushellCommandResult();
 
       case 'quit':
         Timer(const Duration(milliseconds: 50), FushellProcess.exit);
-        return FushellCommandResult.text(stdout: 'stopping daemon\n');
+        await output.writeStdoutText('stopping daemon\n');
+        return FushellCommandResult();
 
       case 'help':
-        return FushellCommandResult.text(stdout: _help);
+        await output.writeStdoutText(_help);
+        return FushellCommandResult();
 
       default:
-        return FushellCommandResult.text(
-          exitCode: 64,
-          stderr: 'unknown command: ${arguments.first}\n$_help',
+        await output.writeStderrText(
+          'unknown command: ${arguments.first}\n$_help',
         );
+        return FushellCommandResult(exitCode: 64);
     }
   }
 
@@ -265,9 +314,11 @@ const String _help = '''fushell singleton example commands:
   close <window-id>  close one window
   closed             list completed window closes
   status             show daemon status
+  exit124            return business exit code 124
   context [args...]   echo invocation context
   raw <bytes...>      echo raw argv bytes as hexadecimal
   wait <milliseconds> wait asynchronously (integration testing)
+  gate <release-file> wait for a release file (integration testing)
   hang <milliseconds> ignore cancellation (integration testing)
   quit               stop the daemon
   help               show this help

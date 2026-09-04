@@ -11,48 +11,253 @@ const String _surfaceChannel = 'dev.fushell/surface';
 const String _applicationChannel = 'dev.fushell/application';
 const String _windowEventsChannel = 'dev.fushell/window-events';
 
+const int _maxOutputFrameBytes = 32 * 1024;
+const int _maxOutputBytes = 8 * 1024 * 1024;
+
+/// 同一 invocation 的 output writer 已有另一个 raw/text write 在途。
+final class FushellCommandOutputStateError extends StateError {
+  FushellCommandOutputStateError(String message) : super(message);
+}
+
+/// 单帧或 invocation 的 logical raw bytes 超出公开上限。
+final class FushellCommandOutputLimitException implements Exception {
+  const FushellCommandOutputLimitException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'FushellCommandOutputLimitException: $message';
+}
+
+/// native 已取消对应 invocation；迟到的 write response 会被 writer 吸收。
+final class FushellCommandOutputCancelledException implements Exception {
+  const FushellCommandOutputCancelledException();
+
+  @override
+  String toString() => 'FushellCommandOutputCancelledException';
+}
+
+/// 对应 invocation 已完成、关闭或失去 native output endpoint。
+final class FushellCommandOutputClosedException implements Exception {
+  const FushellCommandOutputClosedException();
+
+  @override
+  String toString() => 'FushellCommandOutputClosedException';
+}
+
+/// 一个 invocation 的有界异步 stdout/stderr writer。
+///
+/// raw write 不得超过 32 KiB；两流共用 8 MiB logical quota。这个对象只由
+/// [FushellCommandInvocation.output] 提供，不能脱离 invocation 构造。
+/// text helper 会先
+/// 完整 UTF-8 编码并预检 quota，再串行发送分片，不会无界缓存后续 frame。
+final class FushellCommandOutput {
+  FushellCommandOutput._({required int id}) : _id = id;
+
+  final int _id;
+  int _logicalBytes = 0;
+  int _generation = 0;
+  bool _closed = false;
+  bool _cancelled = false;
+  Future<void>? _inFlight;
+  Completer<void>? _inFlightCompleter;
+
+  /// 以一个完整 raw frame 写入 stdout；bytes 不会被转码或改写。
+  Future<void> writeStdout(Uint8List bytes) => _writeRaw(1, bytes);
+
+  /// 以一个完整 raw frame 写入 stderr；bytes 不会被转码或改写。
+  Future<void> writeStderr(Uint8List bytes) => _writeRaw(2, bytes);
+
+  /// 将完整字符串 UTF-8 编码后按 frame 上限串行写入 stdout。
+  Future<void> writeStdoutText(String text) => _writeText(1, text);
+
+  /// 将完整字符串 UTF-8 编码后按 frame 上限串行写入 stderr。
+  Future<void> writeStderrText(String text) => _writeText(2, text);
+
+  Future<void> _writeRaw(int stream, Uint8List bytes) {
+    _checkWritable();
+    if (bytes.isEmpty) return Future<void>.value();
+    if (bytes.length > _maxOutputFrameBytes) {
+      throw const FushellCommandOutputLimitException(
+        'a raw write must not exceed 32 KiB',
+      );
+    }
+    _reserve(bytes.length);
+    return _startOperation(() => _sendFrame(stream, bytes));
+  }
+
+  Future<void> _writeText(int stream, String text) {
+    _checkWritable();
+    final Uint8List bytes = Uint8List.fromList(utf8.encode(text));
+    if (bytes.isEmpty) return Future<void>.value();
+    _reserve(bytes.length);
+    final int generation = _generation;
+    return _startOperation(() async {
+      for (
+        var offset = 0;
+        offset < bytes.length;
+        offset += _maxOutputFrameBytes
+      ) {
+        _checkGeneration(generation);
+        final int end = offset + _maxOutputFrameBytes < bytes.length
+            ? offset + _maxOutputFrameBytes
+            : bytes.length;
+        await _sendFrame(stream, Uint8List.sublistView(bytes, offset, end));
+      }
+    });
+  }
+
+  void _checkWritable() {
+    if (_closed) throw const FushellCommandOutputClosedException();
+    if (_inFlight != null) {
+      throw FushellCommandOutputStateError(
+        'an output write is already in flight for this invocation',
+      );
+    }
+  }
+
+  void _checkGeneration(int generation) {
+    if (generation != _generation || _closed) {
+      if (_cancelled) throw const FushellCommandOutputCancelledException();
+      throw const FushellCommandOutputClosedException();
+    }
+  }
+
+  void _reserve(int length) {
+    if (length > _maxOutputBytes - _logicalBytes) {
+      throw const FushellCommandOutputLimitException(
+        'the invocation output limit is 8 MiB',
+      );
+    }
+    _logicalBytes += length;
+  }
+
+  Future<void> _startOperation(Future<void> Function() operation) {
+    final Completer<void> completer = Completer<void>();
+    final Future<void> future = completer.future;
+    _inFlight = future;
+    _inFlightCompleter = completer;
+    // 内部 observer 消费 unawaited write 的错误，但不改变调用方 Future 的结果。
+    unawaited(
+      future.then<void>(
+        (_) {},
+        onError: (Object error, StackTrace stackTrace) {},
+      ),
+    );
+    unawaited(
+      operation().then<void>(
+        (_) => _finishOperation(completer),
+        onError: (Object error, StackTrace stackTrace) {
+          _finishOperation(completer, error, stackTrace);
+        },
+      ),
+    );
+    return future;
+  }
+
+  void _finishOperation(
+    Completer<void> completer, [
+    Object? error,
+    StackTrace? stackTrace,
+  ]) {
+    if (!identical(_inFlightCompleter, completer)) return;
+    _inFlight = null;
+    _inFlightCompleter = null;
+    if (_cancelled) {
+      completer.completeError(const FushellCommandOutputCancelledException());
+    } else if (error != null) {
+      _closed = true;
+      _generation++;
+      completer.completeError(error, stackTrace ?? StackTrace.current);
+    } else {
+      completer.complete();
+    }
+  }
+
+  Future<void> _sendFrame(int stream, Uint8List bytes) async {
+    try {
+      await FushellApplication._channel.invokeMethod<void>(
+        'write',
+        <String, Object?>{
+          'id': _id,
+          'stream': stream,
+          'dataHex': _encodeHex(bytes),
+        },
+      );
+    } on PlatformException catch (error) {
+      throw _mapOutputException(error);
+    }
+  }
+
+  Future<void> _awaitIdle() async {
+    final Future<void>? pending = _inFlight;
+    if (pending != null) await pending;
+  }
+
+  void _cancel() {
+    if (_closed) return;
+    _closed = true;
+    _cancelled = true;
+    _generation++;
+  }
+
+  void _close() {
+    if (_closed) return;
+    _closed = true;
+    _generation++;
+    final Completer<void>? completer = _inFlightCompleter;
+    _inFlight = null;
+    _inFlightCompleter = null;
+    completer?.completeError(const FushellCommandOutputClosedException());
+  }
+
+  static Object _mapOutputException(PlatformException error) {
+    switch (error.code) {
+      case 'ApplicationCancelled':
+        return const FushellCommandOutputCancelledException();
+      case 'ApplicationOutputClosed':
+      case 'ApplicationInvocationStale':
+        return const FushellCommandOutputClosedException();
+      case 'ApplicationOutputLimit':
+        return FushellCommandOutputLimitException(
+          error.message ?? 'native rejected the output frame',
+        );
+      default:
+        return error;
+    }
+  }
+}
+
 /// One process invocation delivered by Fushell's native application broker.
 ///
-/// [arguments] and [workingDirectory] preserve the original Unix bytes. The
-/// convenience text accessors use UTF-8 and replace malformed sequences.
+/// 该类型只有 native dispatch 路径能创建。应用从 [output] 取得专属 writer；
+/// [arguments] 与 [workingDirectory] 保留原始 Unix bytes。
 final class FushellCommandInvocation {
-  FushellCommandInvocation({
-    required this.arguments,
-    required this.workingDirectory,
-    required this.isInitial,
-  }) : _cancellation = _FushellCommandCancellation();
-
   FushellCommandInvocation._internal({
+    required int id,
     required this.arguments,
     required this.workingDirectory,
     required this.isInitial,
     required _FushellCommandCancellation cancellation,
-  }) : _cancellation = cancellation;
+  }) : _cancellation = cancellation,
+       output = FushellCommandOutput._(id: id) {
+    cancellation._setOutput(output._cancel);
+  }
 
   /// 进程入口收到的原始参数字节串，不包含可执行文件名本身。
   final List<Uint8List> arguments;
-
-  /// 调用进程中捕获的 cwd 字节。
   final Uint8List workingDirectory;
-
-  /// Whether this invocation started the primary daemon process.
   final bool isInitial;
-
+  final FushellCommandOutput output;
   final _FushellCommandCancellation _cancellation;
 
-  /// native broker 是否已请求本次命令尽快结束。
   bool get isCancellationRequested => _cancellation.isRequested;
-
-  /// native broker 请求取消时完成；重复取消只完成一次。
   Future<void> get cancelled => _cancellation.whenRequested;
 
-  /// 供常规文本命令解析器使用的有损 UTF-8 视图。
-  /// 文件名或参数可能包含非 UTF-8 字节时应改用 [arguments]。
   List<String> get textArguments => arguments
       .map((Uint8List value) => utf8.decode(value, allowMalformed: true))
       .toList(growable: false);
 
-  /// [workingDirectory] 的有损 UTF-8 视图。
   String get textWorkingDirectory =>
       utf8.decode(workingDirectory, allowMalformed: true);
 }
@@ -61,47 +266,42 @@ final class _FushellCommandCancellation {
   _FushellCommandCancellation();
 
   final Completer<void> _requested = Completer<void>();
+  void Function()? _onRequested;
 
   bool get isRequested => _requested.isCompleted;
 
   Future<void> get whenRequested => _requested.future;
 
+  void _setOutput(void Function() onRequested) {
+    _onRequested = onRequested;
+    if (isRequested) onRequested();
+  }
+
   void _request() {
     if (!_requested.isCompleted) {
       _requested.complete();
+      _onRequested?.call();
     }
   }
 }
 
-/// 返回给应用命令调用进程的完成结果。
-///
-/// 输出会先缓冲，再与退出状态原子交付，因此本 API 适合命令规模的响应，不适合无界
-/// 流式传输。native broker 将每个输出流限制为 16 MiB，并串行执行回调。
+final class _ActiveCommand {
+  const _ActiveCommand({required this.id, required this.invocation});
+
+  final int id;
+  final FushellCommandInvocation invocation;
+}
+
+/// 返回给应用命令调用进程的完成结果；输出必须通过 invocation 的 writer 发送。
+/// exitCode 只能取 0..255，stdout/stderr 不会被缓存在结果对象中。
 final class FushellCommandResult {
-  FushellCommandResult({
-    this.exitCode = 0,
-    Uint8List? stdout,
-    Uint8List? stderr,
-  }) : stdout = stdout ?? Uint8List(0),
-       stderr = stderr ?? Uint8List(0) {
+  FushellCommandResult({this.exitCode = 0}) {
     if (exitCode < 0 || exitCode > 255) {
       throw RangeError.range(exitCode, 0, 255, 'exitCode');
     }
   }
 
-  factory FushellCommandResult.text({
-    int exitCode = 0,
-    String stdout = '',
-    String stderr = '',
-  }) => FushellCommandResult(
-    exitCode: exitCode,
-    stdout: Uint8List.fromList(utf8.encode(stdout)),
-    stderr: Uint8List.fromList(utf8.encode(stderr)),
-  );
-
   final int exitCode;
-  final Uint8List stdout;
-  final Uint8List stderr;
 }
 
 /// 由应用拥有的首次启动与远程调用命令分发器。
@@ -123,8 +323,7 @@ final class FushellApplication {
     JSONMethodCodec(),
   );
   static FushellCommandHandler? _handler;
-  static int? _activeCommandId;
-  static _FushellCommandCancellation? _activeCancellation;
+  static _ActiveCommand? _activeCommand;
 
   /// 安装 [onCommand]，并释放 Dart 启动期间排队的 invocation。
   ///
@@ -152,15 +351,20 @@ final class FushellApplication {
           message: 'malformed application cancellation',
         );
       }
-      if (_activeCommandId == id) {
-        _activeCancellation?._request();
-      }
+      final _ActiveCommand? active = _activeCommand;
+      if (active?.id == id) active!.invocation._cancellation._request();
       return;
     }
     if (call.method != 'dispatch' || call.arguments is! Map<Object?, Object?>) {
       throw PlatformException(
         code: 'ApplicationProtocol',
         message: 'unsupported application invocation',
+      );
+    }
+    if (_activeCommand != null) {
+      throw PlatformException(
+        code: 'ApplicationProtocol',
+        message: 'application invocation is already active',
       );
     }
     final Map<Object?, Object?> fields =
@@ -178,11 +382,19 @@ final class FushellApplication {
         message: 'malformed application invocation',
       );
     }
+    final FushellCommandHandler? handler = _handler;
+    if (handler == null) {
+      throw PlatformException(
+        code: 'ApplicationProtocol',
+        message: 'application handler is not ready',
+      );
+    }
 
     final _FushellCommandCancellation cancellation =
         _FushellCommandCancellation();
     final FushellCommandInvocation invocation =
         FushellCommandInvocation._internal(
+          id: idValue,
           arguments: argumentsValue
               .map((Object? value) {
                 if (value is! String) {
@@ -195,31 +407,61 @@ final class FushellApplication {
           isInitial: initialValue,
           cancellation: cancellation,
         );
+    final _ActiveCommand active = _ActiveCommand(
+      id: idValue,
+      invocation: invocation,
+    );
+    _activeCommand = active;
+    unawaited(_runInvocation(active, handler));
+  }
 
-    _activeCommandId = idValue;
-    _activeCancellation = cancellation;
+  static Future<void> _runInvocation(
+    _ActiveCommand active,
+    FushellCommandHandler handler,
+  ) async {
     FushellCommandResult result;
     try {
-      final FushellCommandHandler handler = _handler!;
-      result = await handler(invocation);
+      try {
+        result = await handler(active.invocation);
+        await active.invocation.output._awaitIdle();
+      } catch (error, stackTrace) {
+        try {
+          await active.invocation.output._awaitIdle();
+        } catch (writeError, writeStackTrace) {
+          debugPrint(
+            'Unable to settle command output before diagnostic: $writeError\n$writeStackTrace',
+          );
+        }
+        try {
+          await active.invocation.output.writeStderrText(
+            'Unhandled application command error: $error\n$stackTrace\n',
+          );
+        } catch (writeError, writeStackTrace) {
+          debugPrint(
+            'Unable to write command diagnostic: $writeError\n$writeStackTrace',
+          );
+        }
+        result = FushellCommandResult(exitCode: 70);
+      }
+      active.invocation.output._close();
+      if (identical(_activeCommand, active)) _activeCommand = null;
+      try {
+        await _channel.invokeMethod<void>('complete', <String, Object?>{
+          'id': active.id,
+          'exitCode': result.exitCode,
+        });
+      } catch (error, stackTrace) {
+        debugPrint(
+          'Unable to complete application command ${active.id}: $error\n$stackTrace',
+        );
+      }
     } catch (error, stackTrace) {
-      result = FushellCommandResult.text(
-        exitCode: 70,
-        stderr: 'Unhandled application command error: $error\n$stackTrace\n',
+      debugPrint(
+        'Application invocation task ${active.id} failed: $error\n$stackTrace',
       );
     } finally {
-      if (_activeCommandId == idValue) {
-        _activeCommandId = null;
-        _activeCancellation = null;
-      }
+      if (identical(_activeCommand, active)) _activeCommand = null;
     }
-
-    await _channel.invokeMethod<void>('complete', <String, Object?>{
-      'id': idValue,
-      'exitCode': result.exitCode,
-      'stdoutHex': _encodeHex(result.stdout),
-      'stderrHex': _encodeHex(result.stderr),
-    });
   }
 }
 

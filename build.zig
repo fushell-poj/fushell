@@ -69,23 +69,7 @@ pub fn build(b: *std.Build) void {
     const dbus_runtime_so = b.pathJoin(&.{ dbus_lib_dir, "libdbus-1.so.3" });
     checkRuntimeFile(b, dbus_runtime_so, "D-Bus runtime");
 
-    const c_headers = b.addWriteFiles();
-    const c_header = c_headers.add("fushell_c_bindings.h",
-        \\#include <dirent.h>
-        \\#include <errno.h>
-        \\#include <stdio.h>
-        \\#include <stdlib.h>
-        \\#include <sys/stat.h>
-        \\#include <time.h>
-        \\#include <unistd.h>
-        \\#include <wayland-egl.h>
-        \\#include <EGL/egl.h>
-        \\#include <GLES2/gl2.h>
-        \\#include <fontconfig/fontconfig.h>
-        \\#include <dbus/dbus.h>
-        \\#include <poll.h>
-        \\#include <flutter_embedder.h>
-    );
+    const c_header = b.path("src/fushell_c_bindings.h");
 
     const flutter_embedder = b.dependency("flutter-embedder", .{});
     const translate_c = b.addTranslateC(.{
@@ -99,6 +83,7 @@ pub fn build(b: *std.Build) void {
     // bool，但 std 的 object_size builtin 仍要求 c_int；显式关闭仅影响头文件翻译，
     // 不改变 Zig 代码的 ReleaseSafe 检查或最终链接器加固。
     translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
+    translate_c.defineCMacro("FUSHELL_TRANSLATE_C", "1");
     linkTranslateCLibraries(translate_c, dynamic_link_opts);
     const c_mod = translate_c.createModule();
 
@@ -274,6 +259,49 @@ pub fn build(b: *std.Build) void {
     const run_build_tool_unit_tests = b.addRunArtifact(build_tool_unit_tests);
     test_step.dependOn(&run_build_tool_unit_tests.step);
 
+    const output_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/application_output.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const output_transport_tests = b.addTest(.{ .root_module = output_transport_mod });
+    const run_output_transport_tests = b.addRunArtifact(output_transport_tests);
+    test_step.dependOn(&run_output_transport_tests.step);
+
+    const output_sink_mod = b.createModule(.{
+        .root_source_file = b.path("src/output_sink_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const output_sink_tests = b.addTest(.{ .root_module = output_sink_mod });
+    const run_output_sink_tests = b.addRunArtifact(output_sink_tests);
+    test_step.dependOn(&run_output_sink_tests.step);
+
+    const retained_signal_mod = b.createModule(.{
+        .root_source_file = b.path("src/retained_signal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const retained_signal_tests = b.addTest(.{ .root_module = retained_signal_mod });
+    const run_retained_signal_tests = b.addRunArtifact(retained_signal_tests);
+    test_step.dependOn(&run_retained_signal_tests.step);
+
+    const broker_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/application_broker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    broker_test_mod.addImport("c", c_mod);
+    broker_test_mod.addLibraryPath(.{ .cwd_relative = dbus_lib_dir });
+    broker_test_mod.linkSystemLibrary("dbus-1", dynamic_link_opts);
+    const broker_tests = b.addTest(.{ .root_module = broker_test_mod });
+    const run_broker_tests = b.addRunArtifact(broker_tests);
+    test_step.dependOn(&run_broker_tests.step);
+
     const build_singleton_fixture = b.addRunArtifact(build_tool);
     build_singleton_fixture.step.dependOn(b.getInstallStep());
     build_singleton_fixture.addArgs(&.{ "build", "--debug", "examples/singleton_app" });
@@ -286,11 +314,23 @@ pub fn build(b: *std.Build) void {
         "1",
     );
     run_single_instance_integration.step.dependOn(&build_singleton_fixture.step);
+    const run_native_v2_fixture = b.addSystemCommand(&.{
+        "bash",
+        "tests/native_v2_fixture.sh",
+    });
+    run_native_v2_fixture.step.dependOn(&build_singleton_fixture.step);
+    const native_v2_fixture_test_step = b.step(
+        "native-v2-fixture-test",
+        "Run the no-EGL private D-Bus V2 fixture",
+    );
+    native_v2_fixture_test_step.dependOn(&run_native_v2_fixture.step);
+
     const integration_test_step = b.step(
         "integration-test",
-        "Run the single-instance D-Bus integration test",
+        "Run the native V2 fixture and real two-process singleton integration tests",
     );
     integration_test_step.dependOn(&run_single_instance_integration.step);
+    integration_test_step.dependOn(&run_native_v2_fixture.step);
 }
 
 /// 检查引擎 .so 是否存在, 缺失时给明确指引 (先构建对应引擎) 并退出。

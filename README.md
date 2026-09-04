@@ -116,7 +116,12 @@ syntax and behavior remain entirely application-defined through
 Single-instance bundles fail explicitly when no session D-Bus is available.
 
 The bundle contains its validated application manifest and `libdbus-1` runtime;
-the internal runner locates those resources relative to itself. See
+the internal runner locates those resources relative to itself. Command handlers use
+`invocation.output.writeStdout`, `writeStderr`, `writeStdoutText`, and
+`writeStderrText`; `FushellCommandResult` only carries an exit code, while output
+frames are streamed with 32 KiB frame and 8 MiB invocation limits. The internal
+Application2 final reply carries `terminalKind=completed` or `timedOut`, so a
+normal business exit code 124 is not confused with a timeout diagnostic. See
 [`examples/singleton_app`](examples/singleton_app) for a complete daemon that
 implements application-defined `open`, `list`, `close`, `status`, `quit`, and
 `help` commands while managing a dynamic `ViewCollection`.
@@ -129,9 +134,10 @@ zig build integration-test
 zig build -Doptimize=ReleaseFast
 ```
 
-The integration step uses a private session bus and headless Cage compositor.
-It covers primary/secondary startup, binary argv and cwd transport, output and
-exit-code propagation, application-defined window commands, command timeout
+`zig build integration-test` runs the native V2 fixture and the real two-process
+singleton integration; it uses a private session bus and headless Cage compositor.
+It covers primary/secondary startup, binary argv and cwd transport, streaming
+stdout/stderr frames and exit-code propagation, application-defined window commands, command timeout
 recovery, signal handling, ownership races, secondary fast-path loading, and
 idle CPU/FD stability.
 
