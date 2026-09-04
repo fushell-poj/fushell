@@ -12,12 +12,7 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   test('closed emits the completed native window id', () async {
-    final List<int> received = <int>[];
-    final StreamSubscription<FushellWindowClosedEvent> subscription =
-        FushellWindow.closed.listen(
-          (FushellWindowClosedEvent event) => received.add(event.windowId),
-        );
-    addTearDown(subscription.cancel);
+    final List<int> received = _recordClosedWindowIds();
 
     await _dispatch(<String, Object?>{
       'event': 'window.closed',
@@ -28,18 +23,8 @@ void main() {
   });
 
   test('closed broadcasts every valid event to every subscriber', () async {
-    final List<int> first = <int>[];
-    final List<int> second = <int>[];
-    final StreamSubscription<FushellWindowClosedEvent> firstSubscription =
-        FushellWindow.closed.listen(
-          (FushellWindowClosedEvent event) => first.add(event.windowId),
-        );
-    final StreamSubscription<FushellWindowClosedEvent> secondSubscription =
-        FushellWindow.closed.listen(
-          (FushellWindowClosedEvent event) => second.add(event.windowId),
-        );
-    addTearDown(firstSubscription.cancel);
-    addTearDown(secondSubscription.cancel);
+    final List<int> first = _recordClosedWindowIds();
+    final List<int> second = _recordClosedWindowIds();
 
     await _dispatch(<String, Object?>{
       'event': 'window.closed',
@@ -55,12 +40,7 @@ void main() {
   });
 
   test('closed ignores malformed and unrelated native events', () async {
-    final List<int> received = <int>[];
-    final StreamSubscription<FushellWindowClosedEvent> subscription =
-        FushellWindow.closed.listen(
-          (FushellWindowClosedEvent event) => received.add(event.windowId),
-        );
-    addTearDown(subscription.cancel);
+    final List<int> received = _recordClosedWindowIds();
 
     await _dispatch(<String, Object?>{'event': 'window.opened', 'windowId': 9});
     await _dispatch(<String, Object?>{
@@ -70,6 +50,15 @@ void main() {
 
     expect(received, isEmpty);
   });
+}
+
+List<int> _recordClosedWindowIds() {
+  final List<int> received = <int>[];
+  final subscription = FushellWindow.closed.listen(
+    (FushellWindowClosedEvent event) => received.add(event.windowId),
+  );
+  addTearDown(subscription.cancel);
+  return received;
 }
 
 Future<void> _dispatch(Object? message) async {
