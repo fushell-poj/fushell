@@ -24,6 +24,10 @@
             .url = "git+https://codeberg.org/ifreund/zig-xkbcommon#6c2f41e269adde0d2cd58d20c02c4f8803d83eb1",
             .hash = "xkbcommon-0.5.0-dev-VDqIe0y2AgA1RzA2ICMdGhaAgSXdhtRTbYybQQu7WfOa",
         },
+        .@"flutter-engine" = .{
+            .url = "https://github.com/fushell-poj/fushell-engine-builds/releases/download/3.47.0/flutter-engine-linux-x64-3.47.0.tar.gz",
+            .hash = "N-V-__8AAFjKPAz2i3YRKcpp_8KKNqYisHRjIgE23CxG65Y4",
+        },
     },
     .paths = .{
         "build.zig",

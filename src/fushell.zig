@@ -19,7 +19,6 @@ const cli = @import("fushell_cli.zig");
 const devtools = @import("devtools.zig");
 const service_uri = @import("service_uri.zig");
 const signal_shutdown = @import("signal_shutdown.zig");
-const build_support = @import("build_support");
 
 comptime {
     _ = hot_reload;
