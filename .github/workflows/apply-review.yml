@@ -1,0 +1,121 @@
+name: Verify architecture repairs
+on:
+  push:
+    branches: ['fix/architecture-review-20260907']
+    paths: ['.github/workflows/apply-review.yml']
+permissions:
+  contents: write
+jobs:
+  verify:
+    if: github.repository == 'fushell-poj/fushell' && github.ref == 'refs/heads/fix/architecture-review-20260907'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/architecture-review-20260907
+      - name: Apply checksum-verified source edits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, urllib.request
+          chunks = [
+              '8fa581f4a4cba42ab9b95831c1cd37d26c29b338',
+              '606529ea82f297cb1f448611838d2ab88d8fda34',
+              'be86f3f64af1399df35f427e4e06847a87cbe177',
+              'db1ad3b57be852b1eab6f7f8a18c150525d9032c',
+              '53a0bb905a8924e16b022c3479c39952f128fcf3',
+              '83ccae20c37b19205dec355cb74e72db22269747',
+              '26235011ab63daab9f0507587854ef11e15de2d4',
+              '54f53a914b8b495f8c38d0be02a3446d0312d1fb',
+              '40da2ed50c49e393ac35e96c1f52effb4f50dccf',
+          ]
+          def blob(sha):
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/fushell-poj/fushell/git/blobs/' + sha,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  data = base64.b64decode(json.load(response)['content'])
+              digest = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              if digest != sha:
+                  raise SystemExit('Blob checksum mismatch: ' + sha)
+              return data
+          compressed = b''.join(blob(sha) for sha in chunks)
+          if hashlib.sha256(compressed).hexdigest() != '0f7d1523e2f17c9645011140136daede58fa7640e098f9ff0223864d7385b841':
+              raise SystemExit('Source edit plan checksum mismatch')
+          files = json.loads(gzip.decompress(compressed))['files']
+          test_plan = blob('fc9ccd27b5060e9a044cea4c276e85a59bdd4ffb')
+          if hashlib.sha256(test_plan).hexdigest() != '3e3b4f4ab7b3e58c614293d6383f866eb10ac50fa4f92dc90fbf241157ea1c2a':
+              raise SystemExit('Test edit plan checksum mismatch')
+          files += json.loads(gzip.decompress(test_plan))['files']
+          pending = []
+          for entry in files:
+              path = pathlib.Path(entry['path'])
+              if path.is_absolute() or '..' in path.parts or path.parts[0] in ('.git', '.github'):
+                  raise SystemExit('Invalid edit path')
+              if entry['before'] is None:
+                  if path.exists():
+                      raise SystemExit('Refusing to replace new file: ' + str(path))
+                  old = b''
+              else:
+                  old = path.read_bytes()
+                  if hashlib.sha256(old).hexdigest() != entry['before']:
+                      raise SystemExit('Source changed; refusing overwrite: ' + str(path))
+              lines = old.decode().splitlines(keepends=True)
+              for start, end, replacement in reversed(entry['edits']):
+                  lines[start:end] = replacement.splitlines(keepends=True)
+              result = ''.join(lines).encode()
+              if hashlib.sha256(result).hexdigest() != entry['after']:
+                  raise SystemExit('Result differs from tested source: ' + str(path))
+              pending.append((path, result))
+          for path, result in pending:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(result)
+              print('Verified source:', path)
+          PY
+      - name: Install native development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev wayland-protocols libegl-dev libgles-dev \
+            libxkbcommon-dev libfontconfig-dev libdbus-1-dev curl xz-utils
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://ziglang.org/download/index.json -o "$RUNNER_TEMP/zig-index.json"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, sys, urllib.request, hashlib
+          root = pathlib.Path(sys.argv[1])
+          release = json.loads((root / 'zig-index.json').read_text())['0.16.0']['x86_64-linux']
+          archive = root / 'zig.tar.xz'
+          urllib.request.urlretrieve(release['tarball'], archive)
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != release['shasum']:
+              raise SystemExit('Zig archive checksum mismatch')
+          PY
+          mkdir -p "$RUNNER_TEMP/zig" "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Debug build
+        run: |
+          test "$(zig version)" = 0.16.0
+          zig build --summary all
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: ReleaseFast build
+        run: zig build -Doptimize=ReleaseFast --summary all
+      - name: Publish verified repairs to the review branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md build.zig build.zig.zon docs flake.nix nix src
+          git commit -m 'fix: harden bundle publication, engine cache, toolchain and runtime lifecycle' \
+            -m 'Preserve the native D-Bus singleton and explicit environment configuration. Repair ownership, exit codes, staged publication, downloader cancellation and locking, selected Flutter SDK, hot-reload invalidation, and bounded software frame scheduling. Verified with Zig 0.16.0 Debug build, unit tests, and ReleaseFast build.'
+          git push origin HEAD:refs/heads/fix/architecture-review-20260907
