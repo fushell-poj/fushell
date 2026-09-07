@@ -1,0 +1,42 @@
+name: Bootstrap zig-clap dependency
+
+on:
+  push:
+    branches: [refactor/zig-clap-cli]
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location https://ziglang.org/download/index.json -o "$RUNNER_TEMP/zig-index.json"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, sys, urllib.request, hashlib
+          root = pathlib.Path(sys.argv[1])
+          rel = json.loads((root / 'zig-index.json').read_text())['0.16.0']['x86_64-linux']
+          archive = root / 'zig.tar.xz'
+          urllib.request.urlretrieve(rel['tarball'], archive)
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != rel['shasum']:
+              raise SystemExit('checksum mismatch')
+          PY
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Pin zig-clap
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig fetch --save=clap 'git+https://github.com/Hejsil/zig-clap#8d97efa1ee1e575443c7888d5c38e1c3fc145cf5'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add build.zig.zon
+          git diff --cached --quiet || git commit -m 'build: pin zig-clap for Zig 0.16.0'
+          git push
