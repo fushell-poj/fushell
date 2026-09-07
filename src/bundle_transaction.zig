@@ -95,7 +95,7 @@ pub const Transaction = struct {
     pub fn begin(allocator: Allocator, io: Io, root: Io.Dir, output: []const u8) !Transaction {
         if (output.len == 0 or std.mem.indexOfScalar(u8, output, 0) != null) return error.UnsafeBundleDirectory;
         var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const root_len = try root.realPath(io, &root_buffer);
+        const root_len = try root.realPathFile(io, ".", &root_buffer);
         const project = root_buffer[0..root_len];
         const target = try std.fs.path.resolve(allocator, &.{ project, output });
         errdefer allocator.free(target);
