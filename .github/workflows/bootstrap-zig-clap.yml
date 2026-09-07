@@ -3,40 +3,51 @@ name: Bootstrap zig-clap dependency
 on:
   push:
     branches: [refactor/zig-clap-cli]
+    paths: [.github/workflows/bootstrap-zig-clap.yml]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  bootstrap:
-    if: github.actor != 'github-actions[bot]'
+  sources:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - name: Install Zig 0.16.0
+        with:
+          persist-credentials: false
+      - name: Collect source snapshots (no credentials)
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --location https://ziglang.org/download/index.json -o "$RUNNER_TEMP/zig-index.json"
-          python3 - "$RUNNER_TEMP" <<'PY'
-          import json, pathlib, sys, urllib.request, hashlib
-          root = pathlib.Path(sys.argv[1])
-          rel = json.loads((root / 'zig-index.json').read_text())['0.16.0']['x86_64-linux']
-          archive = root / 'zig.tar.xz'
-          urllib.request.urlretrieve(rel['tarball'], archive)
-          if hashlib.sha256(archive.read_bytes()).hexdigest() != rel['shasum']:
-              raise SystemExit('checksum mismatch')
-          PY
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-      - name: Pin zig-clap
+          mkdir -p "$RUNNER_TEMP/review"
+          git archive HEAD | gzip > "$RUNNER_TEMP/review/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/review/source-commit.txt"
+          git clone --quiet https://github.com/Hejsil/zig-clap "$RUNNER_TEMP/clap"
+          git -C "$RUNNER_TEMP/clap" archive --prefix=clap/ 8d97efa1ee1e575443c7888d5c38e1c3fc145cf5 | gzip > "$RUNNER_TEMP/review/clap.tar.gz"
+          git -C "$RUNNER_TEMP/clap" show --stat bf56f229ed5b6c381d90e192234913c6deb3f688 > "$RUNNER_TEMP/review/clap-transition.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-refactor-sources
+          path: ${{ runner.temp }}/review/
+          retention-days: 1
+  nix-deps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Regenerate deps.nix
         shell: bash
         run: |
           set -euo pipefail
-          zig fetch --save=clap 'git+https://github.com/Hejsil/zig-clap#8d97efa1ee1e575443c7888d5c38e1c3fc145cf5'
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add build.zig.zon
-          git diff --cached --quiet || git commit -m 'build: pin zig-clap for Zig 0.16.0'
-          git push
+          sudo apt-get update -qq
+          sudo apt-get install -y nix-bin
+          mkdir -p "$RUNNER_TEMP/nix-result"
+          sudo -H nix --extra-experimental-features 'nix-command flakes' run github:nix-community/zon2nix > "$RUNNER_TEMP/nix-result/deps.nix"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-refactor-nix-deps
+          path: ${{ runner.temp }}/nix-result/deps.nix
+          retention-days: 1
