@@ -19,9 +19,7 @@
   dbus,
   stdenv,
   flutter,
-  depot-tools,
-  python3,
-  ninja,
+  writeShellScriptBin,
   ...
 }: let
   # Zig's Clang driver rejects some flags emitted by distro .pc files.
@@ -53,6 +51,8 @@
         ;;
     esac
   '';
+
+  generate-nix-deps = writeShellScriptBin "generate-nix-deps" ''nix run github:nix-community/zon2nix > deps.nix'';
 in
   mkShell {
     packages = [
@@ -63,6 +63,7 @@ in
       zls
       clang
       lldb
+      generate-nix-deps
 
       wayland
       wayland-protocols
@@ -75,22 +76,11 @@ in
       freetype
       dbus
       stdenv.cc.cc.lib
-
-      # gclient 的运行环境 (zig build pull-flutter 需要)
-      depot-tools
-      python3
-
-      # ninja: 工作区 depot_tools/ninja 是 python 包装 (import pipes,
-      # Python 3.13 已移除) 不可用; 用 nix 的真二进制 (zig build build-engine 需要)
-      ninja
-
-      # Convenient default. A local Flutter checkout can override FLUTTER_SDK.
       flutter
     ];
 
     FUSHELL_NIX_FLUTTER_SDK = "${flutter}";
     FUSHELL_WAYLAND_PROTOCOLS = "${wayland-protocols}/share/wayland-protocols";
-    FUSHELL_DBUS_LIB_DIR = "${dbus.lib}/lib";
 
     shellHook = ''
       export PATH="$PATH:$PWD/zig-out/bin"
@@ -107,7 +97,7 @@ in
         stdenv.cc.cc.lib
       ]}"
       export LD_LIBRARY_PATH="$FUSHELL_NIX_LIBRARY_PATH:''${LD_LIBRARY_PATH:-}"
-
+      alias generate-nix-deps=${generate-nix-deps}
       echo "fushell dev shell"
       echo "  zig: $(zig version)"
       echo "  wayland protocols: $FUSHELL_WAYLAND_PROTOCOLS"

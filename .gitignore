@@ -12,3 +12,4 @@ zig-pkg
 flutter_engine_dir
 .dart_tool
 build
+result

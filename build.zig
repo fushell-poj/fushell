@@ -3,23 +3,13 @@ const Scanner = @import("wayland").Scanner;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const runner_interpreter = b.option([]const u8, "runner-interpreter", "ELF interpreter written into installed and embedded runners");
     const strip = b.option(bool, "strip", "Strip installed and embedded executables") orelse false;
     const optimize = b.standardOptimizeOption(.{});
-
-    // 三个引擎 .so 全部内嵌进 fushell CLI (打包时按模式选)。
-    const flutter_engine_dep = b.dependency("flutter-engine", .{});
 
     const dynamic_link_opts: std.Build.Module.LinkSystemLibraryOptions = .{
         .preferred_link_mode = .dynamic,
         .search_strategy = .mode_first,
     };
-    const dbus_lib_dir = b.option([]const u8, "dbus-lib-dir", "Directory containing libdbus-1.so.3") orelse
-        b.graph.environ_map.get("FUSHELL_DBUS_LIB_DIR") orelse {
-        std.debug.print("error: D-Bus runtime not configured; enter `nix develop` or pass -Ddbus-lib-dir=<path>\n", .{});
-        std.process.exit(1);
-    };
-    const dbus_runtime_so = b.pathJoin(&.{ dbus_lib_dir, "libdbus-1.so.3" });
 
     const c_header = b.path("src/fushell_c_bindings.h");
 
@@ -47,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     exe_mod.addImport("c", c_mod);
-    exe_mod.addLibraryPath(.{ .cwd_relative = dbus_lib_dir });
+    exe_mod.linkSystemLibrary("dbus-1", dynamic_link_opts);
 
     const scanner = Scanner.create(b, .{
         // Custom protocols are added explicitly below, so this only satisfies
@@ -90,27 +80,14 @@ pub fn build(b: *std.Build) void {
     // Packaged app runners resolve bundled runtime libraries before system paths.
     exe_mod.addRPathSpecial("$ORIGIN/lib");
 
-    // pi-lens-ignore: zls
     const exe = b.addExecutable(.{
-        // pi-lens-ignore: zls
         .name = "fushell-runner",
         .root_module = exe_mod,
         .use_llvm = true,
     });
     // NixOS bundle 不能依赖事后的 install fixup：CLI 会在编译期内嵌 runner。
     // 因此先复制并修补 emitted binary，再同时用于安装和 @embedFile。
-    const runner_bin = if (runner_interpreter) |interpreter| blk: {
-        const patch_runner = b.addSystemCommand(&.{
-            "sh",
-            "-c",
-            "set -eu; cp \"$1\" \"$2\"; chmod u+w \"$2\"; patchelf --set-interpreter \"$3\" \"$2\"",
-            "_",
-        });
-        patch_runner.addFileArg(exe.getEmittedBin());
-        const output = patch_runner.addOutputFileArg("fushell-runner");
-        patch_runner.addArg(interpreter);
-        break :blk output;
-    } else exe.getEmittedBin();
+    const runner_bin = exe.getEmittedBin();
 
     const build_tool_mod = b.createModule(.{
         .root_source_file = b.path("src/fushell.zig"),
@@ -123,7 +100,6 @@ pub fn build(b: *std.Build) void {
     // fushell run: 进程内播放 (player.zig → flutter_runner → c/wayland/EGL)
     build_tool_mod.addImport("c", c_mod);
     build_tool_mod.addImport("wayland", wayland_mod);
-    build_tool_mod.addLibraryPath(.{ .cwd_relative = dbus_lib_dir });
     linkRuntimeLibraries(build_tool_mod, dynamic_link_opts);
     build_tool_mod.addRPathSpecial("$ORIGIN/../lib");
     // workspace 解析后是绝对路径 (或相对构建根), 用 cwd_relative 支持两者
@@ -142,25 +118,10 @@ pub fn build(b: *std.Build) void {
     }
     build_tool_mod.addOptions("build_options", build_options);
 
-    build_tool_mod.addAnonymousImport("flutter_engine_so_release", .{ .root_source_file = .{ .dependency = .{
-        .dependency = flutter_engine_dep,
-        .sub_path = "libflutter_engine-linux-x64-release.so",
-    } } });
-    build_tool_mod.addAnonymousImport("flutter_engine_so_debug", .{ .root_source_file = .{ .dependency = .{
-        .dependency = flutter_engine_dep,
-        .sub_path = "libflutter_engine-linux-x64-debug.so",
-    } } });
-    build_tool_mod.addAnonymousImport("flutter_engine_so_profile", .{ .root_source_file = .{ .dependency = .{
-        .dependency = flutter_engine_dep,
-        .sub_path = "libflutter_engine-linux-x64-profile.so",
-    } } });
     // runner 可执行文件内嵌进 fushell CLI: 打包时写出为 bundle 入口
     // (getEmittedBin LazyPath, 构建顺序自动: runner 先编译)
     build_tool_mod.addAnonymousImport("fushell_runner_bin", .{
         .root_source_file = runner_bin,
-    });
-    build_tool_mod.addAnonymousImport("dbus_runtime", .{
-        .root_source_file = .{ .cwd_relative = dbus_runtime_so },
     });
     // fushell SDK 包文件内嵌: `fushell sdk` 释放给外部项目
     build_tool_mod.addAnonymousImport("fushell_sdk_pubspec", .{
@@ -178,19 +139,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    if (runner_interpreter != null) {
-        const install_runner = b.addInstallFileWithDir(runner_bin, .bin, "fushell-runner");
-        b.getInstallStep().dependOn(&install_runner.step);
-    } else {
-        b.installArtifact(exe);
-    }
     b.installArtifact(build_tool);
-    const install_dbus_runtime = b.addInstallFileWithDir(
-        .{ .cwd_relative = dbus_runtime_so },
-        .lib,
-        "libdbus-1.so.3",
-    );
-    b.getInstallStep().dependOn(&install_dbus_runtime.step);
 
     const run_cmd = b.addRunArtifact(build_tool);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -247,7 +196,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     broker_test_mod.addImport("c", c_mod);
-    broker_test_mod.addLibraryPath(.{ .cwd_relative = dbus_lib_dir });
     broker_test_mod.linkSystemLibrary("dbus-1", dynamic_link_opts);
     const broker_tests = b.addTest(.{ .root_module = broker_test_mod });
     const run_broker_tests = b.addRunArtifact(broker_tests);
