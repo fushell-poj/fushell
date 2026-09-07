@@ -613,6 +613,12 @@ test "closed sink pipe becomes sink_write summary instead of SIGPIPE death" {
 
 test "helper receives PDEATHSIG when its short-lived parent exits" {
     const io = std.testing.io;
+    // Adopt and reap the orphan ourselves. kill(pid, 0) also succeeds for a
+    // zombie, so waiting for it to fail incorrectly depends on the host PID 1.
+    var previous_subreaper: c_int = 0;
+    _ = try posix.prctl(.GET_CHILD_SUBREAPER, .{@intFromPtr(&previous_subreaper)});
+    _ = try posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
+    defer _ = posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, @intCast(previous_subreaper))}) catch {};
     var report_pipe: [2]i32 = undefined;
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&report_pipe, .{ .CLOEXEC = true })));
     const short_parent_raw = linux.fork();
@@ -649,9 +655,29 @@ test "helper receives PDEATHSIG when its short-lived parent exits" {
         if (try deadline.expired()) return error.TestTimeout;
         try sleepUntil(deadline, io);
     }
-    while (linux.errno(linux.kill(helper_pid, @enumFromInt(0))) == .SUCCESS) {
-        if (try deadline.expired()) return error.TestTimeout;
-        try sleepUntil(deadline, io);
+    var helper_reaped = false;
+    defer if (!helper_reaped) {
+        _ = linux.kill(helper_pid, .KILL);
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(helper_pid, &status, 0)) == .INTR) {}
+    };
+    const helper_deadline = try Deadline.after(2 * std.time.ns_per_s);
+    while (true) {
+        var status: u32 = 0;
+        const waited = linux.waitpid(helper_pid, &status, linux.W.NOHANG);
+        switch (linux.errno(waited)) {
+            .SUCCESS => if (waited != 0) {
+                helper_reaped = true;
+                // If the parent died before prctl, spawn's getppid guard exits
+                // with 127; otherwise the kernel must terminate it with KILL.
+                try std.testing.expect((status & 0x7f) == 9 or status == (127 << 8));
+                break;
+            },
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+        if (try helper_deadline.expired()) return error.TestTimeout;
+        try sleepUntil(helper_deadline, io);
     }
 }
 

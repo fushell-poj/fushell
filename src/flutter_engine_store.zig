@@ -32,6 +32,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const cache_lock = @import("cache_lock.zig");
 
 /// 默认的 Flutter Engine 二进制仓库。
 pub const default_repository =
@@ -171,7 +172,7 @@ pub const ProgressSink = struct {
 
 /// 下载操作的结果。
 ///
-/// SHA256 是下载过程中直接计算得到的，不需要下载完成后再次读取整个文件。
+/// SHA256 is computed by the backend: streamed for HTTP, read after curl exits.
 pub const DownloadResult = struct {
     bytes: u64,
     sha256: [32]u8,
@@ -179,7 +180,7 @@ pub const DownloadResult = struct {
 
 /// 抽象下载后端。
 ///
-/// 正常运行使用 HTTP 实现；测试可以注入 fake fetcher，避免访问网络。
+/// 默认使用 curl；测试注入 fake fetcher 或本地子进程，无需外部网络。
 pub const Fetcher = struct {
     context: ?*anyopaque = null,
 
@@ -316,6 +317,7 @@ pub const Store = struct {
     pub fn initWith(
         allocator: Allocator,
         io: Io,
+        environ: *const std.process.Environ.Map,
         root_dir: Io.Dir,
         repository: []const u8,
         cache_root: []const u8,
@@ -325,6 +327,7 @@ pub const Store = struct {
         return .{
             .allocator = allocator,
             .io = io,
+            .environ = environ,
             .root_dir = root_dir,
             .repository = repository,
             .cache_root = cache_root,
@@ -364,6 +367,16 @@ pub const Store = struct {
             self.io,
             cache_dir,
         );
+        var lock = try self.acquireLock(cache_dir);
+        defer lock.deinit();
+        // Metadata from a different configured repository is not trusted.
+        const repository_path = try Io.Dir.path.join(self.allocator, &.{ cache_dir, ".repository" });
+        defer self.allocator.free(repository_path);
+        const old_repository = self.root_dir.readFileAlloc(self.io, repository_path, self.allocator, .limited(8192)) catch |err| switch (err) {
+            error.FileNotFound, error.StreamTooLong => null,
+            else => return err,
+        };
+        defer if (old_repository) |bytes| self.allocator.free(bytes);
 
         const metadata_path = try Io.Dir.path.join(
             self.allocator,
@@ -374,11 +387,19 @@ pub const Store = struct {
         );
         defer self.allocator.free(metadata_path);
 
+        const repository = std.mem.trimEnd(u8, self.repository, "/");
+        if (old_repository == null or !std.mem.eql(u8, old_repository.?, repository)) {
+            try deleteIfExists(self.root_dir, self.io, metadata_path);
+        }
         var parsed = try self.ensureMetadata(
             metadata_path,
             progress,
         );
         defer parsed.deinit();
+        var origin = try self.root_dir.createFileAtomic(self.io, repository_path, .{ .replace = true });
+        defer origin.deinit(self.io);
+        try origin.file.writeStreamingAll(self.io, repository);
+        try origin.replace(self.io);
 
         const metadata = &parsed.value;
 
@@ -440,6 +461,7 @@ pub const Store = struct {
             .{engine_path},
         );
         defer self.allocator.free(temp_path);
+        defer cleanupTemporary(self.root_dir, self.io, temp_path);
 
         // 清理上一次中断留下的 .part。
         try deleteIfExists(self.root_dir, self.io, temp_path);
@@ -478,14 +500,9 @@ pub const Store = struct {
             return error.EngineHashMismatch;
         }
 
-        // updateFile 使用原子目标替换语义，并自动创建目标父目录。
-        _ = try self.root_dir.updateFile(
-            self.io,
-            temp_path,
-            self.root_dir,
-            engine_path,
-            .{},
-        );
+        // 校验成功后发布缓存文件。
+        // Both paths live on the same filesystem; publish only verified bytes.
+        try self.root_dir.rename(temp_path, self.root_dir, engine_path, self.io);
 
         try deleteIfExists(
             self.root_dir,
@@ -541,6 +558,16 @@ pub const Store = struct {
     ) ![]u8 {
         const cache_dir = try self.engineDir(arch);
         defer self.allocator.free(cache_dir);
+        var lock = try self.acquireLock(cache_dir);
+        defer lock.deinit();
+        const origin_path = try Io.Dir.path.join(self.allocator, &.{ cache_dir, ".repository" });
+        defer self.allocator.free(origin_path);
+        const origin = self.root_dir.readFileAlloc(self.io, origin_path, self.allocator, .limited(8192)) catch |err| switch (err) {
+            error.FileNotFound => return error.EngineNotCached,
+            else => return err,
+        };
+        defer self.allocator.free(origin);
+        if (!std.mem.eql(u8, origin, std.mem.trimEnd(u8, self.repository, "/"))) return error.RepositoryMismatch;
 
         const metadata_path = try Io.Dir.path.join(
             self.allocator,
@@ -596,20 +623,6 @@ pub const Store = struct {
             return error.EngineNotCached;
         }
 
-        const actual_digest = try sha256File(
-            self.root_dir,
-            self.io,
-            source,
-        );
-
-        if (!std.mem.eql(
-            u8,
-            &actual_digest,
-            &expected_digest,
-        )) {
-            return error.EngineHashMismatch;
-        }
-
         const destination = try Io.Dir.path.join(
             self.allocator,
             &.{
@@ -619,13 +632,25 @@ pub const Store = struct {
         );
         errdefer self.allocator.free(destination);
 
-        _ = try self.root_dir.updateFile(
-            self.io,
-            source,
-            self.root_dir,
-            destination,
-            .{},
-        );
+        // Copy and hash in one pass; a corrupt source never replaces a good destination.
+        const input = try self.root_dir.openFile(self.io, source, .{});
+        defer input.close(self.io);
+        var output = try self.root_dir.createFileAtomic(self.io, destination, .{ .replace = true, .make_path = true });
+        defer output.deinit(self.io);
+        var read_buffer: [download_buffer_size]u8 = undefined;
+        var reader = input.reader(self.io, &read_buffer);
+        var chunk: [download_buffer_size]u8 = undefined;
+        var hasher = Sha256.init(.{});
+        while (true) {
+            const n = try reader.interface.readSliceShort(&chunk);
+            if (n == 0) break;
+            try output.file.writeStreamingAll(self.io, chunk[0..n]);
+            hasher.update(chunk[0..n]);
+        }
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        if (!std.mem.eql(u8, &digest, &expected_digest)) return error.EngineHashMismatch;
+        try output.replace(self.io);
 
         return destination;
     }
@@ -648,6 +673,7 @@ pub const Store = struct {
         self: *const Store,
         arch: Arch,
     ) ![]u8 {
+        if (!isEngineRevision(self.flutter.engine_revision)) return error.InvalidEngineRevision;
         return Io.Dir.path.join(
             self.allocator,
             &.{
@@ -656,6 +682,13 @@ pub const Store = struct {
                 self.flutter.engine_revision,
             },
         );
+    }
+
+    /// Serialize readers/publication and all modes sharing one metadata file.
+    fn acquireLock(self: *const Store, dir: []const u8) !cache_lock.Lock {
+        const path = try Io.Dir.path.join(self.allocator, &.{ dir, ".lock" });
+        defer self.allocator.free(path);
+        return cache_lock.Lock.acquire(self.io, self.root_dir, path);
     }
 
     /// 确保 metadata.json 存在且与当前 Flutter Engine revision 匹配。
@@ -685,7 +718,10 @@ pub const Store = struct {
                 } else |_| {
                     parsed.deinit();
                 }
-            } else |_| {}
+            } else |err| switch (err) {
+                error.InvalidMetadata, error.StreamTooLong, error.FileNotFound => {},
+                else => return err,
+            }
 
             // 本地 metadata 损坏或 revision 不一致。
             try deleteIfExists(
@@ -701,6 +737,7 @@ pub const Store = struct {
             .{metadata_path},
         );
         defer self.allocator.free(temp_path);
+        defer cleanupTemporary(self.root_dir, self.io, temp_path);
 
         try deleteIfExists(
             self.root_dir,
@@ -744,12 +781,11 @@ pub const Store = struct {
             return err;
         };
 
+        errdefer parsed.deinit();
         validateMetadata(
             &parsed.value,
             self.flutter.engine_revision,
         ) catch |err| {
-            parsed.deinit();
-
             try deleteIfExists(
                 self.root_dir,
                 self.io,
@@ -759,13 +795,8 @@ pub const Store = struct {
             return err;
         };
 
-        _ = try self.root_dir.updateFile(
-            self.io,
-            temp_path,
-            self.root_dir,
-            metadata_path,
-            .{},
-        );
+        // Both paths live on the same filesystem; publish only verified bytes.
+        try self.root_dir.rename(temp_path, self.root_dir, metadata_path, self.io);
 
         try deleteIfExists(
             self.root_dir,
@@ -826,7 +857,7 @@ pub const Store = struct {
         artifact: Artifact,
         from_cache: bool,
     ) !ResolvedEngine {
-        errdefer self.allocator.free(engine_path);
+        // engine_path remains caller-owned until this function succeeds.
 
         const engine_revision =
             try self.allocator.dupe(
@@ -1059,7 +1090,7 @@ fn validateArtifact(
     }
 
     for (artifact.file) |c| {
-        if (c == '/' or c == '\\')
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '-')
             return error.InvalidArtifactFilename;
     }
 
@@ -1092,7 +1123,10 @@ fn loadMetadata(
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         },
-    );
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidMetadata,
+    };
 }
 
 /// 标准 HTTP 下载器。
@@ -1122,7 +1156,7 @@ fn httpFetchToFile(
     var request = try client.request(
         .GET,
         uri,
-        .{},
+        .{ .headers = .{ .accept_encoding = .{ .override = "identity" } } },
     );
     defer request.deinit();
 
@@ -1176,6 +1210,7 @@ fn httpFetchToFile(
             break;
 
         const data = chunk[0..n];
+        if (kind == .metadata and downloaded + n > max_metadata_size) return error.MetadataTooLarge;
 
         try file.writeStreamingAll(
             io,
@@ -1202,190 +1237,68 @@ fn httpFetchToFile(
     };
 }
 
-/// 使用系统 curl 下载文件。
-///
-/// curl 负责：
-/// - HTTP/HTTPS
-/// - GitHub Release redirect
-/// - HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY
-/// - TLS/CA
-/// - 网络失败重试
-/// - Engine 文件的实时终端进度条
-///
-/// Store 仍然负责：
-/// - `.part` 临时文件
-/// - metadata 验证
-/// - SHA256
-/// - hash 不匹配时删除损坏文件
-/// - cache hit 检查
-///
-/// 注意：正式 Store 使用当前 Flutter 项目 cwd 作为 root_dir，因此
-/// `destination_path` 可以直接作为 curl 的输出路径。测试仍然使用 FakeFetcher，
-/// 不会调用这个函数。
+/// Download with curl's proxy/TLS support. The supplied environment and directory
+/// are authoritative. curl renders its own progress; the callback receives only
+/// start/end events (not a fabricated intermediate percentage).
 fn curlFetchToFile(
     _: ?*anyopaque,
-    _: Allocator,
+    allocator: Allocator,
     io: Io,
-    _: *const std.process.Environ.Map,
+    environ: *const std.process.Environ.Map,
     destination_dir: Io.Dir,
     url: []const u8,
     destination_path: []const u8,
     kind: DownloadKind,
-    _: ProgressSink,
+    progress: ProgressSink,
 ) !DownloadResult {
-    // 当前 curl backend 面向正式 Store（cwd）。
-    // 保留参数是为了继续满足 Fetcher 的通用接口。
-    _ = destination_dir;
+    return curlFetchWithExecutable("curl", allocator, io, environ, destination_dir, url, destination_path, kind, progress);
+}
 
-    // curl 默认会读取：
-    //
-    //   HTTP_PROXY / http_proxy
-    //   HTTPS_PROXY / https_proxy
-    //   ALL_PROXY / all_proxy
-    //   NO_PROXY / no_proxy
-    //
-    // std.process.spawn 默认继承父进程环境，因此不需要手工传递代理变量。
-
-    const argv: []const []const u8 = switch (kind) {
-        .metadata => &.{
-            "curl",
-
-            // HTTP >= 400 返回非 0。
-            "--fail",
-
-            // GitHub Release 会跳转到实际对象存储。
-            "--location",
-
-            // 瞬时网络错误重试。
-            "--retry",
-            "3",
-
-            "--retry-delay",
-            "1",
-
-            "--connect-timeout",
-            "15",
-
-            // metadata 很小，不显示进度。
-            "--silent",
-            "--show-error",
-
-            "--output",
-            destination_path,
-
-            url,
-        },
-
-        .engine => &.{
-            "curl",
-
-            "--fail",
-            "--location",
-
-            "--retry",
-            "3",
-
-            "--retry-delay",
-            "1",
-
-            "--connect-timeout",
-            "15",
-
-            // 让 stderr 直接显示 curl 自带的单行进度条。
-            "--progress-bar",
-            "--show-error",
-
-            "--output",
-            destination_path,
-
-            url,
-        },
+/// Injectable executable used by the offline subprocess contract tests.
+fn curlFetchWithExecutable(
+    executable: []const u8,
+    _: Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    destination_dir: Io.Dir,
+    url: []const u8,
+    destination_path: []const u8,
+    kind: DownloadKind,
+    progress: ProgressSink,
+) !DownloadResult {
+    const uri = try std.Uri.parse(url);
+    if (!std.mem.eql(u8, uri.scheme, "https") and !std.mem.eql(u8, uri.scheme, "http")) return error.UnsupportedUriScheme;
+    const argv: []const []const u8 = &.{
+        executable,                               "--disable",      "--globoff",                                        "--fail",                                                "--location",
+        "--proto",                                "=http,https",    "--proto-redir",                                    "=http,https",                                           "--retry",
+        "3",                                      "--retry-delay",  "1",                                                "--connect-timeout",                                     "15",
+        "--speed-limit",                          "1",              "--speed-time",                                     "60",                                                    "--max-time",
+        if (kind == .metadata) "120" else "1800", "--max-filesize", if (kind == .metadata) "1048576" else "8589934592", if (kind == .metadata) "--silent" else "--progress-bar", "--show-error",
+        "--output",                               destination_path, "--url",                                            url,
     };
-
-    if (kind == .engine) {
-        std.debug.print(
-            "[engine] downloading from {s}\n",
-            .{url},
-        );
-    }
-
-    // spawn 而不是 process.run：
-    //
-    // run() 会捕获 stderr，curl 的进度条就看不到了；
-    // spawn() 默认 stdin/stdout/stderr 都继承当前终端。
-    var child = std.process.spawn(
-        io,
-        .{
-            .argv = argv,
-        },
-    ) catch |err| {
-        std.debug.print(
-            "[engine] unable to start curl: {s}\n",
-            .{@errorName(err)},
-        );
-
-        return error.CurlUnavailable;
-    };
-
+    progress.report(.{ .kind = kind, .downloaded = 0, .total = null });
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .dir = destination_dir },
+        .environ_map = environ,
+        .stdin = .ignore,
+    });
+    // Also terminate and reap on cancellation/wait failure. No-op after wait.
+    defer child.kill(io);
     const term = try child.wait(io);
-
     switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.debug.print(
-                    "[engine] curl exited with status {d}\n",
-                    .{code},
-                );
-
-                return error.DownloadFailed;
-            }
-        },
-
-        .signal => |signal| {
-            std.debug.print(
-                "[engine] curl terminated by signal {d}\n",
-                .{signal},
-            );
-
+        .exited => |code| if (code != 0) {
+            std.debug.print("[engine] curl failed with exit status {d}\n", .{code});
             return error.DownloadFailed;
         },
-
-        .stopped => |signal| {
-            std.debug.print(
-                "[engine] curl stopped by signal {d}\n",
-                .{signal},
-            );
-
-            return error.DownloadFailed;
-        },
-
-        .unknown => {
-            return error.DownloadFailed;
-        },
+        else => return error.DownloadFailed,
     }
-
-    // curl 成功只代表传输成功。
-    //
-    // 内容完整性仍由我们自己的 SHA256 校验负责。
-    const digest = try sha256File(
-        Io.Dir.cwd(),
-        io,
-        destination_path,
-    );
-
-    var file = try Io.Dir.cwd().openFile(
-        io,
-        destination_path,
-        .{},
-    );
-    defer file.close(io);
-
-    const stat = try file.stat(io);
-
-    return .{
-        .bytes = stat.size,
-        .sha256 = digest,
-    };
+    const stat = try destination_dir.statFile(io, destination_path, .{});
+    if (stat.kind != .file) return error.InvalidDownloadedFile;
+    if (kind == .metadata and stat.size > max_metadata_size) return error.MetadataTooLarge;
+    const digest = try sha256File(destination_dir, io, destination_path);
+    progress.report(.{ .kind = kind, .downloaded = stat.size, .total = stat.size });
+    return .{ .bytes = stat.size, .sha256 = digest };
 }
 
 /// 计算已有文件的 SHA256。
@@ -1508,6 +1421,13 @@ fn fileExists(
     return true;
 }
 
+/// Finish our own temporary-file cleanup even while the task is canceled.
+fn cleanupTemporary(dir: Io.Dir, io: Io, path: []const u8) void {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    dir.deleteFile(io, path) catch {};
+}
+
 /// 删除文件，如果不存在则视为成功。
 fn deleteIfExists(
     dir: Io.Dir,
@@ -1597,6 +1517,7 @@ const FakeFetcher = struct {
         context: ?*anyopaque,
         _: Allocator,
         io: Io,
+        _: *const std.process.Environ.Map,
         destination_dir: Io.Dir,
         url: []const u8,
         destination_path: []const u8,
@@ -1832,9 +1753,12 @@ test "ensure downloads metadata and engine" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/fushell-engine-builds",
         "build/fushell_flutter_engine",
@@ -1905,9 +1829,12 @@ test "ensure uses valid cached engine" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -1980,9 +1907,12 @@ test "corrupted cache is downloaded again" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -2067,9 +1997,12 @@ test "download with wrong hash is rejected" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -2130,9 +2063,12 @@ test "metadata revision mismatch is rejected" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -2181,9 +2117,12 @@ test "unsupported architecture is rejected" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -2227,9 +2166,12 @@ test "copy materializes cached engine as libflutter_engine.so" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -2299,9 +2241,12 @@ test "copy rejects corrupted cache" {
     var flutter =
         testFlutterInfo();
 
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
     var store = Store.initWith(
         allocator,
         io,
+        &environ,
         tmp.dir,
         "https://example.invalid/repo",
         "build/fushell_flutter_engine",
@@ -2333,4 +2278,110 @@ test "copy rejects corrupted cache" {
             "dist",
         ),
     );
+}
+
+/// Verify that failed result construction never releases its borrowed path.
+fn testResolvedAllocationFailure(allocator: Allocator) !void {
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var info = testFlutterInfo();
+    var store = Store.init(allocator, std.testing.io, &env, &info);
+    const path = try allocator.dupe(u8, "engine.so");
+    errdefer allocator.free(path);
+    const digest = digestToHex(sha256Of(test_engine_bytes));
+    const artifact: Artifact = .{ .file = "engine.so", .sha256 = &digest };
+    const modes: ModeArtifacts = .{ .debug = artifact, .profile = artifact, .release = artifact };
+    const metadata: Metadata = .{
+        .schema = 1,
+        .engine_revision = test_revision,
+        .flutter_version = "test",
+        .dart_version = "test",
+        .artifacts = .{ .x86_64 = modes },
+    };
+    var resolved = try store.makeResolved(path, &metadata, artifact, false);
+    resolved.deinit(allocator);
+}
+
+test "resolved result ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolvedAllocationFailure, .{});
+}
+
+test "curl backend honors directory and explicit environment without network" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("FUSHELL_TEST_BODY", "proxy-environment-reached-child");
+    const script = try tmp.dir.createFile(io, "fake-curl", .{ .permissions = .executable_file });
+    try script.writeStreamingAll(io, "#!/bin/sh\nset -eu\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = --output ]; then shift; output=$1; fi\nshift\ndone\nprintf %s \"$FUSHELL_TEST_BODY\" > \"$output\"\n");
+    script.close(io);
+    const exe = try tmp.dir.realPathFileAlloc(io, "fake-curl", gpa);
+    defer gpa.free(exe);
+    const result = try curlFetchWithExecutable(exe, gpa, io, &env, tmp.dir, "https://example.invalid/test", "result.part", .metadata, .{});
+    try std.testing.expectEqual(@as(u64, 31), result.bytes);
+    const content = try tmp.dir.readFileAlloc(io, "result.part", gpa, .limited(100));
+    defer gpa.free(content);
+    try std.testing.expectEqualStrings("proxy-environment-reached-child", content);
+    try std.testing.expectEqualSlices(u8, &sha256Of(content), &result.sha256);
+}
+
+test "artifact filenames reject URL syntax and traversal" {
+    const digest = digestToHex(sha256Of("test"));
+    for ([_][]const u8{ "../engine.so", "a/b", "a\\b", "?name", "%2F", "a#fragment", "", ".", "..", "a\x00b" }) |name| {
+        try std.testing.expectError(error.InvalidArtifactFilename, validateArtifact(.{ .file = name, .sha256 = &digest }));
+    }
+    try validateArtifact(.{ .file = "libflutter_engine-linux-x64-release.so", .sha256 = &digest });
+}
+
+test "repository overrides invalidate metadata rather than reuse another origin" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const metadata = try createTestMetadata(gpa, test_revision, test_engine_bytes);
+    defer gpa.free(metadata);
+    var fake: FakeFetcher = .{ .metadata = metadata, .engine = test_engine_bytes };
+    var flutter = testFlutterInfo();
+    var store = Store.initWith(gpa, io, &env, tmp.dir, "https://first.invalid/repo", default_cache_root, &flutter, fake.asFetcher());
+    var first = try store.ensure(.x86_64, .release, .{});
+    defer first.deinit(gpa);
+    store.repository = "https://second.invalid/repo";
+    try std.testing.expectError(error.RepositoryMismatch, store.copy(.x86_64, .release, "out"));
+    var second = try store.ensure(.x86_64, .release, .{});
+    defer second.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), fake.metadata_fetches);
+    // Identical bytes with the new origin's matching digest may be reused.
+    try std.testing.expect(second.from_cache);
+}
+
+test "concurrent ensure calls share one download under a persistent inode lock" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const metadata = try createTestMetadata(gpa, test_revision, test_engine_bytes);
+    defer gpa.free(metadata);
+    var fake: FakeFetcher = .{ .metadata = metadata, .engine = test_engine_bytes };
+    var flutter = testFlutterInfo();
+    var store = Store.initWith(gpa, io, &env, tmp.dir, default_repository, default_cache_root, &flutter, fake.asFetcher());
+    const Task = struct {
+        fn run(s: *Store) !void {
+            var result = try s.ensure(.x86_64, .release, .{});
+            defer result.deinit(s.allocator);
+        }
+    };
+    var first = try io.concurrent(Task.run, .{&store});
+    defer first.cancel(io) catch {};
+    var second = try io.concurrent(Task.run, .{&store});
+    defer second.cancel(io) catch {};
+    try first.await(io);
+    try second.await(io);
+    try std.testing.expectEqual(@as(usize, 1), fake.metadata_fetches);
+    try std.testing.expectEqual(@as(usize, 1), fake.engine_fetches);
 }

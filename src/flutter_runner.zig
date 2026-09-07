@@ -10,6 +10,10 @@
 //! display 和动态加载的引擎。改变顺序可能让回调继续指向已释放的 Host。
 
 const std = @import("std");
+const platform_event_loop = @import("platform_event_loop.zig");
+const frame_clock = @import("frame_clock.zig");
+const owned_arguments = @import("owned_arguments.zig");
+const process_exit = @import("process_exit.zig");
 const c = @import("c");
 const egl = @import("wayland_egl_host.zig");
 const flutter = @import("flutter_embedder.zig");
@@ -34,9 +38,6 @@ const WindowRegistry = window_registry.Registry;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 
-/// 默认帧间隔 (60Hz)。引擎的 vsync 回调携带实际时间戳, 此值仅用于
-/// 无 vsync 驱动的兜底计算; 真实刷新率由 compositor 通过 frame 事件驱动。
-const frame_interval_nanos: u64 = 16_666_667;
 /// 进程退出时显式释放共享 dc/ime (此刻 state Wayland 仍有效, 清理安全)。
 /// ImeV3 持有 Wayland 对象 (text_input 等), 由 state 的 disconnect 统一收尾;
 /// 这里只回收 gpa.create 的对象内存 + DataControl 内部 buffer。
@@ -231,6 +232,8 @@ const Runner = struct {
     /// A command handler may request process exit before its D-Bus reply is sent.
     /// Defer the event-loop stop until applicationComplete flushes that reply.
     exit_after_application_command: bool = false,
+    exit_status: process_exit.Status = .{},
+    frame_clock: frame_clock.Clock,
 
     // ── compositor 呈现路径 ────────────────────────
     /// backing store 纹理 → 窗口 surface 的 GLES2 blit 模块。
@@ -642,6 +645,8 @@ const Runner = struct {
 
     fn nextPollTimeoutMs(self: *Runner) i32 {
         var timeout = self.task_queue.timeoutMs(self.now());
+        const frame_timeout = self.frame_clock.timeoutMs(self.now());
+        if (frame_timeout >= 0 and (timeout < 0 or frame_timeout < timeout)) timeout = frame_timeout;
         if (self.pending_clipboard_read) |pending| {
             const now_nanos = nowNs();
             const clipboard_timeout: i32 = if (pending.deadline_ns <= now_nanos)
@@ -873,8 +878,8 @@ fn encodeApplicationInvocation(gpa: std.mem.Allocator, invocation: *const applic
 /// 运行打包应用，直到 Dart 请求退出、收到终止信号，或 compositor/session bus 断开。
 ///
 /// 调用方必须在进入本函数前完成单实例所有权判定；若传入 primary broker，其所有权
-/// 在引擎生命周期内交给 Runner，并在有序清理阶段释放。
-pub fn run(gpa: std.mem.Allocator, options: Options) !void {
+/// 仍由 player 拥有；Runner 只借用，player 在引擎关闭后释放它。
+pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     vm_service.clear(options.io);
     var api = try flutter.Api.load(gpa, options.engine_library);
     defer api.deinit();
@@ -889,6 +894,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     const bundle = if (is_aot) blk: {
         std.debug.print("Flutter engine reports AOT-only execution; using AOT launch path (libapp.so).\n", .{});
         const aot_bundle = try bundle_loader.loadAot(gpa, options.bundle_path);
+        errdefer aot_bundle.deinit(gpa);
         aot_source = std.mem.zeroes(c.FlutterEngineAOTDataSource);
         aot_source.type = c.kFlutterEngineAOTDataSourceTypeElfPath;
         aot_source.unnamed_0.elf_path = aot_bundle.app_so_path.?.ptr;
@@ -906,14 +912,10 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     const state = &state_storage;
     var registry = WindowRegistry.init(gpa, options.io);
     defer registry.deinit();
-    var local_host: egl.Host = .{};
-    // 无头基座: 这个 host 不初始化任何 surface 角色, 仅作为进程级连接的所有者
-    // 与事件循环载体 (单引擎模型下窗口全部由注册表内 Host 承载)。
-    const host: *egl.Host = &local_host;
-    defer local_host.deinit();
-
-    // 进程级初始化: attach (acquire → 建连接) 后绑单一 event queue 到全部对象。
-    try host.attach(state, options.io, gpa);
+    // Own the process connection independently of any window Host.
+    _ = try state.acquire(gpa);
+    defer state.release();
+    defer shutdownShared(gpa, state);
     try state.bindGlobals();
     // 进程级单一 EGL render context (raster + 呈现)。
     var render_context: egl.RenderContext = .{};
@@ -944,7 +946,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
 
     var task_queue = try flutter_task_queue.TaskQueue.init(gpa, options.io);
     defer task_queue.deinit();
-    var runner: Runner = .{ .gpa = gpa, .state = state, .registry = &registry, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .task_queue = &task_queue, .engine_library = options.engine_library, .bundle_path = options.bundle_path, .application_broker = options.application_broker };
+    var runner: Runner = .{ .gpa = gpa, .frame_clock = .{ .io = options.io }, .state = state, .registry = &registry, .render_context = &render_context, .api = &api, .platform_thread_id = std.Thread.getCurrentId(), .task_queue = &task_queue, .engine_library = options.engine_library, .bundle_path = options.bundle_path, .application_broker = options.application_broker };
     runner.ime = state.ime;
     runner.text_client = text_input.Client.init(gpa);
     runner.text_client.send_fn = textInputSendCallback;
@@ -991,15 +993,9 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     custom_task_runners.struct_size = @sizeOf(c.FlutterCustomTaskRunners);
     custom_task_runners.platform_task_runner = &platform_task_runner;
 
-    var dart_argument_strings = try gpa.alloc([:0]u8, options.dart_entrypoint_arguments.len);
-    defer gpa.free(dart_argument_strings);
-    var initialized_dart_arguments: usize = 0;
-    errdefer for (dart_argument_strings[0..initialized_dart_arguments]) |argument| gpa.free(argument);
-    for (options.dart_entrypoint_arguments, 0..) |argument, index| {
-        dart_argument_strings[index] = try gpa.dupeZ(u8, argument);
-        initialized_dart_arguments += 1;
-    }
-    defer for (dart_argument_strings) |argument| gpa.free(argument);
+    var owned_argv = try owned_arguments.Arguments.init(gpa, options.dart_entrypoint_arguments);
+    defer owned_argv.deinit();
+    const dart_argument_strings = owned_argv.strings;
 
     var dart_argument_pointers = try gpa.alloc([*c]const u8, dart_argument_strings.len);
     defer gpa.free(dart_argument_pointers);
@@ -1074,7 +1070,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
 
     std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
     var event_loop_error: ?anyerror = null;
-    host.runEventLoop(gpa, &runner.quit_requested, "Engine event loop active (headless shell).", .{
+    platform_event_loop.run(state, gpa, &runner.quit_requested, "Engine event loop active (headless shell).", .{
         .fd = task_queue.wake_fd,
         .context = &runner,
         .tick = flutterTaskPumpCallback,
@@ -1113,6 +1109,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !void {
     shutdownShared(gpa, state);
     std.debug.print("engine event loop exited.\n", .{});
     if (event_loop_error) |err| return err;
+    return runner.exit_status.value();
 }
 
 /// 单调时钟纳秒 (重复计时用)。
@@ -1274,6 +1271,10 @@ fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     processCompositorCloseRequests(runner);
     runner.checkKeyRepeat();
     try runner.runDueFlutterTasks();
+    while (try runner.frame_clock.takeDue(runner.now())) |frame| {
+        if (runner.engine == null) return error.EngineUnavailable;
+        try flutter.ensureSuccess(runner.api.on_vsync(runner.engine, frame.baton, frame.start, frame.target), "FlutterEngineOnVsync");
+    }
 }
 
 fn flutterTaskTimeoutCallback(user_data: ?*anyopaque) i32 {
@@ -1682,6 +1683,7 @@ pub fn updateWindowSurface(runner: *Runner, response_handle: ?*const c.FlutterPl
 
 /// process.exit: 停止事件循环 → run() 退出序列 (关引擎 → 毁窗口 → 断连接)。
 pub fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.ExitRequest) !void {
+    try runner.exit_status.request(request.code);
     sendSurfaceSuccess(runner, response_handle, request.id);
     if (runner.application_broker) |broker| {
         if (broker.hasActiveInvocation()) {
@@ -1920,18 +1922,12 @@ fn glProcResolverCallback(user_data: ?*anyopaque, name: [*c]const u8) callconv(.
     return null;
 }
 
+/// Queue requested frames; the event pump supplies the software timing fallback.
+/// This intentionally does not claim synchronization with a physical display.
 fn vsyncCallback(user_data: ?*anyopaque, baton: isize) callconv(.c) void {
     const runner = fromUserData(user_data);
-    if (runner.engine == null) {
-        std.debug.print("[error] Flutter vsync requested before engine handle was available; dropping baton {d}.\n", .{baton});
-        return;
-    }
-    const frame_start = runner.now();
-    const frame_target = frame_start + frame_interval_nanos;
-    const result = runner.api.on_vsync(runner.engine, baton, frame_start, frame_target);
-    if (result != c.kSuccess) {
-        std.debug.print("[error] FlutterEngineOnVsync failed: {s}\n", .{flutter.resultName(result)});
-    }
+    runner.frame_clock.request(baton, runner.now());
+    runner.task_queue.notify();
 }
 
 /// VM Service URI published by the engine log callback for development tools.

@@ -4,6 +4,9 @@
   callPackage,
   zig,
   pkg-config,
+  makeWrapper,
+  curl,
+  coreutils,
   wayland,
   wayland-scanner,
   libxkbcommon,
@@ -37,6 +40,7 @@
     then "aarch64-linux-gnu.${glibcVersion}"
     else throw "Unsupported system: ${stdenv.hostPlatform.system}";
 in
+  assert lib.assertMsg (zig.version == "0.16.0") "Fushell requires Zig 0.16.0";
   stdenv.mkDerivation {
     pname = "fushell";
     version = "0.1.0";
@@ -46,6 +50,7 @@ in
     nativeBuildInputs = [
       zig
       pkg-config
+      makeWrapper
       wayland-scanner
     ];
 
@@ -75,7 +80,13 @@ in
       "-Dtarget=${target}"
     ];
 
+    # Unit tests run in CI; graphical/integration fixtures are opt-in.
     dontUseZigCheck = true;
+
+    postFixup = ''
+      wrapProgram "$out/bin/fushell" \
+        --prefix PATH : "${lib.makeBinPath [ curl coreutils ]}"
+    '';
 
     meta = {
       description = "Flutter multi-view Wayland shell";

@@ -31,7 +31,7 @@ pub const FrontendServer = struct {
         // 定位引擎产物
         const engine_dir = try engineArtifactsDir(gpa, flutter_root);
         defer gpa.free(engine_dir);
-        const snapshot = try std.fs.path.join(gpa, &.{ engine_dir, "linux-x64", "frontend_server_aot.dart.snapshot" });
+        const snapshot = try std.fs.path.join(gpa, &.{ engine_dir, hostPlatform(), "frontend_server_aot.dart.snapshot" });
         defer gpa.free(snapshot);
         const dart_rt = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "dart-sdk", "bin", "dartaotruntime" });
         defer gpa.free(dart_rt);
@@ -41,7 +41,7 @@ pub const FrontendServer = struct {
         // sdk-root / platform dill: 优先 linux-x64/flutter_patched_sdk, 否则 common/flutter_patched_sdk
         var sdk_root_buf: [4096]u8 = undefined;
         const sdk_root: []const u8 = blk: {
-            const linux_patched = try std.fs.path.join(gpa, &.{ engine_dir, "linux-x64", "flutter_patched_sdk" });
+            const linux_patched = try std.fs.path.join(gpa, &.{ engine_dir, hostPlatform(), "flutter_patched_sdk" });
             defer gpa.free(linux_patched);
             if (dirExists(linux_patched)) {
                 const n = (try std.fmt.bufPrint(&sdk_root_buf, "{s}/", .{linux_patched})).len;
@@ -239,7 +239,7 @@ pub const FrontendServer = struct {
 
 /// 引擎产物目录: <flutter_root>/bin/cache/artifacts/engine (解析符号链接后的真实路径)。
 fn engineArtifactsDir(gpa: std.mem.Allocator, flutter_root: []const u8) ![]const u8 {
-    const link = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "artifacts", "engine", "linux-x64", "frontend_server_aot.dart.snapshot" });
+    const link = try std.fs.path.join(gpa, &.{ flutter_root, "bin", "cache", "artifacts", "engine", hostPlatform(), "frontend_server_aot.dart.snapshot" });
     defer gpa.free(link);
     const io = std.Io.Threaded.global_single_threaded.io();
     var buf: [4096]u8 = undefined;
@@ -259,4 +259,13 @@ fn dirExists(path: []const u8) bool {
     var dir = std.Io.Dir.openDir(.cwd(), std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     dir.close(std.Io.Threaded.global_single_threaded.io());
     return true;
+}
+
+/// Flutter's host cache uses Flutter architecture names, not Zig CPU tags.
+fn hostPlatform() []const u8 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => "linux-x64",
+        .aarch64 => "linux-arm64",
+        else => @compileError("unsupported Flutter host architecture"),
+    };
 }

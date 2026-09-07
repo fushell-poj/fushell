@@ -2,6 +2,7 @@
   lib,
   writeScriptBin,
   pkg-config,
+  curl,
   zig,
   zls,
   mkShell,
@@ -52,12 +53,19 @@
     esac
   '';
 
-  generate-nix-deps = writeShellScriptBin "generate-nix-deps" ''nix run github:nix-community/zon2nix > deps.nix'';
+  generate-nix-deps = writeShellScriptBin "generate-nix-deps" ''
+    set -euo pipefail
+    tmp=$(mktemp ./deps.nix.XXXXXXXX)
+    trap 'rm -f -- "$tmp"' EXIT
+    nix run github:nix-community/zon2nix > "$tmp"
+    mv -- "$tmp" deps.nix
+  '';
 in
   mkShell {
     packages = [
       custom-pkg-config
       pkg-config
+      curl
       wrap-zig
       zig
       zls
@@ -97,7 +105,6 @@ in
         stdenv.cc.cc.lib
       ]}"
       export LD_LIBRARY_PATH="$FUSHELL_NIX_LIBRARY_PATH:''${LD_LIBRARY_PATH:-}"
-      alias generate-nix-deps=${generate-nix-deps}
       echo "fushell dev shell"
       echo "  zig: $(zig version)"
       echo "  wayland protocols: $FUSHELL_WAYLAND_PROTOCOLS"

@@ -85,7 +85,7 @@ pub fn runPlayer(
     };
     defer gpa.free(engine_library);
 
-    flutter_runner.run(gpa, .{
+    const exit_status = flutter_runner.run(gpa, .{
         .io = io,
         .engine_library = engine_library,
         .bundle_path = bundle_path,
@@ -99,7 +99,7 @@ pub fn runPlayer(
     if (broker) |active_broker| {
         cleanupBrokerWithRetry(active_broker, io) catch |cleanup_err| return cleanup_err;
     }
-    return 0;
+    return exit_status;
 }
 
 fn commandExitStatus(exit_code: i32) u8 {
