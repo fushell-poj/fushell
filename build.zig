@@ -11,6 +11,14 @@ pub fn build(b: *std.Build) void {
         .search_strategy = .mode_first,
     };
 
+    const clap = b.dependency("clap", .{ .target = target, .optimize = optimize });
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_mod.addImport("clap", clap.module("clap"));
+
     const c_header = b.path("src/fushell_c_bindings.h");
 
     const flutter_embedder = b.dependency("flutter-embedder", .{});
@@ -97,6 +105,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // fushell run: 进程内播放 (player.zig → flutter_runner → c/wayland/EGL)
+    build_tool_mod.addImport("cli", cli_mod);
     build_tool_mod.addImport("c", c_mod);
     build_tool_mod.addImport("wayland", wayland_mod);
     linkRuntimeLibraries(build_tool_mod, dynamic_link_opts);
@@ -150,6 +159,11 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    const cli_test_step = b.step("cli-test", "Test command parsing and help without Flutter or a display");
+    cli_test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(cli_test_step);
     for ([_][]const u8{ "flutter_engine_store", "owned_arguments", "process_exit", "bundle_transaction", "flutter_toolchain", "source_snapshot" }) |name| {
         const module = b.createModule(.{
             .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
