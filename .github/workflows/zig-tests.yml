@@ -1,0 +1,71 @@
+name: Zig build and unit tests
+
+on:
+  push:
+    branches: [main, 'fix/architecture-review-20260907']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install native development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev wayland-protocols libegl-dev libgles-dev \
+            libxkbcommon-dev libfontconfig-dev libdbus-1-dev curl xz-utils
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://ziglang.org/download/index.json -o "$RUNNER_TEMP/zig-index.json"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, sys, urllib.request, hashlib
+          root = pathlib.Path(sys.argv[1])
+          release = json.loads((root / 'zig-index.json').read_text())['0.16.0']['x86_64-linux']
+          archive = root / 'zig.tar.xz'
+          urllib.request.urlretrieve(release['tarball'], archive)
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != release['shasum']:
+              raise SystemExit('Zig archive checksum mismatch')
+          PY
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(zig version)" = 0.16.0
+          zig build
+          zig test src/flutter_engine_store.zig
+          zig build test
+          zig build -Doptimize=ReleaseFast
+      # Temporary review workspace: source and toolchain only, never checkout
+      # credentials or Git configuration. Removed after the repair review.
+      - name: Collect review workspace
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/review-workspace"
+          git archive HEAD | gzip > "$RUNNER_TEMP/review-workspace/source.tar.gz"
+          if test -f "$RUNNER_TEMP/zig.tar.xz"; then
+            cp "$RUNNER_TEMP/zig.tar.xz" "$RUNNER_TEMP/review-workspace/zig.tar.xz"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: review-workspace
+          path: ${{ runner.temp }}/review-workspace/
+          retention-days: 1
