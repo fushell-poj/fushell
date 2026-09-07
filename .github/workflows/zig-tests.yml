@@ -1,0 +1,62 @@
+name: Zig build and unit tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zig-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install native development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev wayland-protocols libegl-dev libgles-dev \
+            libxkbcommon-dev libfontconfig-dev libdbus-1-dev curl xz-utils
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://ziglang.org/download/index.json -o "$RUNNER_TEMP/zig-index.json"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          import urllib.request
+
+          root = pathlib.Path(sys.argv[1])
+          release = json.loads((root / 'zig-index.json').read_text())['0.16.0']['x86_64-linux']
+          archive = root / 'zig.tar.xz'
+          urllib.request.urlretrieve(release['tarball'], archive)
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != release['shasum']:
+              raise SystemExit('Zig archive checksum mismatch')
+          PY
+          # Zig's ZIP fetcher needs this directory on a fresh cache.
+          mkdir -p "$RUNNER_TEMP/zig" "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+      - name: Debug build
+        run: |
+          test "$(zig version)" = 0.16.0
+          zig build --summary all
+      - name: Unit tests
+        run: zig build test --summary all
+      - name: ReleaseFast build
+        run: zig build -Doptimize=ReleaseFast --summary all

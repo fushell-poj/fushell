@@ -100,6 +100,7 @@ pub const DisplayState = struct {
     pub fn acquire(self: *DisplayState, allocator: std.mem.Allocator) !bool {
         if (self.ref_count == 0) {
             self.allocator = allocator;
+            errdefer self.deinit();
             try self.init();
         }
         self.ref_count += 1;

@@ -21,8 +21,10 @@
       "x86_64-linux"
     ];
   in {
-    packages = forAllSystems (system: {
-      default = nixpkgs.legacyPackages.${system}.callPackage ./nix/package.nix {};
+    packages = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      default = pkgs.callPackage ./nix/package.nix { zig = pkgs.zig_0_16; };
     });
 
     devShells = forAllSystems (

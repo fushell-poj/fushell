@@ -1,6 +1,6 @@
 //! 面向开发者的 `fushell` 命令实现。
 //!
-//! runner、Fushell SDK 与 libdbus 会在构建时嵌入本可执行文件。
+//! runner 与 Fushell Dart SDK 在构建时嵌入本可执行文件；系统库由宿主提供。
 //! Flutter Engine 则根据当前 Flutter CLI 的 Engine revision 按需从
 //! fushell-engine-builds 获取，并缓存在 Flutter 项目的 build 目录。
 //! `build` 生成自包含 bundle；`run` 监管该 bundle 以及可选的
@@ -10,6 +10,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const application_config = @import("application_config.zig");
+const bundle_transaction = @import("bundle_transaction.zig");
 const flutter = @import("flutter_embedder.zig");
 const display_state = @import("wl_display_state.zig");
 const egl = @import("wayland_egl_host.zig");
@@ -22,6 +23,8 @@ const devtools = @import("devtools.zig");
 const service_uri = @import("service_uri.zig");
 const signal_shutdown = @import("signal_shutdown.zig");
 const flutter_engine_store = @import("flutter_engine_store.zig");
+const flutter_toolchain = @import("flutter_toolchain.zig");
+const source_snapshot = @import("source_snapshot.zig");
 
 comptime {
     _ = hot_reload;
@@ -32,9 +35,7 @@ const embedded_runner = @embedFile("fushell_runner_bin");
 /// VM service URI 轮询间隔 (ns)。URI 在引擎启动日志回调中写入, 通常在
 /// 引擎 run 后几百 ms 内就绪; 50ms 轮询兼顾及时性与低开销。
 const vm_uri_poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
-/// 文件监听轮询间隔 (ns)。mtime 轮询 (非 inotify 事件驱动) 因
-/// std.Io.Threaded 的 Dir.iterate 存在 BADF bug 而自实现目录迭代;
-/// 500ms 足够捕获保存操作, 开销可忽略。
+/// Poll source snapshots every 500ms; platform rendering has its own event loop.
 const watch_poll_interval_ns: u64 = 500 * std.time.ns_per_ms;
 
 // fushell SDK 包 (`fushell sdk` 释放)
@@ -86,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const options = resolveOptions(runtime_arena, parsed);
+    const options = try resolveOptions(runtime_arena, parsed);
     if (options.vm_service_port) |port| {
         const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
         var server = address.listen(io, .{}) catch |err| {
@@ -103,12 +104,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("working directory: {s}\n", .{workdir});
     }
 
-    buildBundle(gpa, io, init.environ_map, options) catch |err| {
+    var toolchain = try flutter_toolchain.Toolchain.discover(gpa, io, init.environ_map);
+    defer toolchain.deinit();
+    buildBundle(gpa, io, init.environ_map, &toolchain, options) catch |err| {
         std.debug.print("[error] fushell build failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     if (options.command == .run) {
-        const exit_status = runBundle(gpa, io, options) catch |err| {
+        const exit_status = runBundle(gpa, io, &toolchain, options) catch |err| {
             if (err == error.UserInterrupt) std.process.exit(130);
             std.debug.print("[error] fushell run failed: {s}\n", .{@errorName(err)});
             std.process.exit(1);
@@ -117,10 +120,10 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn resolveOptions(runtime_arena: std.mem.Allocator, parsed: cli.Options) Options {
+fn resolveOptions(runtime_arena: std.mem.Allocator, parsed: cli.Options) !Options {
     var workdir: ?[]const u8 = null;
     var entrypoint: []const u8 = "lib/main.dart";
-    var bundle_dir: []const u8 = defaultBundleDir(runtime_arena, parsed.mode);
+    var bundle_dir: []const u8 = try defaultBundleDir(runtime_arena, parsed.mode);
     if (parsed.positional(0)) |first| {
         if (isDir(first)) {
             workdir = first;
@@ -145,7 +148,7 @@ fn resolveOptions(runtime_arena: std.mem.Allocator, parsed: cli.Options) Options
     };
 }
 
-fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !u8 {
+fn runBundle(gpa: std.mem.Allocator, io: std.Io, toolchain: *const flutter_toolchain.Toolchain, options: Options) !u8 {
     std.debug.print("running {s}...\n", .{options.bundle_dir});
     hot_reload_stop.store(false, .release);
 
@@ -158,7 +161,7 @@ fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !u8 {
 
     var hot_thread: ?std.Thread = null;
     if (options.mode == .debug and options.hot_reload) {
-        hot_thread = std.Thread.spawn(.{}, hotReloadThreadMain, .{ gpa, hot_reload_service }) catch |err| blk: {
+        hot_thread = std.Thread.spawn(.{}, hotReloadThreadMain, .{ gpa, hot_reload_service, toolchain, options.entrypoint }) catch |err| blk: {
             std.debug.print("[error] hot reload unavailable: {s}\n", .{@errorName(err)});
             break :blk null;
         };
@@ -167,6 +170,8 @@ fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !u8 {
     var devtools_context = devtools.Context{
         .io = io,
         .gpa = gpa,
+        .executable = toolchain.dart_executable,
+        .flutter_executable = toolchain.executable,
         .launch_browser = options.launch_browser,
         .use_flutter_attach = options.mode == .debug,
         .raw_service = &flutter_runner.vm_service,
@@ -206,9 +211,8 @@ fn runBundle(gpa: std.mem.Allocator, io: std.Io, options: Options) !u8 {
     return exit_status;
 }
 
-/// 热重载线程: 等待引擎报告 VM service URI → 连接 → getVM 验证。
-/// (spike 阶段: 验证 WebSocket + JSON-RPC 链路; 后续扩展为文件监听 + reload)
-/// 主窗口关闭后由 main 置位, watcher while 循环检查退出 (避免 join 卡死)。
+/// Wait for the VM service, compile the selected entrypoint, and watch source changes.
+/// All startup/watcher waits observe the CLI shutdown flag.
 var hot_reload_stop = std.atomic.Value(bool).init(false);
 fn parseIsolateId(allocator: std.mem.Allocator, result: []const u8, buffer: []u8) ?[]const u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, result, .{}) catch return null;
@@ -223,7 +227,7 @@ fn parseIsolateId(allocator: std.mem.Allocator, result: []const u8, buffer: []u8
     return std.fmt.bufPrint(buffer, "{s}", .{id.string}) catch null;
 }
 
-fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void {
+fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State, toolchain: *const flutter_toolchain.Toolchain, entrypoint: []const u8) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -232,6 +236,7 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void
     var waited: usize = 0;
     var uri_buf: [512]u8 = undefined;
     const uri = while (true) {
+        if (hot_reload_stop.load(.acquire)) return;
         if (service.get(io, &uri_buf)) |u| break u;
         if (waited > 20_000) {
             std.debug.print("[hot-reload] timeout waiting for VM service URI.\n", .{});
@@ -263,12 +268,7 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void
     };
     std.debug.print("[hot-reload] isolateId: {s}\n", .{isolate_id});
 
-    // 定位 flutter SDK (用于 frontend_server 启动参数)
-    const flutter_root = queryFlutterRoot(gpa, io) catch |err| {
-        std.debug.print("[hot-reload] cannot find Flutter SDK: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer gpa.free(flutter_root);
+    const flutter_root = toolchain.root;
 
     const project_dir = std.process.currentPathAlloc(io, gpa) catch return;
     defer gpa.free(project_dir);
@@ -276,8 +276,10 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void
     var kernel_path_buf: [128]u8 = undefined;
     const kernel_path = std.fmt.bufPrint(&kernel_path_buf, "/tmp/fushell-hotreload-kernel-{d}.dill", .{std.os.linux.getpid()}) catch return;
     defer std.Io.Dir.cwd().deleteFile(io, kernel_path) catch {};
-    var main_uri_buf: [4096]u8 = undefined;
-    const main_uri = std.fmt.bufPrint(&main_uri_buf, "file://{s}/lib/main.dart", .{project_dir}) catch return;
+    const main_path = std.fs.path.resolve(gpa, &.{ project_dir, entrypoint }) catch return;
+    defer gpa.free(main_path);
+    const main_uri = flutter_toolchain.fileUri(gpa, main_path) catch return;
+    defer gpa.free(main_uri);
     var err_buf: [4096]u8 = undefined;
 
     // Keep one frontend_server alive for incremental compilation.
@@ -287,38 +289,46 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void
     };
     defer fs.stop();
     var dill_path_buf: [4096]u8 = undefined;
-    _ = fs.compile(&err_buf, &.{}, &dill_path_buf) catch |err| {
+    const initial_ok = fs.compile(&err_buf, &.{}, &dill_path_buf) catch |err| {
         std.debug.print("[hot-reload] initial compile failed: {s}\n", .{@errorName(err)});
         return;
     };
-    // recompile 输出增量 dill; 每次 reload 从结果行解析实际路径
-    var kernel_uri_buf: [8192]u8 = undefined;
-    std.debug.print("[hot-reload] initial compile done. Watching lib/**/*.dart (press 'r' to reload)...\n", .{});
+    if (!initial_ok) {
+        std.debug.print("[hot-reload] initial compile has errors\n", .{});
+        return;
+    }
+    // recompile outputs incremental dill; use the path returned by the compiler.
+    std.debug.print("[hot-reload] initial compile done. Watching Dart source changes...\n", .{});
 
     // 文件监听 (轮询 mtime)
-    var baseline = scanLibDartFiles(gpa, "lib") catch return;
-    defer freeFileMap(gpa, &baseline);
+    var baseline = source_snapshot.Snapshot.scan(gpa, io, .cwd(), entrypoint) catch return;
+    defer baseline.deinit();
 
     while (true) {
         if (hot_reload_stop.load(.acquire)) break;
         std.Io.sleep(io, .{ .nanoseconds = watch_poll_interval_ns }, .real) catch return;
 
-        var current = scanLibDartFiles(gpa, "lib") catch continue;
-        var changed_paths = filesChanged(gpa, &baseline, &current) catch {
-            freeFileMap(gpa, &current);
+        var current = source_snapshot.Snapshot.scan(gpa, io, .cwd(), entrypoint) catch continue;
+        var changed_paths = source_snapshot.Snapshot.changes(&baseline, &current, gpa) catch {
+            current.deinit();
             continue;
         };
-        // changed_paths 的路径借用自 current (之后成为新 baseline), 只 deinit 容器本身
-        defer changed_paths.deinit(gpa);
-        // 更新基线
-        freeFileMap(gpa, &baseline);
+        defer changed_paths.deinit();
+        baseline.deinit();
         baseline = current;
-        if (changed_paths.items.len == 0) continue;
+        if (changed_paths.paths.items.len == 0) continue;
+        for (changed_paths.paths.items) |*path| {
+            const absolute = std.fs.path.resolve(gpa, &.{ project_dir, path.* }) catch return;
+            defer gpa.free(absolute);
+            const uri_path = flutter_toolchain.fileUri(gpa, absolute) catch return;
+            gpa.free(path.*);
+            path.* = uri_path;
+        }
 
-        std.debug.print("[hot-reload] {d} file(s) changed, compiling...\n", .{changed_paths.items.len});
+        std.debug.print("[hot-reload] {d} file(s) changed, compiling...\n", .{changed_paths.paths.items.len});
         // 热重载: 新 kernel 文件 → VM 替换代码 → 框架重建
         dill_path_buf[0] = 0;
-        const ok = fs.compile(&err_buf, changed_paths.items, &dill_path_buf) catch |err| {
+        const ok = fs.compile(&err_buf, changed_paths.paths.items, &dill_path_buf) catch |err| {
             std.debug.print("[hot-reload] compile failed: {s}\n", .{@errorName(err)});
             continue;
         };
@@ -331,7 +341,10 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void
         else
             kernel_path;
         std.debug.print("[hot-reload] kernel: {s}\n", .{dill_used});
-        const kernel_uri = std.fmt.bufPrint(&kernel_uri_buf, "file://{s}", .{dill_used}) catch continue;
+        const absolute_dill = std.fs.path.resolve(gpa, &.{ project_dir, dill_used }) catch continue;
+        defer gpa.free(absolute_dill);
+        const kernel_uri = flutter_toolchain.fileUri(gpa, absolute_dill) catch continue;
+        defer gpa.free(kernel_uri);
         const reload_out = vm.reloadSources(isolate_id, kernel_uri, &out) catch |err| {
             std.debug.print("[hot-reload] reloadSources failed: {s}\n", .{@errorName(err)});
             continue;
@@ -349,76 +362,6 @@ fn hotReloadThreadMain(gpa: std.mem.Allocator, service: *service_uri.State) void
     }
 }
 
-const FileEntry = struct { path: []const u8, mtime: i64 };
-
-fn scanLibDartFiles(gpa: std.mem.Allocator, dir: []const u8) !std.ArrayList(FileEntry) {
-    var result: std.ArrayList(FileEntry) = .empty;
-    try scanDirRecursive(gpa, &result, dir);
-    return result;
-}
-
-fn scanDirRecursive(gpa: std.mem.Allocator, out: *std.ArrayList(FileEntry), dir: []const u8) !void {
-    // 用 raw getdents64 遍历 (zig 0.16 Threaded 的 Dir.iterate 有 BADF bug)
-    const dir_z = try gpa.dupeZ(u8, dir);
-    defer gpa.free(dir_z);
-    const fd = std.os.linux.open(dir_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
-    if (std.os.linux.errno(fd) != .SUCCESS) return;
-    defer _ = std.os.linux.close(@intCast(fd));
-
-    var buf: [16384]u8 align(8) = undefined;
-    while (true) {
-        const rc = std.os.linux.getdents64(@intCast(fd), &buf, buf.len);
-        const n: usize = @intCast(@as(isize, @bitCast(rc)));
-        if (n > 0x8000000000000000) return; // errno (负数)
-        if (n == 0) break;
-        var off: usize = 0;
-        while (off < n) {
-            const ent: *std.os.linux.dirent64 = @ptrCast(@alignCast(buf[off..].ptr));
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
-            off += ent.reclen;
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            const full = try std.fs.path.join(gpa, &.{ dir, name });
-            if (ent.type == std.os.linux.DT.DIR) {
-                try scanDirRecursive(gpa, out, full);
-                gpa.free(full);
-            } else if (std.mem.endsWith(u8, name, ".dart")) {
-                const st = statMtime(full) orelse {
-                    gpa.free(full);
-                    continue;
-                };
-                try out.append(gpa, .{ .path = full, .mtime = st });
-            } else {
-                gpa.free(full);
-            }
-        }
-    }
-}
-
-fn statMtime(path: []const u8) ?i64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const st = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch return null;
-    return @intCast(st.mtime.nanoseconds);
-}
-
-/// 返回变化的文件路径列表 (增量编译的 invalidated files)。
-fn filesChanged(gpa: std.mem.Allocator, old: *std.ArrayList(FileEntry), new: *std.ArrayList(FileEntry)) !std.ArrayList([]const u8) {
-    var changed: std.ArrayList([]const u8) = .empty;
-    for (new.items) |n| {
-        var found = false;
-        for (old.items) |o| {
-            if (std.mem.eql(u8, o.path, n.path)) {
-                found = true;
-                if (o.mtime != n.mtime) {
-                    try changed.append(gpa, n.path);
-                }
-                break;
-            }
-        }
-        if (!found) try changed.append(gpa, n.path);
-    }
-    return changed;
-}
-
 test "parse isolate id from standard DDS getVM JSON" {
     var buffer: [64]u8 = undefined;
     const id = parseIsolateId(
@@ -427,11 +370,6 @@ test "parse isolate id from standard DDS getVM JSON" {
         &buffer,
     ) orelse return error.MissingIsolateId;
     try std.testing.expectEqualStrings("isolates/42", id);
-}
-
-fn freeFileMap(gpa: std.mem.Allocator, map: *std.ArrayList(FileEntry)) void {
-    for (map.items) |e| gpa.free(e.path);
-    map.deinit(gpa);
 }
 
 /// 路径存在且是目录 (Io.Dir.openDir 成功且关闭正常 = 目录)。
@@ -443,146 +381,17 @@ fn isDir(path: []const u8) bool {
 }
 
 /// 默认输出目录: build/linux/<arch>/<mode> (arch 来自构建目标, Flutter 命名)。
-fn defaultBundleDir(gpa: std.mem.Allocator, mode: Mode) []const u8 {
+fn defaultBundleDir(gpa: std.mem.Allocator, mode: Mode) ![]const u8 {
     const arch = @import("build_options").flutter_arch;
     const mode_str = switch (mode) {
         .debug => "debug",
         .release => "release",
         .profile => "profile",
     };
-    return std.fmt.allocPrint(gpa, "build/linux/{s}/{s}", .{ arch, mode_str }) catch "build/bundle";
+    return std.fmt.allocPrint(gpa, "build/linux/{s}/{s}", .{ arch, mode_str });
 }
-/// Flutter Engine 下载进度条。
-///
-/// Store 的下载 callback 可能运行在 `io.async()` 调度的线程中，因此
-/// 状态使用 atomic 保存。当前实现只显示 Engine asset，不显示很小的
-/// metadata.json 下载。
-const EngineProgressBar = struct {
-    /// 是否真正发生过 Engine 网络下载。
-    started: std.atomic.Value(bool) =
-        std.atomic.Value(bool).init(false),
-
-    /// 上一次已经打印的百分比，避免每个 64 KiB chunk 都刷新终端。
-    last_percent: std.atomic.Value(u8) =
-        std.atomic.Value(u8).init(255),
-
-    /// Content-Length 不可用时用于按 0.1 MiB 节流输出。
-    last_tenths_mib: std.atomic.Value(u64) =
-        std.atomic.Value(u64).init(std.math.maxInt(u64)),
-
-    /// 构造传给 flutter_engine_store 的 ProgressSink。
-    fn sink(self: *EngineProgressBar) flutter_engine_store.ProgressSink {
-        return .{
-            .context = self,
-            .callback = onProgress,
-        };
-    }
-
-    /// Store 下载线程调用的进度 callback。
-    fn onProgress(
-        raw_context: ?*anyopaque,
-        progress: flutter_engine_store.DownloadProgress,
-    ) void {
-        if (progress.kind != .engine)
-            return;
-
-        const context = raw_context orelse
-            return;
-
-        const self: *EngineProgressBar =
-            @ptrCast(@alignCast(context));
-
-        self.started.store(true, .release);
-
-        if (progress.total) |total| {
-            const percent_u64: u64 =
-                if (total == 0) 100 else @min(@as(u64, 100), (progress.downloaded * 100) / total);
-
-            const percent: u8 =
-                @intCast(percent_u64);
-
-            const previous =
-                self.last_percent.load(.monotonic);
-
-            if (previous == percent and percent != 100)
-                return;
-
-            self.last_percent.store(percent, .monotonic);
-
-            renderKnownSizeProgress(progress.downloaded, total, percent);
-        } else {
-            const tenths =
-                bytesToTenthsMiB(progress.downloaded);
-
-            const previous =
-                self.last_tenths_mib.load(.monotonic);
-
-            if (previous == tenths) return;
-
-            self.last_tenths_mib.store(tenths, .monotonic);
-
-            std.debug.print("\r[engine] downloading {d}.{d} MiB", .{
-                tenths / 10,
-                tenths % 10,
-            });
-        }
-    }
-
-    /// 下载结束或失败后结束当前进度行。
-    fn finish(self: *EngineProgressBar) void {
-        if (self.started.load(.acquire)) {
-            std.debug.print("\n", .{});
-        }
-    }
-};
-
-/// 绘制一个简单的单行 Engine 下载进度条。
-fn renderKnownSizeProgress(
-    downloaded: u64,
-    total: u64,
-    percent: u8,
-) void {
-    const width = 28;
-
-    var bar: [width]u8 = undefined;
-    @memset(bar[0..], '-');
-
-    const filled = (@as(usize, percent) * width) / 100;
-
-    @memset(bar[0..@min(filled, width)], '#');
-
-    const downloaded_mib = bytesToTenthsMiB(downloaded);
-
-    const total_mib = bytesToTenthsMiB(total);
-
-    std.debug.print(
-        "\r[engine] [{s}] {d}%  {d}.{d}/{d}.{d} MiB",
-        .{
-            bar[0..],
-            percent,
-
-            downloaded_mib / 10,
-            downloaded_mib % 10,
-
-            total_mib / 10,
-            total_mib % 10,
-        },
-    );
-}
-
-/// 将字节数转换成 0.1 MiB 单位。
-///
-/// 使用拆分计算避免 `bytes * 10` 在极端大文件上发生整数溢出。
-fn bytesToTenthsMiB(bytes: u64) u64 {
-    const mib: u64 = 1024 * 1024;
-
-    return (bytes / mib) * 10 + ((bytes % mib) * 10) / mib;
-}
-
-/// 将 Fushell CLI 的 Mode 转换成 Engine Store 的 Mode。
-fn engineStoreMode(
-    mode: Mode,
-) flutter_engine_store.Mode {
+/// Keep engine mode conversion explicit at the CLI boundary.
+fn engineStoreMode(mode: Mode) flutter_engine_store.Mode {
     return switch (mode) {
         .debug => .debug,
         .profile => .profile,
@@ -590,105 +399,6 @@ fn engineStoreMode(
     };
 }
 
-/// 获取与当前 Flutter CLI 完全匹配的 Engine，并复制到 bundle 的 lib 目录。
-///
-/// 流程：
-///
-/// 1. 执行 `flutter --version --machine`。
-/// 2. 根据 engineRevision 初始化 Store。
-/// 3. 通过 `io.async()` 执行 metadata/cache/download/hash 流程。
-/// 4. 下载期间通过 ProgressSink 显示进度条。
-/// 5. SHA256 验证成功后调用 Store.copy()。
-/// 6. 最终生成 `<output_lib_dir>/libflutter_engine.so`。
-///
-/// Engine Store 默认缓存在：
-///
-///   build/fushell_flutter_engine/<arch>/<engine-revision>/
-///
-/// 仓库可以通过 `FUSHELL_ENGINE_REPOSITORY` 环境变量覆盖。
-fn installFlutterEngine(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    environ: *const std.process.Environ.Map,
-    mode: Mode,
-    output_lib_dir: []const u8,
-) !void {
-    var flutter_info =
-        try flutter_engine_store.queryFlutterInfo(gpa, io);
-    defer flutter_info.deinit(gpa);
-
-    const arch = try flutter_engine_store.nativeArch();
-
-    const store_mode = engineStoreMode(mode);
-
-    var store = flutter_engine_store.Store.init(
-        gpa,
-        io,
-        environ,
-        &flutter_info,
-    );
-
-    const revision_short = flutter_info.engine_revision[0..@min(flutter_info.engine_revision.len, 12)];
-
-    std.debug.print(
-        "[engine] Flutter {s}, Dart {s}, revision {s}\n",
-        .{
-            flutter_info.flutter_version,
-            flutter_info.dart_version,
-            revision_short,
-        },
-    );
-
-    var progress: EngineProgressBar = .{};
-
-    // Store.ensure() 本身保持普通同步函数，
-    // 这里由调用端通过 std.Io Future 调度。
-    //
-    // 将来如果需要让 Engine 下载与其他构建工作真正并行，
-    // 可以把 await 移到更靠后的 bundle assemble 阶段，
-    // Store API 无需改变。
-    var future = io.async(
-        flutter_engine_store.Store.ensure,
-        .{
-            &store,
-            arch,
-            store_mode,
-            progress.sink(),
-        },
-    );
-
-    var resolved = future.await(io) catch |err| {
-        progress.finish();
-        return err;
-    };
-    defer resolved.deinit(gpa);
-
-    progress.finish();
-
-    if (resolved.from_cache) {
-        std.debug.print(
-            "[engine] cache hit: {s}\n",
-            .{resolved.path},
-        );
-    } else {
-        std.debug.print(
-            "[engine] download verified: {s}\n",
-            .{resolved.path},
-        );
-    }
-
-    const destination = try store.copy(
-        arch,
-        store_mode,
-        output_lib_dir,
-    );
-    defer gpa.free(destination);
-
-    std.debug.print(
-        "[engine] bundle: {s}\n",
-        .{destination},
-    );
-}
 fn printUsage(io: std.Io) void {
     std.Io.File.stdout().writeStreamingAll(io,
         \\usage: fushell <command> [options]
@@ -723,36 +433,55 @@ fn printUsage(io: std.Io) void {
     ) catch |err| std.log.err("failed to write CLI help: {s}", .{@errorName(err)});
 }
 
+/// Build into a sibling staging directory, then publish after all steps succeed.
+/// A project lock protects Flutter's shared intermediate outputs. Engine fetching
+/// overlaps compilation; every exit joins/cancels the task before borrowed state
+/// is released. Only a complete staging directory replaces the previous bundle.
 fn buildBundle(
     gpa: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
+    toolchain: *const flutter_toolchain.Toolchain,
     options: Options,
 ) !void {
+    try std.Io.Dir.cwd().createDirPath(io, "build");
+    var project_lock = try @import("cache_lock.zig").Lock.acquire(io, .cwd(), "build/.fushell-build.lock");
+    defer project_lock.deinit();
+    var transaction = try bundle_transaction.Transaction.begin(gpa, io, .cwd(), options.bundle_dir);
+    defer transaction.deinit();
+    const arch = try flutter_engine_store.nativeArch();
+    var store = flutter_engine_store.Store.init(gpa, io, environ, &toolchain.info);
+    std.debug.print("[engine] Flutter {s}, Dart {s}, revision {s}\n", .{ toolchain.info.flutter_version, toolchain.info.dart_version, toolchain.info.engine_revision });
+    var future = try io.concurrent(flutter_engine_store.Store.ensure, .{ &store, arch, engineStoreMode(options.mode), flutter_engine_store.ProgressSink{} });
+    var awaited = false;
+    defer if (!awaited) {
+        // cancel may return a result if the task won the race: release it too.
+        if (future.cancel(io)) |value| {
+            var result = value;
+            result.deinit(gpa);
+        } else |_| {}
+    };
     switch (options.mode) {
-        .debug => try buildDebugBundle(
-            gpa,
-            io,
-            environ,
-            options.entrypoint,
-            options.bundle_dir,
-        ),
-
-        .release, .profile => try buildAotBundle(
-            gpa,
-            io,
-            environ,
-            options.mode,
-            options.entrypoint,
-            options.bundle_dir,
-        ),
+        .debug => try buildDebugBundle(gpa, io, toolchain, options.entrypoint, transaction.staging_path),
+        .release, .profile => try buildAotBundle(gpa, io, toolchain, options.mode, options.entrypoint, transaction.staging_path),
     }
+    const download = future.await(io);
+    awaited = true;
+    var engine = try download;
+    defer engine.deinit(gpa);
+    std.debug.print("[engine] {s}: {s}\n", .{ if (engine.from_cache) "cache hit" else "download verified", engine.path });
+    const lib_dir = try std.fs.path.join(gpa, &.{ transaction.staging_path, "lib" });
+    defer gpa.free(lib_dir);
+    const copied = try store.copy(arch, engineStoreMode(options.mode), lib_dir);
+    defer gpa.free(copied);
+    try transaction.commit();
+    std.debug.print("fushell bundle ready: {s}\n", .{options.bundle_dir});
 }
 
 fn buildDebugBundle(
     gpa: std.mem.Allocator,
     io: std.Io,
-    environ: *const std.process.Environ.Map,
+    toolchain: *const flutter_toolchain.Toolchain,
     entrypoint: []const u8,
     bundle_dir: []const u8,
 ) !void {
@@ -762,8 +491,7 @@ fn buildDebugBundle(
 
     const target_platform = targetPlatform();
 
-    const flutter_root = try queryFlutterRoot(gpa, io);
-    defer gpa.free(flutter_root);
+    const flutter_root = toolchain.root;
 
     const icu_data = try std.fs.path.join(
         gpa,
@@ -779,13 +507,13 @@ fn buildDebugBundle(
     );
     defer gpa.free(icu_data);
 
-    try runCommand(gpa, io, &.{ "flutter", "pub", "get" });
+    try runCommand(gpa, io, &.{ toolchain.executable, "pub", "get" });
 
     const platform_arg = try std.fmt.allocPrint(gpa, "--target-platform={s}", .{target_platform});
     defer gpa.free(platform_arg);
 
     try runCommand(gpa, io, &.{
-        "flutter",
+        toolchain.executable,
         "build",
         "bundle",
         "--debug",
@@ -807,24 +535,17 @@ fn buildDebugBundle(
         try std.fs.path.join(gpa, &.{ data_dir, "flutter_assets" });
     defer gpa.free(data_assets);
 
-    try runCommand(gpa, io, &.{ "rm", "-rf", bundle_dir });
-
     try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
 
     try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
 
     try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
 
-    // 根据当前 Flutter CLI 的 Engine revision 获取并复制 Engine。
-    try installFlutterEngine(gpa, io, environ, .debug, lib_dir);
-
     try copyNixRuntimeLibraries(gpa, io, lib_dir);
 
     try writeBundleEntry(gpa, io, bundle_dir);
 
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
-
-    std.debug.print("fushell bundle ready: {s}\n", .{bundle_dir});
 }
 /// release/profile 共用：AOT 编译 app + 组装 AOT bundle。
 ///
@@ -833,7 +554,7 @@ fn buildDebugBundle(
 fn buildAotBundle(
     gpa: std.mem.Allocator,
     io: std.Io,
-    environ: *const std.process.Environ.Map,
+    toolchain: *const flutter_toolchain.Toolchain,
     mode: Mode,
     entrypoint: []const u8,
     bundle_dir: []const u8,
@@ -843,8 +564,7 @@ fn buildAotBundle(
 
     const target_platform = targetPlatform();
 
-    const flutter_root = try queryFlutterRoot(gpa, io);
-    defer gpa.free(flutter_root);
+    const flutter_root = toolchain.root;
 
     const icu_data = try std.fs.path.join(gpa, &.{
         flutter_root,
@@ -857,7 +577,7 @@ fn buildAotBundle(
     });
     defer gpa.free(icu_data);
 
-    try runCommand(gpa, io, &.{ "flutter", "pub", "get" });
+    try runCommand(gpa, io, &.{ toolchain.executable, "pub", "get" });
 
     const platform_arg = try std.fmt.allocPrint(gpa, "-dTargetPlatform={s}", .{target_platform});
     defer gpa.free(platform_arg);
@@ -883,17 +603,23 @@ fn buildAotBundle(
 
     const split_debug_arg = "-dSplitDebugInfo=" ++ split_debug_dir;
 
-    // Flutter assemble cache 不会跟踪 split debug-info 输出被手工删除。
-    // 因此主动清除 AOT graph，确保每次构建重新产生 symbols。
-    try runCommand(gpa, io, &.{
-        "rm",
-        "-rf",
+    const debug_info_name = try std.fmt.allocPrint(gpa, "app.{s}.symbols", .{target_platform});
+    defer gpa.free(debug_info_name);
+
+    const debug_info = try std.fs.path.join(gpa, &.{
         split_debug_dir,
-        ".dart_tool/flutter_build",
+        debug_info_name,
     });
+    defer gpa.free(debug_info);
+
+    // Preserve incremental AOT artifacts. Invalidate only when an external
+    // deletion removed the symbols Flutter's cache does not track.
+    if (!try pathExists(gpa, debug_info)) {
+        try runCommand(gpa, io, &.{ "rm", "-rf", ".dart_tool/flutter_build" });
+    }
 
     try runCommand(gpa, io, &.{
-        "flutter",
+        toolchain.executable,
         "assemble",
         "--no-version-check",
         "--output=build",
@@ -930,15 +656,6 @@ fn buildAotBundle(
         return error.MissingLibAppSo;
     }
 
-    const debug_info_name = try std.fmt.allocPrint(gpa, "app.{s}.symbols", .{target_platform});
-    defer gpa.free(debug_info_name);
-
-    const debug_info = try std.fs.path.join(gpa, &.{
-        split_debug_dir,
-        debug_info_name,
-    });
-    defer gpa.free(debug_info);
-
     if (!try pathExists(gpa, debug_info)) {
         std.debug.print("AOT debug info not found at {s}\n", .{debug_info});
 
@@ -963,8 +680,6 @@ fn buildAotBundle(
     const debug_info_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so.symbols" });
     defer gpa.free(debug_info_dest);
 
-    try runCommand(gpa, io, &.{ "rm", "-rf", bundle_dir });
-
     try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
 
     try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
@@ -975,16 +690,11 @@ fn buildAotBundle(
 
     try runCommand(gpa, io, &.{ "cp", debug_info, debug_info_dest });
 
-    // 对 profile/release 自动选择对应的预构建 Engine。
-    try installFlutterEngine(gpa, io, environ, mode, lib_dir);
-
     try copyNixRuntimeLibraries(gpa, io, lib_dir);
 
     try writeBundleEntry(gpa, io, bundle_dir);
 
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
-
-    std.debug.print("fushell {s} bundle ready: {s}\n", .{ @tagName(mode), bundle_dir });
 }
 
 fn targetPlatform() []const u8 {
@@ -994,32 +704,6 @@ fn targetPlatform() []const u8 {
         .aarch64 => "linux-arm64",
         else => @compileError("unsupported Fushell Flutter engine host architecture"),
     };
-}
-
-fn queryFlutterRoot(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    _ = io;
-
-    if (try envValue(gpa, "FLUTTER_ROOT")) |root| return root;
-    if (try envValue(gpa, "FLUTTER_SDK")) |root| return root;
-
-    const path = std.c.getenv("PATH") orelse return error.FlutterRootUnavailable;
-    var entries = std.mem.splitScalar(u8, std.mem.span(path), ':');
-    while (entries.next()) |entry| {
-        if (entry.len == 0) continue;
-        const flutter_exe = try std.fs.path.join(gpa, &.{ entry, "flutter" });
-        defer gpa.free(flutter_exe);
-        if (!try pathExists(gpa, flutter_exe)) continue;
-
-        const root_candidate = std.fs.path.dirname(entry) orelse continue;
-        const root = try gpa.dupe(u8, root_candidate);
-        errdefer gpa.free(root);
-        const icu_probe = try std.fs.path.join(gpa, &.{ root, "bin", "cache", "artifacts", "engine", targetPlatform(), "icudtl.dat" });
-        defer gpa.free(icu_probe);
-        if (try pathExists(gpa, icu_probe)) return root;
-        gpa.free(root);
-    }
-
-    return error.FlutterRootUnavailable;
 }
 
 fn envValue(gpa: std.mem.Allocator, comptime name: []const u8) !?[]u8 {
@@ -1043,6 +727,7 @@ fn runCommand(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !voi
 
     // 用 std.process.spawn (需要完整环境解析 PATH, io 由调用方提供: init.io / graph.io)
     var child = try std.process.spawn(io, .{ .argv = argv });
+    defer child.kill(io);
     // Child 无 deinit: wait 后由 io 释放 (spawn 的 stdio 管道在 wait 时清理)
 
     const term = try child.wait(io);

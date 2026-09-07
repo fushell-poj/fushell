@@ -85,8 +85,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
         .use_llvm = true,
     });
-    // NixOS bundle 不能依赖事后的 install fixup：CLI 会在编译期内嵌 runner。
-    // 因此先复制并修补 emitted binary，再同时用于安装和 @embedFile。
+    // Embed the emitted runner; system library/loader policy belongs to packaging.
     const runner_bin = exe.getEmittedBin();
 
     const build_tool_mod = b.createModule(.{
@@ -151,6 +150,16 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
+    for ([_][]const u8{ "flutter_engine_store", "owned_arguments", "process_exit", "bundle_transaction", "flutter_toolchain", "source_snapshot" }) |name| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const tests = b.addTest(.{ .root_module = module });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
     const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);

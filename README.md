@@ -5,40 +5,60 @@ engine and isolate can create and manage multiple native windows from Dart.
 
 ## Build the tools
 
-The project uses Zig 0.16 and a local Flutter engine workspace configured in
-`build.zig.zon`.
+The project targets **Zig 0.16.0**. Native development dependencies include
+Wayland, EGL/GLES, xkbcommon, Fontconfig, D-Bus and `pkg-config`/`wayland-scanner`.
 
 ```bash
+nix develop
 zig build
+zig build test
 ```
 
-This installs:
-
-- `zig-out/bin/fushell` — development CLI
-- `zig-out/bin/fushell-runner` — internal bundle player embedded by the CLI
+The installed command is `zig-out/bin/fushell`. Its native bundle runner and the
+Dart SDK files are embedded at build time; Flutter Engine binaries are **not**.
+The `flutter-embedder` Zig dependency supplies the C ABI header for compilation,
+not the runtime Engine selected for an application.
 
 ## NixOS package
 
-NixOS 是当前正式支持的发布环境。完整 CLI 需要匹配 revision 的 debug、profile、release Flutter engine artifacts；flake 暴露参数化的 `lib.mkFushell`，不会在纯 derivation 中读取开发机路径。构造器要求显式 `engineArtifacts.revision`，并在 Zig 编译前确认它与 Flutter SDK 及三份二进制均一致。
-
-使用本地 engine workspace 构建完整 Nix package：
-
 ```bash
-nix run .#build-local -- /path/to/flutter-engine
-
+nix build
 ./result/bin/fushell help
 ```
 
-`fushell build` 从该 package 运行时，会为生成的应用写入 Nix loader，并复制 runner 直接依赖的用户态运行库；这些库的传递依赖由 Nix closure 保留。EGL 驱动仍由 NixOS 的 `/run/opengl-driver/lib` 提供。
+The package uses `nix/package.nix` and the root `deps.nix` package cache. It provides
+runtime `curl` and coreutils through a PATH wrapper, without fixing the application's
+Flutter SDK. Update Zig dependencies with `generate-nix-deps` inside `nix develop`,
+or run `nix run github:nix-community/zon2nix > deps.nix` explicitly.
 
-Zig 依赖由 zon2nix 生成的 `deps.nix` 固定：
+Select a Flutter SDK with `FLUTTER_ROOT`, then `FLUTTER_SDK`, or the `flutter` on
+PATH. Fushell resolves this once and uses the same SDK for compilation, version
+queries, ICU data, frontend_server and DevTools. The SDK must already be initialized.
 
-```bash
-nix run github:nix-community/zon2nix > deps.nix
-nix flake check
-```
+Generated bundles carry the application, assets and matching Flutter Engine.
+System libraries and the ELF loader still depend on the build/target environment;
+this is **not** a promise of a universally portable Linux binary. In NixOS those
+libraries must remain reachable in the Nix closure or runtime library search paths.
+`FUSHELL_RUNTIME_LIBS` remains an optional explicit bundle-library source.
 
-参数化 package、应用包装与依赖更新细节见 [`nix/README.md`](nix/README.md)。跨发行版 portable bundle 暂不承诺支持。
+## Flutter Engine cache and safe publication
+
+Fushell reads `engineRevision` from the selected SDK's `flutter --version --machine`,
+then downloads the matching `engine-<revision>` release from
+`fushell-poj/fushell-engine-builds`. Set `FUSHELL_ENGINE_REPOSITORY` to a compatible
+repository URL to override it. curl honors the environment's proxy configuration.
+
+The cache is `build/fushell_flutter_engine/<arch>/<revision>/`, with metadata,
+SHA-256 verified shared libraries, an origin record and a persistent lock file.
+Changing repositories invalidates cached metadata. Cooperating processes serialize
+cache publication; failed downloads never become final Engine files.
+
+Engine acquisition overlaps Dart compilation. A project lock protects Flutter's
+shared intermediate outputs. Bundles are assembled in a private sibling staging
+directory and published only on success. Replacing existing nonempty directories
+requires a recognized Fushell bundle; project/source/intermediate directories are
+rejected. On ordinary publication failure the previous bundle is restored. This
+provides rollback on errors, not a power-loss-atomic directory transaction.
 
 ## CLI
 
@@ -115,7 +135,7 @@ syntax and behavior remain entirely application-defined through
 `FushellApplication.run`; fushell does not reserve application arguments.
 Single-instance bundles fail explicitly when no session D-Bus is available.
 
-The bundle contains its validated application manifest and `libdbus-1` runtime;
+The bundle contains its validated application manifest; `libdbus-1` is a system dependency, and
 the internal runner locates those resources relative to itself. Command handlers use
 `invocation.output.writeStdout`, `writeStderr`, `writeStdoutText`, and
 `writeStderrText`; `FushellCommandResult` only carries an exit code, while output
@@ -144,3 +164,11 @@ idle CPU/FD stability.
 See [`packages/fushell/README.md`](packages/fushell/README.md) for the Dart API,
 window ownership model, parent relationships, layer surfaces, and multi-view
 widget binding.
+
+## Architecture and timing
+
+See [docs/architecture.md](docs/architecture.md) for process ownership, build flow
+and testing boundaries. The current frame scheduler is a bounded **60 Hz software
+fallback**, not Wayland compositor presentation feedback. It responds only to
+requested frames and does not wake idle engines periodically. Hardware refresh
+rate synchronization remains a separate rendering integration task.
