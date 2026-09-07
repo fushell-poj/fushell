@@ -16,6 +16,8 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
     steps:
       - uses: actions/checkout@v6
         with:
@@ -40,7 +42,7 @@ jobs:
           if hashlib.sha256(archive.read_bytes()).hexdigest() != release['shasum']:
               raise SystemExit('Zig archive checksum mismatch')
           PY
-          mkdir -p "$RUNNER_TEMP/zig"
+          mkdir -p "$RUNNER_TEMP/zig" "$ZIG_GLOBAL_CACHE_DIR/tmp"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
       - name: Build and test
@@ -52,17 +54,28 @@ jobs:
           zig test src/flutter_engine_store.zig
           zig build test
           zig build -Doptimize=ReleaseFast
-      # Temporary review workspace: source and toolchain only, never checkout
-      # credentials or Git configuration. Removed after the repair review.
+      # Temporary source-review fixtures, removed once review is complete.
+      # This archive deliberately excludes credentials and Git configuration.
       - name: Collect review workspace
         if: always()
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/review-workspace"
+          mkdir -p "$RUNNER_TEMP/review-workspace/sysroot/usr/lib/x86_64-linux-gnu"
           git archive HEAD | gzip > "$RUNNER_TEMP/review-workspace/source.tar.gz"
-          if test -f "$RUNNER_TEMP/zig.tar.xz"; then
-            cp "$RUNNER_TEMP/zig.tar.xz" "$RUNNER_TEMP/review-workspace/zig.tar.xz"
+          if test -d "$ZIG_GLOBAL_CACHE_DIR/p"; then
+            tar -czf "$RUNNER_TEMP/review-workspace/zig-packages.tar.gz" -C "$ZIG_GLOBAL_CACHE_DIR" p
           fi
+          sysroot="$RUNNER_TEMP/review-workspace/sysroot"
+          cp -a /usr/include "$sysroot/usr/"
+          mkdir -p "$sysroot/usr/bin" "$sysroot/usr/lib/x86_64-linux-gnu/pkgconfig"
+          cp /usr/bin/wayland-scanner "$sysroot/usr/bin/"
+          for stem in libwayland-client libwayland-egl libxkbcommon libEGL libGLESv2 libfontconfig libfreetype libdbus-1 libffi libexpat; do
+            cp -a /usr/lib/x86_64-linux-gnu/"$stem".so* "$sysroot/usr/lib/x86_64-linux-gnu/" || true
+          done
+          cp -a /usr/lib/x86_64-linux-gnu/dbus-1.0 "$sysroot/usr/lib/x86_64-linux-gnu/"
+          cp -a /usr/lib/x86_64-linux-gnu/pkgconfig/*.pc "$sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/"
+          tar -czf "$RUNNER_TEMP/review-workspace/sysroot.tar.gz" -C "$sysroot" .
+          rm -rf "$sysroot"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
