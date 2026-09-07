@@ -78,6 +78,22 @@ fushell sdk ./vendor
 Debug is the default mode. Build output is written to
 `build/linux/<arch>/<mode>` unless an output directory is supplied.
 
+Use `fushell help <command>` or `fushell <command> --help` for command-specific
+usage. Option values accept both `--vm-service-port=8181` and
+`--vm-service-port 8181`. Syntax errors exit with status 2 and identify the
+relevant command; help exits successfully without requiring a Flutter SDK.
+
+`fushell run ./app -- <arguments...>` forwards every argument after `--` to the
+application unchanged. For `build` and `sdk`, `--` instead introduces positional
+paths, including paths starting with `-`. Relative output directories are resolved
+inside the selected project, as before.
+
+The CLI uses zig-clap pinned to `8d97efa1ee1e575443c7888d5c38e1c3fc145cf5`, the
+upstream commit immediately before its Zig 0.17 migration. Both `build.zig.zon`
+and generated `deps.nix` pin that source. `zig build cli-test` runs the parser and
+help regressions; `tests/cli_smoke.sh` checks the compiled executable's public
+entry point without Flutter or a display.
+
 ## DevTools and VM Service
 
 ```bash

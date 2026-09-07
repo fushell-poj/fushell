@@ -27,6 +27,14 @@ linkFarm "zig-packages" [
     };
   }
   {
+    name = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5";
+    path = fetchgit {
+      url = "https://github.com/Hejsil/zig-clap";
+      rev = "8d97efa1ee1e575443c7888d5c38e1c3fc145cf5";
+      hash = "sha256-HveL7aJBC+/8PNlGYxtNZBrk3ytkM8zuXENO9JpygC0=";
+    };
+  }
+  {
     name = "wayland-0.6.0-dev-lQa1krD8AQBlMqwuhAMJjPQKXvpRByZBxxqMVAZ7yzbG";
     path = fetchgit {
       url = "https://codeberg.org/ifreund/zig-wayland";

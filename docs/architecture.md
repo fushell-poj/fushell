@@ -2,10 +2,23 @@
 
 ## Two entry points, one player
 
-`fushell` (`src/fushell.zig`) is a development CLI. It builds a bundle and optionally
-runs it in-process through `player.runPlayer`. A shipped bundle starts at
-`src/main.zig`; it locates resources relative to its executable, then calls the
-same player. A shipped app does not need Flutter SDK or network access.
+`fushell` (`src/fushell.zig`) only parses and dispatches commands. `src/cli/`
+contains the side-effect-free zig-clap declarations, per-command Options, typed
+Command union, diagnostics and generated help. Parser strings borrow argv; clap's
+temporary allocations are released before returning. The run parser splits at
+`--` before invoking clap, so application arguments are never interpreted.
+
+`src/commands/build.zig`, `run.zig` and `sdk.zig` implement their respective
+operations. The shared project helper resolves input/output paths only after
+parsing succeeds. Help and SDK export do not discover Flutter. Build and run use
+a build-only plan; run options are not carried through the packaging pipeline.
+Command cleanup completes before the entry point maps failures to process status
+(2 for command syntax/validation, 1 for operational failures, 130 for an interrupted
+run). Normal application exit status is preserved.
+
+Development runs call `player.runPlayer` in-process. A shipped bundle starts at
+`src/main.zig`, locates resources relative to its executable, and calls the same
+player. A shipped app does not need Flutter SDK or network access.
 
 The runner is embedded in the CLI. Flutter Engine is downloaded at bundle-build
 time and dynamically loaded from the bundle by `flutter_embedder.zig`. A successful
