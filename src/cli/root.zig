@@ -7,28 +7,31 @@ const common = @import("common.zig");
 pub const build = @import("build.zig");
 pub const run = @import("run.zig");
 pub const sdk = @import("sdk.zig");
+pub const create = @import("create.zig");
 pub const Mode = common.Mode;
 pub const Topic = common.Topic;
 pub const Diagnostic = common.Diagnostic;
 
 pub const Command = union(enum) {
-    help: Topic,
     build: build.Options,
     run: run.Options,
     sdk: sdk.Options,
+    create: create.Options,
 };
+/// Help is a parsing outcome, never an executable subcommand.
+pub const ParseResult = union(enum) {
+    help: Topic,
+    command: Command,
+};
+
 const CommandName = std.meta.Tag(Command);
 const root_params = clap.parseParamsComptime(common.help_spec ++
-    \\<command>  The command to execute. Use help <command> for command-specific usage.
-    \\
-);
-const help_params = clap.parseParamsComptime(common.help_spec ++
-    \\<command>...  One optional command to describe.
+    \\<command>  The command to execute. Use <command> --help for command-specific usage.
     \\
 );
 const parsers = .{ .command = clap.parsers.string };
 
-pub fn parse(allocator: std.mem.Allocator, args: []const []const u8, diag: *Diagnostic) !Command {
+pub fn parse(allocator: std.mem.Allocator, args: []const []const u8, diag: *Diagnostic) !ParseResult {
     diag.* = .{};
     var iterator = clap.args.SliceIterator{ .args = args };
     var result = try clap.parseEx(clap.Help, &root_params, parsers, &iterator, .{
@@ -41,41 +44,21 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8, diag: *Diag
     const command = std.meta.stringToEnum(CommandName, name) orelse
         return diag.reject("unknown command", name);
     const rest = args[iterator.index..];
-    if (command == .help) return .{ .help = try parseHelp(allocator, rest, diag) };
     diag.topic = switch (command) {
         .build => .build,
         .run => .run,
         .sdk => .sdk,
-        .help => unreachable,
+        .create => .create,
     };
     if (result.args.help != 0) {
         if (rest.len != 0) return diag.reject("unexpected argument after help target", rest[0]);
         return .{ .help = diag.topic };
     }
     return switch (command) {
-        .build => if (try build.parse(allocator, rest, diag)) |options| .{ .build = options } else .{ .help = .build },
-        .run => if (try run.parse(allocator, rest, diag)) |options| .{ .run = options } else .{ .help = .run },
-        .sdk => if (try sdk.parse(allocator, rest, diag)) |options| .{ .sdk = options } else .{ .help = .sdk },
-        .help => unreachable,
-    };
-}
-
-fn parseHelp(allocator: std.mem.Allocator, args: []const []const u8, diag: *Diagnostic) !Topic {
-    var iterator = clap.args.SliceIterator{ .args = args };
-    var result = try clap.parseEx(clap.Help, &help_params, parsers, &iterator, .{
-        .allocator = allocator,
-        .diagnostic = &diag.syntax,
-    });
-    defer result.deinit();
-    const names = result.positionals[0];
-    if (names.len > 1) return diag.reject("help accepts at most one command", names[1]);
-    if (names.len == 0) return .root;
-    const name = std.meta.stringToEnum(CommandName, names[0]) orelse return diag.reject("unknown command", names[0]);
-    return switch (name) {
-        .help => .root,
-        .build => .build,
-        .run => .run,
-        .sdk => .sdk,
+        .build => if (try build.parse(allocator, rest, diag)) |options| .{ .command = .{ .build = options } } else .{ .help = .build },
+        .run => if (try run.parse(allocator, rest, diag)) |options| .{ .command = .{ .run = options } } else .{ .help = .run },
+        .sdk => if (try sdk.parse(allocator, rest, diag)) |options| .{ .command = .{ .sdk = options } } else .{ .help = .sdk },
+        .create => if (try create.parse(allocator, rest, diag)) |options| .{ .command = .{ .create = options } } else .{ .help = .create },
     };
 }
 
@@ -84,13 +67,14 @@ pub fn help(writer: *std.Io.Writer, topic: Topic) !void {
         .build => return build.help(writer),
         .run => return run.help(writer),
         .sdk => return sdk.help(writer),
+        .create => return create.help(writer),
         .root => {},
     }
     try writer.writeAll("Fushell - Flutter applications on Linux/Wayland.\n\nUsage: fushell [options] [command] [arguments...]");
     try writer.writeAll("\n\nCommands:\n");
-    inline for (.{ build, run, sdk }, .{ "build", "run", "sdk" }) |module, name|
+    inline for (.{ build, run, sdk, create }, .{ "build", "run", "sdk", "create" }) |module, name|
         try writer.print("  {s:<8} {s}\n", .{ name, module.description });
-    try writer.writeAll("  help     Show general or command-specific help.\n\n");
+    try writer.writeByte('\n');
     try clap.help(writer, clap.Help, &root_params, common.help_options);
     try writer.writeAll("\n\nRun 'fushell <command> --help' for more information.\n");
 }

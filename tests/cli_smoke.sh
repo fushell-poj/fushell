@@ -15,9 +15,9 @@ no_flutter() {
 no_flutter > "$work/root"
 no_flutter --help > "$work/root-help"
 cmp "$work/root" "$work/root-help"
-for command in build run sdk; do
+for command in build run sdk create; do
   no_flutter "$command" --help > "$work/$command-help"
-  no_flutter help "$command" > "$work/$command-alias"
+  no_flutter "$command" -h > "$work/$command-alias"
   cmp "$work/$command-help" "$work/$command-alias"
   grep -q "Usage: fushell $command" "$work/$command-help"
 done
@@ -36,7 +36,8 @@ expect_usage_error run --release --devtools
 expect_usage_error sdk --debug
 expect_usage_error build --unknown
 grep -q -- '--unknown' "$work/stderr"
-expect_usage_error help missing-command
+expect_usage_error help
+expect_usage_error create --overwrite app
 expect_usage_error sdk one two
 
 no_flutter sdk "$work/sdk output" > "$work/sdk-stdout" 2> "$work/sdk-stderr"

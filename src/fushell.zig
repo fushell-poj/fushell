@@ -5,6 +5,7 @@ const cli = @import("cli");
 const build_command = @import("commands/build.zig");
 const run_command = @import("commands/run.zig");
 const sdk_command = @import("commands/sdk.zig");
+const create_command = @import("commands/create.zig");
 
 pub fn main(init: std.process.Init) void {
     // Return through execute() before exiting so all command defers run.
@@ -23,7 +24,7 @@ fn execute(init: std.process.Init) !u8 {
     for (command_args, args) |arg, *destination| destination.* = arg;
 
     var diagnostic: cli.Diagnostic = .{};
-    const command = cli.parse(init.gpa, args, &diagnostic) catch |err| {
+    const parsed = cli.parse(init.gpa, args, &diagnostic) catch |err| {
         if (err == error.OutOfMemory) return err;
         var buffer: [2048]u8 = undefined;
         var writer = std.Io.File.stderr().writer(init.io, &buffer);
@@ -31,24 +32,28 @@ fn execute(init: std.process.Init) !u8 {
         try writer.interface.flush();
         return 2;
     };
-    return dispatch(init, command) catch |err| {
-        if (err == error.UserInterrupt) return 130;
-        std.log.err("fushell {s} failed: {s}", .{ @tagName(command), @errorName(err) });
-        return 1;
-    };
-}
-
-fn dispatch(init: std.process.Init, command: cli.Command) !u8 {
-    switch (command) {
+    switch (parsed) {
         .help => |topic| {
             var buffer: [4096]u8 = undefined;
             var writer = std.Io.File.stdout().writer(init.io, &buffer);
             try cli.help(&writer.interface, topic);
             try writer.interface.flush();
+            return 0;
         },
+        .command => |command| return dispatch(init, command) catch |err| {
+            if (err == error.UserInterrupt) return 130;
+            std.log.err("fushell {s} failed: {s}", .{ @tagName(command), @errorName(err) });
+            return 1;
+        },
+    }
+}
+
+fn dispatch(init: std.process.Init, command: cli.Command) !u8 {
+    switch (command) {
         .build => |options| try build_command.execute(init, options),
         .run => |options| return run_command.execute(init, options),
         .sdk => |options| try sdk_command.execute(init, options),
+        .create => |options| try create_command.execute(init, options),
     }
     return 0;
 }
@@ -57,4 +62,5 @@ fn dispatch(init: std.process.Init, command: cli.Command) !u8 {
 test {
     _ = run_command;
     _ = sdk_command;
+    _ = create_command;
 }

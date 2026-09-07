@@ -23,7 +23,7 @@ not the runtime Engine selected for an application.
 
 ```bash
 nix build
-./result/bin/fushell help
+./result/bin/fushell --help
 ```
 
 The package uses `nix/package.nix` and the root `deps.nix` package cache. It provides
@@ -188,3 +188,60 @@ and testing boundaries. The current frame scheduler is a bounded **60 Hz softwar
 fallback**, not Wayland compositor presentation feedback. It responds only to
 requested frames and does not wake idle engines periodically. Hardware refresh
 rate synchronization remains a separate rendering integration task.
+
+## Create a project
+
+```sh
+fushell create my_app
+fushell create --single-instance --org dev.example my_app
+fushell create --project-name my_app "a directory with spaces"
+fushell create --no-pub my_app
+fushell create --help
+```
+
+Without an output directory, `fushell create` opens a line-oriented terminal
+wizard. With a directory it uses flags/defaults without prompting;
+`--interactive` explicitly requests the wizard. Supplied flags are never asked
+again. Piped/non-terminal input is rejected when prompting is required. All
+questions finish before filesystem writes. There is no `help` subcommand:
+use `-h` or `--help` on each command; bare `fushell` shows general help.
+
+Only absent or empty directories are accepted, including `create .` in an
+empty directory. Even a directory containing only `.git` is nonempty. There is
+no overwrite/force mode or existing-project migration. Symlink destinations
+and symlinked parent components are rejected. Files are generated in a private
+sibling workspace and published with no-replace renames. Existing empty
+folders retain their inode. Ordinary errors roll back; a crash or forced kill
+can leave scratch files and is not a power-loss transaction.
+
+Creation calls the selected Flutter SDK's `create --template=app --empty
+--platforms=linux --no-pub`. It then exports the canonical SDK to
+`vendor/fushell`, adds a relative dependency, writes a minimal view-aware app,
+UI test, README and `fushell.json`, and removes the generated GTK/CMake `linux/`
+host. Pubspec edits use the YAML AST from the initialized Flutter tools package
+configuration; no extra `pub get` is needed for this helper, and SDK bounds and
+unrelated pubspec content are preserved. Flutter's existing `.gitignore` is
+retained and missing generated-file rules are appended idempotently, including
+`/linux/flutter/ephemeral/` and generated plugin metadata. `vendor/fushell`,
+`pubspec.lock`, `.metadata` and `fushell.json` remain version-controlled.
+
+The final `flutter pub get` runs in the published project, not the scratch
+path. If it fails, the command fails but keeps usable sources and explains how
+to retry. `--no-pub` skips this final dependency resolution; it does not prevent
+Flutter itself from initializing its SDK caches. Creation does not download
+Fushell Engine assets, compile or launch an application, initialize Git, change
+Flutter's global settings, or require a display/session bus connection.
+
+Both templates keep the process alive when windows close; use the explicit
+Exit button/`FushellProcess.exit()` or Ctrl+C. The single-instance template uses
+`FushellApplication.run`, opens at most one window on a no-argument invocation,
+and implements a minimal application-owned `quit` command. This does not alter
+runtime lifecycle policy. Use Fushell to run/build: official `flutter build
+linux` and automatic GTK native-plugin registration are not supported by the
+created project.
+
+The creation suite tests parser/TTY behavior and failure safety with fake SDK
+processes, then verifies the YAML helper, generated UI tests, static analysis
+and Debug/Profile/Release bundle builds with an actual Flutter 3.41.9 SDK in CI.
+No Wayland/GPU runtime test is implied by these checks. `doctor` is not yet
+implemented.
