@@ -1,0 +1,68 @@
+import 'dart:ui' as ui;
+
+import 'package:flutter/widgets.dart';
+import 'package:fushell/fushell.dart';
+
+import 'app.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runWidget(const _WindowViews());
+@@STARTUP@@
+}
+
+Future<void> openMainWindow() async {
+  // Keep at most one window; a later invocation can reopen it after closing.
+  if (ui.PlatformDispatcher.instance.views.any((view) => view.viewId != 0)) {
+    return;
+  }
+  final id = await FushellWindow.openWindow(
+    title: @@TITLE@@,
+    appId: @@APPLICATION_ID@@,
+    width: 800,
+    height: 600,
+  );
+  await FushellWindow.viewById(id);
+}
+
+// There is no implicit window. Keep the widget tree in sync with engine view
+// additions/removals, including closes initiated by the compositor.
+class _WindowViews extends StatefulWidget {
+  const _WindowViews();
+
+  @override
+  State<_WindowViews> createState() => _WindowViewsState();
+}
+
+class _WindowViewsState extends State<_WindowViews>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeMetrics() {
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ViewCollection(
+    views: [
+      for (final view in ui.PlatformDispatcher.instance.views)
+        if (view.viewId != 0)
+          View(
+            key: ValueKey(view.viewId),
+            view: view,
+            child: App(onExit: () async => FushellProcess.exit()),
+          ),
+    ],
+  );
+}

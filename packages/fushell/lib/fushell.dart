@@ -16,7 +16,7 @@ const int _maxOutputBytes = 8 * 1024 * 1024;
 
 /// 同一 invocation 的 output writer 已有另一个 raw/text write 在途。
 final class FushellCommandOutputStateError extends StateError {
-  FushellCommandOutputStateError(String message) : super(message);
+  FushellCommandOutputStateError(super.message);
 }
 
 /// 单帧或 invocation 的 logical raw bytes 超出公开上限。
@@ -529,14 +529,14 @@ final class FushellWindow {
             'kind': 'window',
             'title': title,
             'appId': appId,
-            if (width != null) 'width': width,
-            if (height != null) 'height': height,
+            'width': ?width,
+            'height': ?height,
           }
         : layer.toJson();
     final Map<String, Object?> response = await _sendRequest(<String, Object?>{
       'method': 'window.open',
       'role': role,
-      if (parent != null) 'parent': parent,
+      'parent': ?parent,
     });
     final Object? windowId = response['windowId'];
     if (windowId is! int) {

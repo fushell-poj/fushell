@@ -84,3 +84,19 @@ regressions. Fake curl subprocess tests do not require Internet or Flutter.
 they need Flutter/Engine assets and extra session-bus/compositor dependencies.
 Passing compiler/unit tests does not establish NixOS closure portability, GPU
 correctness, high-refresh behavior or full graphical shutdown correctness.
+
+## Project creation
+
+Help is a `ParseResult` outcome, not an executable `Command`. The command union
+contains only build/run/sdk/create; no help alias or compatibility parser exists.
+`create_prompt.zig` handles defaults and terminal questions without filesystem
+writes. `project_draft.zig` stages new project files and never replaces existing
+entries; it deliberately does not reuse replaceable bundle transactions.
+`commands/create.zig` orchestrates Flutter, SDK export, template configuration,
+publication and the final pub get, using one SDK and an explicit environment.
+The small Dart configuration helper uses Flutter's existing YAML dependency and
+AST spans rather than implementing a second YAML parser in Zig. All template
+files live under `src/project_templates` and are embedded at compile time.
+The final pub get follows publication so it cannot leave absolute staging paths
+in package configuration. Download or dependency errors do not erase delivered
+sources. Crashes can leave private staging directories for manual recovery.

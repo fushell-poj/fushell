@@ -1,0 +1,13 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:@@PROJECT_NAME@@/app.dart';
+
+void main() {
+  testWidgets('shows the initial UI and an explicit exit action', (tester) async {
+    var exits = 0;
+    await tester.pumpWidget(App(onExit: () => exits++));
+    expect(find.text('Hello, Fushell!'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'Exit'));
+    expect(exits, 1);
+  });
+}

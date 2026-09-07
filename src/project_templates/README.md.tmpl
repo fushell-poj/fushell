@@ -1,0 +1,57 @@
+# @@PROJECT_NAME@@
+
+A Fushell application for Linux/Wayland. Instance policy: **@@INSTANCE@@**.
+
+## Development
+
+Install Fushell and an initialized Flutter SDK, then run:
+
+```sh
+flutter pub get
+fushell run --debug
+fushell run --debug --devtools
+```
+
+The first bundle build fetches the matching Engine revision. Creation itself
+never downloads an Engine or builds the app. An unavailable Engine release
+must be published to the configured Engine repository before building.
+
+`lib/app.dart` contains testable UI; `lib/main.dart` owns native view startup.
+Use `flutter test` for UI tests and `flutter analyze` for static analysis.
+Hot reload does not re-run `main()`; restart after changing startup code.
+
+## Windows and process lifetime
+
+Closing a window does **not** exit the process in either template. Use the UI's
+**Exit** button, an explicit `FushellProcess.exit()`, or Ctrl+C in the launching
+terminal. Decide your own close/exit policy in application code.
+
+In single-instance mode, a no-argument invocation opens a window if none exists
+(it does not force compositor focus on an existing window). `quit` stops the
+existing instance. The session D-Bus is required for single-instance mode.
+These command semantics belong to this sample, not to Fushell's runner.
+
+```sh
+fushell run --debug -- quit
+```
+
+## Distribution
+
+```sh
+fushell build --release
+```
+
+Bundle output is `build/linux/<arch>/release/`, with executable
+`@@PROJECT_NAME@@`. Distribute the **whole bundle**, not just that executable.
+The target still needs compatible system libraries, a loader and Wayland;
+this is not a universally portable Linux executable.
+
+There is no official GTK/CMake `linux/` host. Build and run through Fushell,
+not `flutter build linux` or `flutter run -d linux`. Flutter's Linux assemble
+steps may regenerate `linux/flutter/ephemeral/` and plugin metadata; these
+are ignored. Official GTK-based native plugins are not registered by Fushell.
+Pure Dart packages and separately integrated native code have different needs.
+
+Commit `vendor/fushell/`, `fushell.json`, `.metadata`, and the application's
+`pubspec.lock`. Do not commit build outputs or regenerated platform artifacts.
+The exported SDK is source code, not a disposable cache.
