@@ -9,6 +9,7 @@ const flutter_engine_store = @import("../flutter_engine_store.zig");
 const flutter_toolchain = @import("../flutter_toolchain.zig");
 const Mode = cli.Mode;
 const embedded_runner = @embedFile("fushell_runner_bin");
+const Transcript = @import("../command_output.zig").Transcript;
 
 pub fn execute(init: std.process.Init, options: cli.build.Options) !void {
     const plan = try project.prepare(init, options);
@@ -37,14 +38,42 @@ pub fn assemble(
     toolchain: *const flutter_toolchain.Toolchain,
     options: project.Plan,
 ) !void {
+    var output = Transcript.init(gpa, io, environ);
+    defer output.deinit();
+    // assembleStaged unwinds/cancels Engine acquisition before returning here.
+    // Never replay compiler output while curl owns the terminal progress line.
+    const entry = assembleStaged(gpa, io, environ, toolchain, options, &output) catch |err| {
+        output.show();
+        return err;
+    };
+    defer gpa.free(entry);
+    output.show();
+    std.debug.print("fushell bundle ready: {s}\nbundle entry: {s}\n", .{ std.fs.path.dirname(entry).?, entry });
+}
+
+/// Return an owned final entry path only after publication. Internal staging
+/// names never become success messages or application launch paths.
+fn assembleStaged(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    toolchain: *const flutter_toolchain.Toolchain,
+    options: project.Plan,
+    output: *Transcript,
+) ![]u8 {
     try std.Io.Dir.cwd().createDirPath(io, "build");
     var project_lock = try @import("../cache_lock.zig").Lock.acquire(io, .cwd(), "build/.fushell-build.lock");
     defer project_lock.deinit();
     var transaction = try bundle_transaction.Transaction.begin(gpa, io, .cwd(), options.bundle_dir);
     defer transaction.deinit();
+    const app_name = try readPubspecName(gpa, io);
+    defer gpa.free(app_name);
+    const final_entry = try std.fs.path.join(gpa, &.{ transaction.output_path, app_name });
+    errdefer gpa.free(final_entry);
     const arch = try flutter_engine_store.nativeArch();
     var store = flutter_engine_store.Store.init(gpa, io, environ, &toolchain.info);
     std.debug.print("[engine] Flutter {s}, Dart {s}, revision {s}\n", .{ toolchain.info.flutter_version, toolchain.info.dart_version, toolchain.info.engine_revision });
+    std.debug.print("[build] Compiling the application and preparing its bundle...\n", .{});
     var future = try io.concurrent(flutter_engine_store.Store.ensure, .{ &store, arch, engineStoreMode(options.mode), flutter_engine_store.ProgressSink{} });
     var awaited = false;
     defer if (!awaited) {
@@ -53,10 +82,12 @@ pub fn assemble(
             var result = value;
             result.deinit(gpa);
         } else |_| {}
+        // Cancellation can leave curl's carriage-return meter unterminated.
+        std.debug.print("\n", .{});
     };
     switch (options.mode) {
-        .debug => try buildDebugBundle(gpa, io, toolchain, options.entrypoint, transaction.staging_path),
-        .release, .profile => try buildAotBundle(gpa, io, toolchain, options.mode, options.entrypoint, transaction.staging_path),
+        .debug => try buildDebugBundle(gpa, io, toolchain, options.entrypoint, transaction.staging_path, app_name, output),
+        .release, .profile => try buildAotBundle(gpa, io, toolchain, options.mode, options.entrypoint, transaction.staging_path, app_name, output),
     }
     const download = future.await(io);
     awaited = true;
@@ -68,7 +99,7 @@ pub fn assemble(
     const copied = try store.copy(arch, engineStoreMode(options.mode), lib_dir);
     defer gpa.free(copied);
     try transaction.commit();
-    std.debug.print("fushell bundle ready: {s}\n", .{options.bundle_dir});
+    return final_entry;
 }
 
 fn buildDebugBundle(
@@ -77,6 +108,8 @@ fn buildDebugBundle(
     toolchain: *const flutter_toolchain.Toolchain,
     entrypoint: []const u8,
     bundle_dir: []const u8,
+    app_name: []const u8,
+    output: *Transcript,
 ) !void {
     var app_config =
         try application_config.loadProject(gpa, io);
@@ -100,12 +133,12 @@ fn buildDebugBundle(
     );
     defer gpa.free(icu_data);
 
-    try runCommand(gpa, io, &.{ toolchain.executable, "pub", "get" });
+    try output.run(.inherit, &.{ toolchain.executable, "pub", "get" });
 
     const platform_arg = try std.fmt.allocPrint(gpa, "--target-platform={s}", .{target_platform});
     defer gpa.free(platform_arg);
 
-    try runCommand(gpa, io, &.{
+    try output.run(.inherit, &.{
         toolchain.executable,
         "build",
         "bundle",
@@ -128,15 +161,15 @@ fn buildDebugBundle(
         try std.fs.path.join(gpa, &.{ data_dir, "flutter_assets" });
     defer gpa.free(data_assets);
 
-    try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
+    try output.run(.inherit, &.{ "mkdir", "-p", data_dir, lib_dir });
 
-    try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
+    try output.run(.inherit, &.{ "cp", icu_data, data_icu });
 
-    try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
+    try output.run(.inherit, &.{ "cp", "-R", "build/flutter_assets", data_assets });
 
-    try copyNixRuntimeLibraries(gpa, io, lib_dir);
+    try copyNixRuntimeLibraries(gpa, output, lib_dir);
 
-    try writeBundleEntry(gpa, io, bundle_dir);
+    try writeBundleEntry(gpa, io, bundle_dir, app_name);
 
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 }
@@ -151,6 +184,8 @@ fn buildAotBundle(
     mode: Mode,
     entrypoint: []const u8,
     bundle_dir: []const u8,
+    app_name: []const u8,
+    output: *Transcript,
 ) !void {
     var app_config = try application_config.loadProject(gpa, io);
     defer app_config.deinit(gpa);
@@ -170,7 +205,7 @@ fn buildAotBundle(
     });
     defer gpa.free(icu_data);
 
-    try runCommand(gpa, io, &.{ toolchain.executable, "pub", "get" });
+    try output.run(.inherit, &.{ toolchain.executable, "pub", "get" });
 
     const platform_arg = try std.fmt.allocPrint(gpa, "-dTargetPlatform={s}", .{target_platform});
     defer gpa.free(platform_arg);
@@ -208,10 +243,10 @@ fn buildAotBundle(
     // Preserve incremental AOT artifacts. Invalidate only when an external
     // deletion removed the symbols Flutter's cache does not track.
     if (!try pathExists(gpa, debug_info)) {
-        try runCommand(gpa, io, &.{ "rm", "-rf", ".dart_tool/flutter_build" });
+        try output.run(.inherit, &.{ "rm", "-rf", ".dart_tool/flutter_build" });
     }
 
-    try runCommand(gpa, io, &.{
+    try output.run(.inherit, &.{
         toolchain.executable,
         "assemble",
         "--no-version-check",
@@ -233,24 +268,13 @@ fn buildAotBundle(
     defer gpa.free(app_so);
 
     if (!try pathExists(gpa, app_so)) {
-        std.debug.print(
-            "libapp.so not found at {s}\n",
-            .{app_so},
-        );
-
-        std.debug.print(
-            "`flutter assemble -dBuildMode={s} {s}` should have produced it.\n",
-            .{
-                @tagName(mode),
-                assemble_target,
-            },
-        );
+        try output.note("libapp.so not found at {s}; flutter assemble target {s} should have produced it.\n", .{ app_so, assemble_target });
 
         return error.MissingLibAppSo;
     }
 
     if (!try pathExists(gpa, debug_info)) {
-        std.debug.print("AOT debug info not found at {s}\n", .{debug_info});
+        try output.note("AOT debug info not found at {s}\n", .{debug_info});
 
         return error.MissingAotDebugInfo;
     }
@@ -273,19 +297,19 @@ fn buildAotBundle(
     const debug_info_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so.symbols" });
     defer gpa.free(debug_info_dest);
 
-    try runCommand(gpa, io, &.{ "mkdir", "-p", data_dir, lib_dir });
+    try output.run(.inherit, &.{ "mkdir", "-p", data_dir, lib_dir });
 
-    try runCommand(gpa, io, &.{ "cp", icu_data, data_icu });
+    try output.run(.inherit, &.{ "cp", icu_data, data_icu });
 
-    try runCommand(gpa, io, &.{ "cp", "-R", "build/flutter_assets", data_assets });
+    try output.run(.inherit, &.{ "cp", "-R", "build/flutter_assets", data_assets });
 
-    try runCommand(gpa, io, &.{ "cp", app_so, app_so_dest });
+    try output.run(.inherit, &.{ "cp", app_so, app_so_dest });
 
-    try runCommand(gpa, io, &.{ "cp", debug_info, debug_info_dest });
+    try output.run(.inherit, &.{ "cp", debug_info, debug_info_dest });
 
-    try copyNixRuntimeLibraries(gpa, io, lib_dir);
+    try copyNixRuntimeLibraries(gpa, output, lib_dir);
 
-    try writeBundleEntry(gpa, io, bundle_dir);
+    try writeBundleEntry(gpa, io, bundle_dir, app_name);
 
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 }
@@ -310,57 +334,25 @@ fn pathExists(gpa: std.mem.Allocator, path: []const u8) !bool {
     return std.c.access(path_z.ptr, std.c.F_OK) == 0;
 }
 
-fn runCommand(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    _ = gpa;
-    std.debug.print("$", .{});
-    for (argv) |arg| std.debug.print(" {s}", .{arg});
-    std.debug.print("\n", .{});
-
-    if (argv.len == 0) return error.CommandFailed;
-
-    // 用 std.process.spawn (需要完整环境解析 PATH, io 由调用方提供: init.io / graph.io)
-    var child = try std.process.spawn(io, .{ .argv = argv });
-    defer child.kill(io);
-    // Child 无 deinit: wait 后由 io 释放 (spawn 的 stdio 管道在 wait 时清理)
-
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                std.debug.print("command exited with status {d}\n", .{code});
-                return error.CommandFailed;
-            }
-        },
-        .signal, .stopped => |sig| {
-            std.debug.print("command terminated by signal {d}\n", .{sig});
-            return error.CommandFailed;
-        },
-        .unknown => return error.CommandFailed,
-    }
-}
-
 /// Nix package 会把可随应用携带的用户态共享库物化到一个 store 目录，并通过环境变量
 /// 传入。这里复制的是普通文件而非 symlink；未设置变量的开发构建继续依赖宿主环境。
-fn copyNixRuntimeLibraries(gpa: std.mem.Allocator, io: std.Io, output_lib_dir: []const u8) !void {
+fn copyNixRuntimeLibraries(gpa: std.mem.Allocator, output: *Transcript, output_lib_dir: []const u8) !void {
     const runtime_root = try envValue(gpa, "FUSHELL_RUNTIME_LIBS") orelse return;
     defer gpa.free(runtime_root);
 
     const source_dir = try std.fs.path.join(gpa, &.{ runtime_root, "lib", "." });
     defer gpa.free(source_dir);
-    try runCommand(gpa, io, &.{ "cp", "-R", source_dir, output_lib_dir });
+    try output.run(.inherit, &.{ "cp", "-R", source_dir, output_lib_dir });
 }
 
 /// 打包入口: 把内嵌的 runner 可执行文件写出为 <bundle_dir>/<app-name> (chmod +x)。
 /// app 名取自项目 pubspec.yaml 的 name 字段 (官方 my_app 同款命名)。
-fn writeBundleEntry(gpa: std.mem.Allocator, io: std.Io, bundle_dir: []const u8) !void {
-    const app_name = try readPubspecName(gpa, io);
-    defer gpa.free(app_name);
+fn writeBundleEntry(gpa: std.mem.Allocator, io: std.Io, bundle_dir: []const u8, app_name: []const u8) !void {
     const entry_path = try std.fs.path.join(gpa, &.{ bundle_dir, app_name });
     defer gpa.free(entry_path);
     var file = try std.Io.Dir.cwd().createFile(io, entry_path, .{ .permissions = .executable_file });
     defer file.close(io);
     try file.writeStreamingAll(io, embedded_runner);
-    std.debug.print("bundle entry: {s}\n", .{entry_path});
 }
 
 /// 解析 pubspec.yaml 的第一层 name (无缩进的 "name:" 行)。
