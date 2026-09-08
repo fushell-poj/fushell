@@ -29,7 +29,7 @@ test "bare invocation and general help" {
 }
 
 test "all help spellings select the same command" {
-    inline for (.{ "build", "run", "sdk", "create" }, .{ cli.Topic.build, .run, .sdk, .create }) |name, topic| {
+    inline for (.{ "build", "run", "sdk", "create", "doctor" }, .{ cli.Topic.build, .run, .sdk, .create, .doctor }) |name, topic| {
         try std.testing.expectEqual(topic, (try parse(&.{ name, "--help" })).help);
         try std.testing.expectEqual(topic, (try parse(&.{ name, "-h" })).help);
         try std.testing.expectEqual(topic, (try parse(&.{ "--help", name })).help);
@@ -82,7 +82,6 @@ test "command declarations reject irrelevant options" {
     try reject(&.{ "run", "--devtools=yes" }, .run, "does not take a value");
     try reject(&.{"unknown"}, .root, "unknown");
     try reject(&.{ "help", "run" }, .root, "help");
-    try reject(&.{"doctor"}, .root, "doctor");
 }
 
 test "run option constraints retain meaningful errors" {
@@ -192,4 +191,14 @@ test "create has its own options and no filesystem side effects" {
     try reject(&.{ "create", "--org=" }, .create, "must not be empty");
     try reject(&.{ "create", "" }, .create, "must not be empty");
     try std.testing.expectEqualStrings("-app", (try parse(&.{ "create", "--", "-app" })).command.create.output.?);
+}
+
+test "doctor options and project are independent from other commands" {
+    const options = (try parse(&.{ "doctor", "my app", "--machine", "-v" })).command.doctor;
+    try std.testing.expectEqualStrings("my app", options.project.?);
+    try std.testing.expect(options.machine and options.verbose);
+    try std.testing.expect((try parse(&.{"doctor"})).command.doctor.project == null);
+    try reject(&.{ "doctor", "a", "b" }, .doctor, "at most one");
+    try reject(&.{ "doctor", "--debug" }, .doctor, "--debug");
+    try reject(&.{ "doctor", "" }, .doctor, "must not be empty");
 }

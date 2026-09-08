@@ -78,7 +78,7 @@ fushell sdk ./vendor
 Debug is the default mode. Build output is written to
 `build/linux/<arch>/<mode>` unless an output directory is supplied.
 
-Use `fushell help <command>` or `fushell <command> --help` for command-specific
+Use `fushell <command> -h` or `fushell <command> --help` for command-specific
 usage. Option values accept both `--vm-service-port=8181` and
 `--vm-service-port 8181`. Syntax errors exit with status 2 and identify the
 relevant command; help exits successfully without requiring a Flutter SDK.
@@ -243,5 +243,22 @@ created project.
 The creation suite tests parser/TTY behavior and failure safety with fake SDK
 processes, then verifies the YAML helper, generated UI tests, static analysis
 and Debug/Profile/Release bundle builds with an actual Flutter 3.41.9 SDK in CI.
-No Wayland/GPU runtime test is implied by these checks. `doctor` is not yet
-implemented.
+No Wayland/GPU runtime test is implied by these checks.
+
+## Diagnose the environment
+
+```sh
+fushell doctor
+fushell doctor --verbose
+fushell doctor --machine ./my_app
+```
+
+Doctor checks the selected Flutter SDK, Engine metadata or verified project
+cache, and desktop sessions. A project path additionally checks real YAML,
+resolved SDK/package URIs and single-instance requirements. It does not build,
+repair project/cache files, or download Engine binaries. Failures are isolated
+and time-bounded; machine output is schema-versioned JSON. Warnings exit 0,
+required-check failures exit 1, and syntax errors exit 2.
+
+See [docs/doctor.md](docs/doctor.md) for exact checks, limitations, network/privacy
+behavior and regression tests.

@@ -265,6 +265,22 @@ pub const ResolvedEngine = struct {
     }
 };
 
+/// Read-only cache state used by diagnostics; it contains no owned pointers.
+pub const CacheInspection = struct {
+    pub const State = enum { missing, unlocked, busy, origin_mismatch, invalid_metadata, inspected };
+    pub const ArtifactState = enum { unchecked, missing, verified, hash_mismatch, invalid_file, unreadable };
+    state: State,
+    modes: [3]ArtifactState = .{ .unchecked, .unchecked, .unchecked },
+
+    pub fn verifiedCount(self: CacheInspection) usize {
+        var count: usize = 0;
+        for (self.modes) |mode| if (mode == .verified) {
+            count += 1;
+        };
+        return count;
+    }
+};
+
 /// Flutter Engine 本地缓存。
 ///
 /// Store 不拥有 `repository` 和 `flutter` 指向的内存，这两个值必须至少
@@ -334,6 +350,68 @@ pub const Store = struct {
             .flutter = flutter,
             .fetcher = fetcher,
         };
+    }
+
+    /// Inspect only: no directories, locks, downloads, repairs or origin writes.
+    /// A shared non-blocking lock avoids racing cooperative cache publication.
+    pub fn inspectCache(self: *const Store, arch: Arch) !CacheInspection {
+        const path = try self.engineDir(arch);
+        defer self.allocator.free(path);
+        const dir = self.root_dir.openDir(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return .{ .state = .missing },
+            else => return err,
+        };
+        defer dir.close(self.io);
+        const lock_stat = dir.statFile(self.io, ".lock", .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return .{ .state = .unlocked },
+            else => return err,
+        };
+        if (lock_stat.kind != .file) return .{ .state = .unlocked };
+        const lock = try dir.openFile(self.io, ".lock", .{});
+        defer lock.close(self.io);
+        if (!try lock.tryLock(self.io, .shared)) return .{ .state = .busy };
+        defer lock.unlock(self.io);
+        if (!try regularFile(dir, self.io, ".repository") or !try regularFile(dir, self.io, "metadata.json")) return .{ .state = .invalid_metadata };
+        const origin = try dir.readFileAlloc(self.io, ".repository", self.allocator, .limited(8192));
+        defer self.allocator.free(origin);
+        if (!std.mem.eql(u8, origin, std.mem.trimEnd(u8, self.repository, "/"))) return .{ .state = .origin_mismatch };
+        const bytes = try dir.readFileAlloc(self.io, "metadata.json", self.allocator, .limited(max_metadata_size));
+        defer self.allocator.free(bytes);
+        var parsed = parseReleaseMetadata(self.allocator, bytes, self.flutter.engine_revision, arch) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .state = .invalid_metadata },
+        };
+        defer parsed.deinit();
+        var result: CacheInspection = .{ .state = .inspected };
+        for ([_]Mode{ .debug, .profile, .release }, 0..) |mode, index| {
+            const artifact = try selectArtifact(&parsed.value, arch, mode);
+            const stat = dir.statFile(self.io, artifact.file, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    result.modes[index] = .missing;
+                    continue;
+                },
+                error.Canceled => return err,
+                else => {
+                    result.modes[index] = .unreadable;
+                    continue;
+                },
+            };
+            if (stat.kind != .file or stat.size > 8 * 1024 * 1024 * 1024) {
+                result.modes[index] = .invalid_file;
+                continue;
+            }
+            const actual = sha256File(dir, self.io, artifact.file) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => {
+                    result.modes[index] = .unreadable;
+                    continue;
+                },
+            };
+            var expected: [32]u8 = undefined;
+            try parseSha256Hex(artifact.sha256, &expected);
+            result.modes[index] = if (std.mem.eql(u8, &actual, &expected)) .verified else .hash_mismatch;
+        }
+        return result;
     }
 
     /// 确保指定架构和模式的 Flutter Engine 已存在于本地缓存。
@@ -1115,6 +1193,11 @@ fn loadMetadata(
     );
     defer allocator.free(bytes);
 
+    return parseMetadataBytes(allocator, bytes);
+}
+
+fn parseMetadataBytes(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Metadata) {
+    if (bytes.len > max_metadata_size) return error.MetadataTooLarge;
     return std.json.parseFromSlice(
         Metadata,
         allocator,
@@ -1127,6 +1210,25 @@ fn loadMetadata(
         error.OutOfMemory => return err,
         else => return error.InvalidMetadata,
     };
+}
+
+/// Parse the same schema/filename/hash rules used by ensure/copy. The owned
+/// parse remains alive while callers inspect artifact names; no borrowed JSON.
+pub fn parseReleaseMetadata(allocator: Allocator, bytes: []const u8, expected_revision: []const u8, arch: Arch) !std.json.Parsed(Metadata) {
+    var parsed = try parseMetadataBytes(allocator, bytes);
+    errdefer parsed.deinit();
+    try validateMetadata(&parsed.value, expected_revision);
+    inline for (.{ Mode.debug, .profile, .release }) |mode|
+        try validateArtifact(try selectArtifact(&parsed.value, arch, mode));
+    return parsed;
+}
+
+fn regularFile(dir: Io.Dir, io: Io, path: []const u8) !bool {
+    const stat = dir.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return stat.kind == .file;
 }
 
 /// 标准 HTTP 下载器。
@@ -1327,10 +1429,11 @@ fn sha256File(
     var hasher = Sha256.init(.{});
 
     while (true) {
-        const n =
-            try reader.interface.readSliceShort(
-                &chunk,
-            );
+        try io.checkCancel();
+        const n = reader.interface.readSliceShort(&chunk) catch |err| {
+            if (err == error.ReadFailed) return reader.err.?;
+            return err;
+        };
 
         if (n == 0)
             break;
@@ -2384,4 +2487,40 @@ test "concurrent ensure calls share one download under a persistent inode lock" 
     try second.await(io);
     try std.testing.expectEqual(@as(usize, 1), fake.metadata_fetches);
     try std.testing.expectEqual(@as(usize, 1), fake.engine_fetches);
+}
+
+test "inspection is non-mutating, detects partial/corrupt cache and respects locks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var flutter = testFlutterInfo();
+    const metadata = try createTestMetadata(a, test_revision, test_engine_bytes);
+    defer a.free(metadata);
+    var fake: FakeFetcher = .{ .metadata = metadata, .engine = test_engine_bytes };
+    var store = Store.initWith(a, io, &env, tmp.dir, "https://example.invalid/engines", "cache", &flutter, fake.asFetcher());
+    try std.testing.expectEqual(CacheInspection.State.missing, (try store.inspectCache(.x86_64)).state);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(io, "cache", .{}));
+    var resolved = try store.ensure(.x86_64, .debug, .{});
+    defer resolved.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), (try store.inspectCache(.x86_64)).verifiedCount());
+    for ([_]Mode{ .profile, .release }) |mode| {
+        var result = try store.ensure(.x86_64, mode, .{});
+        result.deinit(a);
+    }
+    try std.testing.expectEqual(@as(usize, 3), (try store.inspectCache(.x86_64)).verifiedCount());
+    try tmp.dir.writeFile(io, .{ .sub_path = resolved.path, .data = "corrupt" });
+    try std.testing.expectEqual(CacheInspection.ArtifactState.hash_mismatch, (try store.inspectCache(.x86_64)).modes[0]);
+    const retained = try tmp.dir.readFileAlloc(io, resolved.path, a, .limited(100));
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("corrupt", retained);
+    const dir_path = try store.engineDir(.x86_64);
+    defer a.free(dir_path);
+    var lock = try store.acquireLock(dir_path);
+    try std.testing.expectEqual(CacheInspection.State.busy, (try store.inspectCache(.x86_64)).state);
+    lock.deinit();
+    store.repository = "https://other.invalid/engines";
+    try std.testing.expectEqual(CacheInspection.State.origin_mismatch, (try store.inspectCache(.x86_64)).state);
 }

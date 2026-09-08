@@ -2,10 +2,12 @@
 //! Parsing and help never discover Flutter or perform project I/O.
 const std = @import("std");
 const cli = @import("cli");
+const doctor_native = @import("doctor/native.zig");
 const build_command = @import("commands/build.zig");
 const run_command = @import("commands/run.zig");
 const sdk_command = @import("commands/sdk.zig");
 const create_command = @import("commands/create.zig");
+const doctor_command = @import("commands/doctor.zig");
 
 pub fn main(init: std.process.Init) void {
     // Return through execute() before exiting so all command defers run.
@@ -22,6 +24,8 @@ fn execute(init: std.process.Init) !u8 {
     const command_args = if (process_args.len == 0) process_args else process_args[1..];
     const args = try arena.alloc([]const u8, command_args.len);
     for (command_args, args) |arg, *destination| destination.* = arg;
+
+    if (try doctor_native.entry(init, args)) |code| return code;
 
     var diagnostic: cli.Diagnostic = .{};
     const parsed = cli.parse(init.gpa, args, &diagnostic) catch |err| {
@@ -54,6 +58,7 @@ fn dispatch(init: std.process.Init, command: cli.Command) !u8 {
         .run => |options| return run_command.execute(init, options),
         .sdk => |options| try sdk_command.execute(init, options),
         .create => |options| try create_command.execute(init, options),
+        .doctor => |options| return doctor_command.execute(init, options),
     }
     return 0;
 }
@@ -63,4 +68,5 @@ test {
     _ = run_command;
     _ = sdk_command;
     _ = create_command;
+    _ = doctor_command;
 }

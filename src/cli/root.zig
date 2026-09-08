@@ -8,6 +8,7 @@ pub const build = @import("build.zig");
 pub const run = @import("run.zig");
 pub const sdk = @import("sdk.zig");
 pub const create = @import("create.zig");
+pub const doctor = @import("doctor.zig");
 pub const Mode = common.Mode;
 pub const Topic = common.Topic;
 pub const Diagnostic = common.Diagnostic;
@@ -17,6 +18,7 @@ pub const Command = union(enum) {
     run: run.Options,
     sdk: sdk.Options,
     create: create.Options,
+    doctor: doctor.Options,
 };
 /// Help is a parsing outcome, never an executable subcommand.
 pub const ParseResult = union(enum) {
@@ -49,6 +51,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8, diag: *Diag
         .run => .run,
         .sdk => .sdk,
         .create => .create,
+        .doctor => .doctor,
     };
     if (result.args.help != 0) {
         if (rest.len != 0) return diag.reject("unexpected argument after help target", rest[0]);
@@ -58,6 +61,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8, diag: *Diag
         .build => if (try build.parse(allocator, rest, diag)) |options| .{ .command = .{ .build = options } } else .{ .help = .build },
         .run => if (try run.parse(allocator, rest, diag)) |options| .{ .command = .{ .run = options } } else .{ .help = .run },
         .sdk => if (try sdk.parse(allocator, rest, diag)) |options| .{ .command = .{ .sdk = options } } else .{ .help = .sdk },
+        .doctor => if (try doctor.parse(allocator, rest, diag)) |options| .{ .command = .{ .doctor = options } } else .{ .help = .doctor },
         .create => if (try create.parse(allocator, rest, diag)) |options| .{ .command = .{ .create = options } } else .{ .help = .create },
     };
 }
@@ -68,11 +72,12 @@ pub fn help(writer: *std.Io.Writer, topic: Topic) !void {
         .run => return run.help(writer),
         .sdk => return sdk.help(writer),
         .create => return create.help(writer),
+        .doctor => return doctor.help(writer),
         .root => {},
     }
     try writer.writeAll("Fushell - Flutter applications on Linux/Wayland.\n\nUsage: fushell [options] [command] [arguments...]");
     try writer.writeAll("\n\nCommands:\n");
-    inline for (.{ build, run, sdk, create }, .{ "build", "run", "sdk", "create" }) |module, name|
+    inline for (.{ build, run, sdk, create, doctor }, .{ "build", "run", "sdk", "create", "doctor" }) |module, name|
         try writer.print("  {s:<8} {s}\n", .{ name, module.description });
     try writer.writeByte('\n');
     try clap.help(writer, clap.Help, &root_params, common.help_options);
