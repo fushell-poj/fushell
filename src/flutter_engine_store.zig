@@ -1387,7 +1387,7 @@ fn curlFetchWithExecutable(
     });
     // Also terminate and reap on cancellation/wait failure. No-op after wait.
     defer child.kill(io);
-    const term = try child.wait(io);
+    const term = try @import("child_wait.zig").wait(&child, io);
     switch (term) {
         .exited => |code| if (code != 0) {
             std.debug.print("[engine] curl failed with exit status {d}\n", .{code});
@@ -2457,7 +2457,7 @@ test "repository overrides invalidate metadata rather than reuse another origin"
     var second = try store.ensure(.x86_64, .release, .{});
     defer second.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 2), fake.metadata_fetches);
-    // Identical bytes with the new origin's matching digest may be reused.
+    // Identical bytes with the new origin's matching digest may be reused。
     try std.testing.expect(second.from_cache);
 }
 

@@ -7,13 +7,14 @@ const Draft = @import("../project_draft.zig").Draft;
 const Toolchain = @import("../flutter_toolchain.zig").Toolchain;
 const sdk = @import("sdk.zig");
 const Io = std.Io;
+const Transcript = @import("../command_output.zig").Transcript;
 
 /// Preserve inherited proxy/SDK configuration and use argv, never a shell string.
 /// Cancellation reaps the direct child; terminal signals also reach its process group.
 fn run(io: Io, env: *const std.process.Environ.Map, cwd: []const u8, args: []const []const u8) !void {
     var child = try std.process.spawn(io, .{ .argv = args, .environ_map = env, .cwd = .{ .path = cwd }, .stdin = .ignore });
     defer child.kill(io);
-    switch (try child.wait(io)) {
+    switch (try @import("../child_wait.zig").wait(&child, io)) {
         .exited => |code| if (code != 0) {
             std.log.err("{s} exited with status {d}", .{ args[0], code });
             return error.CreateCommandFailed;
@@ -24,6 +25,18 @@ fn run(io: Io, env: *const std.process.Environ.Map, cwd: []const u8, args: []con
         },
         else => return error.CreateCommandFailed,
     }
+}
+
+/// Flutter's scaffold/formatter output describes the private draft, not the
+/// finished Fushell project. Suppress successful output rather than rewriting
+/// Flutter's prose; keep both streams on failure for actionable diagnostics.
+fn runQuiet(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, args: []const []const u8) !void {
+    var output = Transcript.init(gpa, io, env);
+    defer output.deinit();
+    output.run(.{ .path = cwd }, args) catch |err| {
+        output.show();
+        return err;
+    };
 }
 
 pub fn execute(init: std.process.Init, options: cli.create.Options) !void {
@@ -65,7 +78,7 @@ pub fn execute(init: std.process.Init, options: cli.create.Options) !void {
         return error.FlutterToolsConfigUnavailable;
     };
     std.debug.print("Creating Fushell project {s}...\n", .{settings.output});
-    run(io, init.environ_map, cwd, &.{
+    runQuiet(init.gpa, io, init.environ_map, cwd, &.{
         tools.executable,   "create",              "--template=app", "--empty",             "--platforms=linux", "--no-pub",
         "--project-name",   settings.project_name, "--org",          settings.organization, "--description",     settings.description,
         draft.project_path,
@@ -87,7 +100,7 @@ pub fn execute(init: std.process.Init, options: cli.create.Options) !void {
     try draft.workspace.writeFile(io, .{ .sub_path = "request.json", .data = request });
     const script = try std.fs.path.join(a, &.{ draft.workspace_path, "configure.dart" });
     const packages_arg = try std.fmt.allocPrint(a, "--packages={s}", .{package_config});
-    run(io, init.environ_map, cwd, &.{ tools.dart_executable, packages_arg, script, draft.project_path }) catch |err| {
+    runQuiet(init.gpa, io, init.environ_map, cwd, &.{ tools.dart_executable, packages_arg, script, draft.project_path }) catch |err| {
         std.log.err("Fushell project configuration failed; destination was not changed", .{});
         return err;
     };
@@ -103,7 +116,7 @@ pub fn execute(init: std.process.Init, options: cli.create.Options) !void {
     // Format and syntax-check generated files before making the project visible.
     const lib = try std.fs.path.join(a, &.{ draft.project_path, "lib" });
     const tests = try std.fs.path.join(a, &.{ draft.project_path, "test" });
-    try run(io, init.environ_map, cwd, &.{ tools.dart_executable, "format", lib, tests });
+    try runQuiet(init.gpa, io, init.environ_map, cwd, &.{ tools.dart_executable, "format", lib, tests });
     try draft.publish();
 
     if (settings.pub_get) {
@@ -131,4 +144,5 @@ fn shellQuote(writer: *Io.Writer, value: []const u8) !void {
 test {
     _ = prompt;
     _ = Draft;
+    _ = Transcript;
 }

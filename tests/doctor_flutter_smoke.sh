@@ -12,7 +12,17 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 "$dart" --packages="$packages" "$repo/tests/doctor_project_test.dart"
 
-"$binary" create "$work/app"
+if ! "$binary" create "$work/app" > "$work/create.stdout" 2> "$work/create.stderr"; then
+  cat "$work/create.stdout" "$work/create.stderr" >&2
+  exit 1
+fi
+if grep -F '.fushell-create-' "$work/create.stdout" "$work/create.stderr" ||
+   grep -F '$ flutter run' "$work/create.stdout" "$work/create.stderr"; then
+  echo 'create exposed instructions for its private Flutter scaffold' >&2
+  exit 1
+fi
+grep -F "Fushell project created at $work/app." "$work/create.stdout"
+grep -Fx '  fushell run' "$work/create.stdout"
 "$flutter" --version --machine > "$work/flutter.json"
 mkdir "$work/bin"
 python3 - "$work" <<'PY'

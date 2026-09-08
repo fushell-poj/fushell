@@ -50,3 +50,6 @@ printf '%s\n' 'CLI smoke checks passed (no Flutter SDK or display required).'
 
 # Run diagnostic behavior as well as parser/help checks in the ordinary CI.
 python3 "$(dirname "${BASH_SOURCE[0]}")/doctor_smoke.py" "$binary"
+
+# Temporary staging paths must not be advertised as usable final outputs.
+python3 "$(dirname "${BASH_SOURCE[0]}")/output_smoke.py" "$binary"
