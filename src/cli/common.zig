@@ -3,7 +3,7 @@ const std = @import("std");
 const clap = @import("clap");
 
 pub const Mode = enum { debug, profile, release };
-pub const Topic = enum { root, build, run, sdk, create };
+pub const Topic = enum { root, build, run, sdk, create, doctor };
 
 pub const help_spec =
     \\-h, --help  Show this command's help and exit.

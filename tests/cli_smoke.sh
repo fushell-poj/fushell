@@ -15,7 +15,7 @@ no_flutter() {
 no_flutter > "$work/root"
 no_flutter --help > "$work/root-help"
 cmp "$work/root" "$work/root-help"
-for command in build run sdk create; do
+for command in build run sdk create doctor; do
   no_flutter "$command" --help > "$work/$command-help"
   no_flutter "$command" -h > "$work/$command-alias"
   cmp "$work/$command-help" "$work/$command-alias"
@@ -39,9 +39,14 @@ grep -q -- '--unknown' "$work/stderr"
 expect_usage_error help
 expect_usage_error create --overwrite app
 expect_usage_error sdk one two
+expect_usage_error doctor one two
+expect_usage_error doctor --debug
 
 no_flutter sdk "$work/sdk output" > "$work/sdk-stdout" 2> "$work/sdk-stderr"
 test -s "$work/sdk output/fushell/pubspec.yaml"
 test -s "$work/sdk output/fushell/lib/fushell.dart"
 test -s "$work/sdk output/fushell/README.md"
 printf '%s\n' 'CLI smoke checks passed (no Flutter SDK or display required).'
+
+# Run diagnostic behavior as well as parser/help checks in the ordinary CI.
+python3 "$(dirname "${BASH_SOURCE[0]}")/doctor_smoke.py" "$binary"

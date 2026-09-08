@@ -62,3 +62,13 @@ jobs:
         run: zig build test --summary all
       - name: ReleaseFast build
         run: zig build -Doptimize=ReleaseFast --summary all
+      - name: Install Flutter for doctor project diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch 3.47.0 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
+          echo "FLUTTER_ROOT=$RUNNER_TEMP/flutter" >> "$GITHUB_ENV"
+      - name: Doctor with real Flutter project metadata
+        shell: bash
+        run: bash tests/doctor_flutter_smoke.sh ./zig-out/bin/fushell
