@@ -16,10 +16,31 @@ pub const Settings = struct {
     pub_get: bool,
 };
 
-pub fn validProjectName(value: []const u8) bool {
-    if (value.len == 0 or std.mem.eql(u8, value, "fushell") or !std.ascii.isLower(value[0])) return false;
-    for (value) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and c != '_') return false;
-    return true; // Flutter performs the remaining Dart reserved-name checks.
+pub const ProjectNameError = error{
+    EmptyProjectName,
+    ProjectNameEqFushell,
+    ProjectNameMustStartWithLowercase,
+    ProjectNameContainsInvalidCharacter,
+};
+
+pub fn validateProjectName(value: []const u8) ProjectNameError!void {
+    if (value.len == 0)
+        return error.EmptyProjectName;
+
+    if (std.mem.eql(u8, value, "fushell"))
+        return error.ProjectNameEqFushell;
+
+    if (!std.ascii.isLower(value[0]))
+        return error.ProjectNameMustStartWithLowercase;
+
+    for (value) |c| {
+        if (!std.ascii.isLower(c) and
+            !std.ascii.isDigit(c) and
+            c != '_')
+        {
+            return error.ProjectNameContainsInvalidCharacter;
+        }
+    }
 }
 
 /// Resolve defaults using the final output name, never a random staging name.
@@ -28,7 +49,7 @@ pub fn resolve(arena: Allocator, cwd: []const u8, options: cli.create.Options) !
     if (output.len == 0 or std.mem.indexOfScalar(u8, output, 0) != null) return error.InvalidProjectDirectory;
     const absolute = try std.fs.path.resolve(arena, &.{ cwd, output });
     const name = options.project_name orelse std.fs.path.basename(absolute);
-    if (!validProjectName(name)) return error.InvalidProjectName;
+    try validateProjectName(name);
     const org = options.organization orelse "com.example";
     if (!config.isValidApplicationId(try std.fmt.allocPrint(arena, "{s}.App", .{org}))) return error.InvalidOrganization;
     const id = options.application_id orelse try std.fmt.allocPrint(arena, "{s}.{s}", .{ org, name });
@@ -56,6 +77,17 @@ fn yesNo(arena: Allocator, reader: *Io.Reader, writer: *Io.Writer, label: []cons
     }
 }
 
+fn defaultProjectName(arena: Allocator, path: []const u8) ![]const u8 {
+    const basename = std.fs.path.basename(path);
+    const name = try arena.dupe(u8, basename);
+
+    for (name) |*c| {
+        if (c.* == '-') c.* = '_';
+    }
+
+    return name;
+}
+
 /// CLI overrides are never prompted again. null means an explicit cancellation;
 /// EOF/interrupt is error.UserInterrupt. All interaction finishes before writes.
 pub fn collect(arena: Allocator, cwd: []const u8, options: cli.create.Options, reader: *Io.Reader, writer: *Io.Writer) !?Settings {
@@ -70,10 +102,39 @@ pub fn collect(arena: Allocator, cwd: []const u8, options: cli.create.Options, r
     }
     const path = try std.fs.path.resolve(arena, &.{ cwd, selected.output.? });
     if (selected.project_name == null) {
+        const default_name = try defaultProjectName(arena, path);
+
         while (true) {
-            selected.project_name = try answer(arena, reader, writer, "Project name", std.fs.path.basename(path));
-            if (validProjectName(selected.project_name.?)) break;
-            try writer.writeAll("Use a lowercase Dart package name; 'fushell' is reserved for the SDK.\n");
+            selected.project_name = try answer(
+                arena,
+                reader,
+                writer,
+                "Project name",
+                default_name,
+            );
+
+            validateProjectName(selected.project_name.?) catch |err| switch (err) {
+                error.EmptyProjectName => {
+                    try writer.writeAll("Project name cannot be empty.\n");
+                    continue;
+                },
+                error.ProjectNameEqFushell => {
+                    try writer.writeAll("'fushell' is reserved for the Fushell SDK.\n");
+                    continue;
+                },
+                error.ProjectNameMustStartWithLowercase => {
+                    try writer.writeAll("Project name must start with a lowercase letter.\n");
+                    continue;
+                },
+                error.ProjectNameContainsInvalidCharacter => {
+                    try writer.writeAll(
+                        "Project name may contain only lowercase letters, digits, and underscores.\n",
+                    );
+                    continue;
+                },
+            };
+
+            break;
         }
     }
     if (selected.organization == null) {
