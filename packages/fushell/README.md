@@ -10,6 +10,55 @@ window's content to the corresponding `FlutterView` with the framework's
 `View`/`ViewCollection` widgets. Closing **all** windows does not exit the
 process; call `FushellProcess.exit` to terminate. Framework `SystemMouseCursors` work automatically through the native Wayland cursor-shape protocol when the compositor supports it; no Dart-side cursor API is required.
 
+## Status notifier tray host
+
+Import `package:fushell/tray.dart` for the pure Dart SNI host and DBusMenu client.
+The transport uses the session D-Bus and needs no Flutter plugin registration.
+
+```dart
+import 'package:fushell/tray.dart';
+
+final host = await TrayHost.connect();
+void renderItems() {
+  for (final item in host.items) {
+    print('${item.title}: ${item.status}');
+  }
+}
+final subscription = host.changes.listen((_) => renderItems());
+renderItems(); // Also render the current snapshot.
+// await item.activate();
+// final menu = await item.loadMenu();
+// await menu?.event(menuItemId);
+// await menu?.close();
+// At shutdown:
+await subscription.cancel();
+await host.close();
+```
+
+A host reuses an existing `org.kde.StatusNotifierWatcher`. If none exists,
+it exports a fallback watcher without replacing or queueing behind another
+owner. Multiple hosts may coexist; each registers a unique host name. Watcher
+owner changes clear stale items and trigger registration and discovery again.
+Applications must re-register after a watcher disappears; their old registry
+cannot be recovered from D-Bus. Reconnect the host if the session bus itself is
+restarted. `lastError` and `watcherOwner` are available for diagnostics.
+
+`TrayItem` exposes metadata, status, tooltip, theme icon names/paths and raw
+ARGB pixmaps (including attention and overlay icons). It supports activation,
+secondary activation, context menus and scrolling. Each item is bound to its
+unique service owner, so stale handles never send actions to a replacement app.
+`TrayMenu` exposes a live immutable layout, `AboutToShow` and menu events.
+Menu nodes preserve visibility, enabled state, separators, toggles and submenus.
+Rendering, icon-theme lookup and screen coordinates belong to the application.
+Close menu transports when done. Sharing an explicitly supplied `DBusClient`
+is supported; close all hosts before closing that client. The host only closes
+a client it created itself.
+
+This supports modern StatusNotifierItem/DBusMenu trays, not legacy XEmbed.
+See `examples/tray_preview` in the repository for a live Flutter inspector and
+a standalone demo item. Run protocol integration tests with `flutter test`
+from `packages/fushell`; the tray tests create their own private `dbus-daemon`.
+
 ## Command-line interface
 
 The installed developer tool is `fushell`, and all operations use explicit

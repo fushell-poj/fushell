@@ -1,0 +1,21 @@
+name: tray_preview
+description: Live StatusNotifierItem host and DBusMenu debugging window.
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ">=3.8.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  fushell:
+    path: ../../packages/fushell
+  dbus: ^0.7.15
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

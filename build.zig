@@ -138,6 +138,11 @@ pub fn build(b: *std.Build) void {
     build_tool_mod.addAnonymousImport("fushell_sdk_lib", .{
         .root_source_file = b.path("packages/fushell/lib/fushell.dart"),
     });
+    inline for (.{ "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher" }) |file| {
+        build_tool_mod.addAnonymousImport("fushell_sdk_" ++ file, .{
+            .root_source_file = b.path("packages/fushell/lib/" ++ file ++ ".dart"),
+        });
+    }
     build_tool_mod.addAnonymousImport("fushell_sdk_readme", .{
         .root_source_file = b.path("packages/fushell/README.md"),
     });

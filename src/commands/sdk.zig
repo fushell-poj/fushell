@@ -4,6 +4,7 @@ const cli = @import("cli");
 const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
 const embedded_sdk_lib = @embedFile("fushell_sdk_lib");
 const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
+const tray_files = .{ "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher" };
 
 pub fn execute(init: std.process.Init, options: cli.sdk.Options) !void {
     const target = try exportPackage(init.gpa, init.io, options.output);
@@ -40,6 +41,17 @@ pub fn exportPackage(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 
     var lib_file = try std.Io.Dir.cwd().createFile(io, lib_path, .{});
     defer lib_file.close(io);
     try lib_file.writeStreamingAll(io, embedded_sdk_lib);
+
+    const tray_dir = try std.fs.path.join(gpa, &.{ lib_dir, "src", "tray" });
+    defer gpa.free(tray_dir);
+    try std.Io.Dir.cwd().createDirPath(io, tray_dir);
+    inline for (tray_files) |file| {
+        const path = try std.fs.path.join(gpa, &.{ lib_dir, file ++ ".dart" });
+        defer gpa.free(path);
+        var output = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer output.close(io);
+        try output.writeStreamingAll(io, @embedFile("fushell_sdk_" ++ file));
+    }
 
     // 写 README.md
     const readme_path = try std.fs.path.join(gpa, &.{ target, "README.md" });
@@ -90,4 +102,14 @@ test "released SDK matches the canonical embedded package byte-for-byte" {
     try std.testing.expectEqualSlices(u8, embedded_sdk_pubspec, pubspec);
     try std.testing.expectEqualSlices(u8, embedded_sdk_lib, library);
     try std.testing.expectEqualSlices(u8, embedded_sdk_readme, readme);
+    inline for (tray_files) |file| {
+        const content = try tmp.dir.readFileAlloc(
+            std.testing.io,
+            "fushell/lib/" ++ file ++ ".dart",
+            std.testing.allocator,
+            .limited(1024 * 1024),
+        );
+        defer std.testing.allocator.free(content);
+        try std.testing.expectEqualSlices(u8, @embedFile("fushell_sdk_" ++ file), content);
+    }
 }
