@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:fushell/fushell.dart';
+import 'package:fushell/windows.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,6 +17,7 @@ Future<void> main() async {
 }
 
 final class _DaemonModel extends ChangeNotifier {
+  final FushellWindowController windowOwner = FushellWindowController();
   final Map<int, String> _windows = <int, String>{};
   final Set<int> _closedWindowIds = <int>{};
 
@@ -47,13 +49,15 @@ final class _DaemonModel extends ChangeNotifier {
         final String title = arguments.length > 1
             ? arguments.skip(1).join(' ')
             : 'Singleton window';
-        final int id = await FushellWindow.openWindow(
-          title: title,
-          appId: 'dev.fushell.SingletonExample',
-          width: 720,
-          height: 480,
+        final window = await windowOwner.open(
+          create: () => FushellWindow.openWindow(
+            title: title,
+            appId: 'dev.fushell.SingletonExample',
+            width: 720,
+            height: 480,
+          ),
         );
-        await FushellWindow.viewById(id);
+        final id = window.windowId;
         _windows[id] = title;
         notifyListeners();
         await output.writeStdoutText('$id\n');
@@ -79,7 +83,9 @@ final class _DaemonModel extends ChangeNotifier {
           await output.writeStderrText('unknown window: ${arguments[1]}\n');
           return FushellCommandResult(exitCode: 66);
         }
-        await FushellWindow.closeWindow(id);
+        await windowOwner.windows
+            .firstWhere((window) => window.windowId == id)
+            .close();
         _windows.remove(id);
         notifyListeners();
         return FushellCommandResult();
@@ -227,56 +233,51 @@ final class _DaemonRoot extends StatefulWidget {
   State<_DaemonRoot> createState() => _DaemonRootState();
 }
 
-final class _DaemonRootState extends State<_DaemonRoot>
-    with WidgetsBindingObserver {
+final class _DaemonRootState extends State<_DaemonRoot> {
   late final StreamSubscription<FushellWindowClosedEvent> _closedSubscription;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _closedSubscription = FushellWindow.closed.listen(
-      (FushellWindowClosedEvent event) =>
-          widget.model.removeWindow(event.windowId),
+      (event) => widget.model.removeWindow(event.windowId),
     );
   }
 
   @override
   void dispose() {
     unawaited(_closedSubscription.cancel());
-    WidgetsBinding.instance.removeObserver(this);
+    unawaited(
+      widget.model.windowOwner.dispose().catchError((
+        Object error,
+        StackTrace stack,
+      ) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stack,
+            library: 'fushell example',
+            context: ErrorDescription('while disposing owned windows'),
+          ),
+        );
+      }),
+    );
     super.dispose();
   }
 
   @override
-  void didChangeMetrics() {
-    widget.model.reconcileViews();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: widget.model,
-      builder: (BuildContext context, Widget? child) {
-        final Map<int, ui.FlutterView> views = <int, ui.FlutterView>{
-          for (final ui.FlutterView view
-              in ui.PlatformDispatcher.instance.views)
-            view.viewId: view,
-        };
-        return ViewCollection(
-          views: <Widget>[
-            for (final MapEntry<int, String> entry
-                in widget.model.windows.entries)
-              if (views[entry.key] case final ui.FlutterView view)
-                View(
-                  view: view,
-                  child: _WindowApp(windowId: entry.key, title: entry.value),
-                ),
-          ],
-        );
-      },
-    );
-  }
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: widget.model,
+    builder: (context, child) => FushellWindowViews(
+      views: () => ui.PlatformDispatcher.instance.views.where(
+        (view) => widget.model.windows.containsKey(view.viewId),
+      ),
+      builder: (context, view) => _WindowApp(
+        windowId: view.viewId,
+        title: widget.model.windows[view.viewId]!,
+      ),
+    ),
+  );
 }
 
 final class _WindowApp extends StatelessWidget {

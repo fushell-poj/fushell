@@ -51,6 +51,8 @@ final class FushellCommandOutputClosedException implements Exception {
 /// [FushellCommandInvocation.output] 提供，不能脱离 invocation 构造。
 /// text helper 会先
 /// 完整 UTF-8 编码并预检 quota，再串行发送分片，不会无界缓存后续 frame。
+/// 已开始的 write 失败会关闭 writer，并使 command 以 70 完成，即使 handler
+/// 捕获该错误或未等待 write。同步参数/quota/并发预检失败不会关闭 writer。
 final class FushellCommandOutput {
   FushellCommandOutput._({required int id}) : _id = id;
 
@@ -61,6 +63,8 @@ final class FushellCommandOutput {
   bool _cancelled = false;
   Future<void>? _inFlight;
   Completer<void>? _inFlightCompleter;
+  Object? _terminalFailure;
+  StackTrace? _terminalFailureStackTrace;
 
   /// 以一个完整 raw frame 写入 stdout；bytes 不会被转码或改写。
   Future<void> writeStdout(Uint8List bytes) => _writeRaw(1, bytes);
@@ -164,11 +168,15 @@ final class FushellCommandOutput {
     _inFlight = null;
     _inFlightCompleter = null;
     if (_cancelled) {
-      completer.completeError(const FushellCommandOutputCancelledException());
+      _terminalFailure = const FushellCommandOutputCancelledException();
+      _terminalFailureStackTrace = stackTrace ?? StackTrace.current;
+      completer.completeError(_terminalFailure!, _terminalFailureStackTrace);
     } else if (error != null) {
       _closed = true;
       _generation++;
-      completer.completeError(error, stackTrace ?? StackTrace.current);
+      _terminalFailure = error;
+      _terminalFailureStackTrace = stackTrace ?? StackTrace.current;
+      completer.completeError(error, _terminalFailureStackTrace);
     } else {
       completer.complete();
     }
@@ -192,6 +200,10 @@ final class FushellCommandOutput {
   Future<void> _awaitIdle() async {
     final Future<void>? pending = _inFlight;
     if (pending != null) await pending;
+    final Object? failure = _terminalFailure;
+    if (failure != null) {
+      Error.throwWithStackTrace(failure, _terminalFailureStackTrace!);
+    }
   }
 
   void _cancel() {
@@ -669,14 +681,10 @@ final class FushellWindow {
       ...request,
     };
 
-    final ByteData message = _encodeJson(requestWithId);
-    final Completer<ByteData?> response = Completer<ByteData?>();
-    ui.PlatformDispatcher.instance.sendPlatformMessage(
-      _surfaceChannel,
-      message,
-      response.complete,
-    );
-    final ByteData? responseData = await response.future;
+    final ByteData? responseData = await ServicesBinding
+        .instance
+        .defaultBinaryMessenger
+        .send(_surfaceChannel, _encodeJson(requestWithId));
     if (responseData == null) {
       throw const FushellSurfaceException(
         code: 'NoResponse',
@@ -684,14 +692,22 @@ final class FushellWindow {
       );
     }
 
-    final Object? decoded = jsonDecode(
-      utf8.decode(
-        responseData.buffer.asUint8List(
-          responseData.offsetInBytes,
-          responseData.lengthInBytes,
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(
+        utf8.decode(
+          responseData.buffer.asUint8List(
+            responseData.offsetInBytes,
+            responseData.lengthInBytes,
+          ),
         ),
-      ),
-    );
+      );
+    } on FormatException {
+      throw const FushellSurfaceException(
+        code: 'InvalidResponse',
+        message: 'fushell returned malformed JSON or UTF-8 for surface request',
+      );
+    }
     if (decoded is! Map<String, Object?>) {
       throw const FushellSurfaceException(
         code: 'InvalidResponse',
@@ -726,8 +742,10 @@ final class FushellProcess {
   ///
   /// platform loop 会在活动应用命令 reply 发出后停止，随后关闭 Flutter、销毁全部
   /// 窗口，并断开 Wayland/D-Bus。该请求不等待响应，因为 isolate 可能在
-  /// platform-channel response 送达前终止。
+  /// platform-channel response 送达前终止。无效状态码以 [RangeError] 拒绝。
+  /// 同步发送错误会传给调用方；发送后的异步传输错误仅记录诊断。
   static Future<void> exit([int code = 0]) async {
+    RangeError.checkValueInInterval(code, 0, 255, 'code');
     final int requestId = FushellWindow._nextRequestId++;
     final ByteData message = _encodeJson(<String, Object?>{
       'id': requestId,
@@ -735,10 +753,17 @@ final class FushellProcess {
       'code': code,
     });
     // 进程即将退出, 响应可能收不到 — 不等待。
-    ui.PlatformDispatcher.instance.sendPlatformMessage(
-      _surfaceChannel,
-      message,
-      (_) {},
+    unawaited(
+      ServicesBinding.instance.defaultBinaryMessenger
+          .send(_surfaceChannel, message)
+          ?.then<void>(
+            (_) {},
+            onError: (Object error, StackTrace stackTrace) {
+              debugPrint(
+                'Unable to send process exit request: $error\n$stackTrace',
+              );
+            },
+          ),
     );
   }
 }

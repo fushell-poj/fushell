@@ -27,3 +27,5 @@ flutter test
 ```
 
 Tests cover out-of-order requests, stable rebuilds, explicit refresh, late errors after disposal, missing/error fallbacks, and file rendering. GUI integration must be validated separately in an isolated compositor.
+
+`FushellWindowViews` tracks view additions/removals with stable per-view keys. Its `onLastViewClosed` callback explicitly calls `FushellProcess.exit`, including the first closure of a view present at the initial build. An empty startup does not exit. Native window closure and process exit remain separate SDK operations.

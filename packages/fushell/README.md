@@ -179,8 +179,14 @@ For example, after the first process is running headlessly:
 bytes; applications may choose their own decoding policy. `isInitial` marks the
 first process invocation. Commands are processed in arrival order with one
 active callback at a time. Secondary processes receive streaming stdout/stderr
-frames before the handler completes and the final exit code afterward. A handler exception becomes exit code 70. If a callback
-exceeds 30 seconds, its caller receives 124, the active invocation's `cancelled`
+frames before the handler completes and the final exit code afterward. A handler
+exception becomes exit code 70. A started output write that fails also makes the
+command complete with 70, even if the handler catches the write error, returns
+another exit code, or does not await the write. This rule is independent of whether
+the failure arrives before or after the handler returns. The failed writer closes;
+synchronous size, quota, and concurrent-write preflight errors do not close it.
+
+If a callback exceeds 30 seconds, its caller receives 124, the active invocation's `cancelled`
 future completes, and `isCancellationRequested` becomes true. The handler then
 has a two-second grace period to release resources and return. If it still does not
 finish, the daemon rejects queued calls, exits cleanly, and the next invocation
@@ -247,6 +253,45 @@ final subscription = FushellWindow.closed.listen((event) {
 // Explicit process exit (headless shell termination).
 await FushellProcess.exit(0);
 ```
+
+Exit codes outside `0..255` fail locally with `RangeError`. Exit remains fire-and-forget:
+its Future does not wait for a native response. A synchronous transport failure
+reaches the caller; a later asynchronous send failure is logged.
+
+## Optional window helpers
+
+Import `package:fushell/windows.dart` for lifecycle helpers layered over the primitive
+window API. `FushellWindowViews` rebuilds a keyed `ViewCollection` as views change;
+its builder runs below each `View` so `View.of(context)` is available. Use
+`runWidget` for this root. The optional `onLastViewClosed` callback lets the
+application choose whether to exit; initial emptiness does not invoke it.
+
+```dart
+import 'package:fushell/fushell.dart';
+import 'package:fushell/windows.dart';
+
+final windows = FushellWindowController();
+final window = await windows.open(
+  create: () => FushellWindow.openWindow(title: 'Settings', appId: 'my.settings'),
+);
+// window.windowId and window.view are ready; window.close() is idempotent.
+await window.close();
+await windows.dispose();
+```
+
+The controller exposes ready handles through `windows` and implements
+`Listenable`. Disposing it cancels view-readiness waits and closes owned windows,
+including IDs returned by an already-pending native create. A native create that
+never replies keeps disposal pending. Failed closes retain ownership so cleanup
+can be retried; callers must await or handle open, close, and disposal failures.
+For an owned subset, pass `views: () => windows.windows.map((w) => w.view)` and
+`listenable: windows` to `FushellWindowViews`. The controller and widget expose
+optional view/event/close callbacks for local testing without global overrides.
+
+Surface requests use Flutter's standard `BinaryMessenger`; tests can mock
+`dev.fushell/surface` directly. Malformed JSON, UTF-8, and non-object replies
+raise `FushellSurfaceException` with code `InvalidResponse`. Missing replies use
+`NoResponse`, and native failure replies preserve their error code and message.
 
 ## Layer-shell windows
 

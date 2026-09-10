@@ -54,3 +54,5 @@ syntax, behavior, output, and exit status. Business output uses
 Production handlers should observe `invocation.cancelled` during long-running
 work and check `invocation.isCancellationRequested` at safe boundaries so they
 can release resources before Fushell's two-second recovery grace period expires.
+
+Window content uses `FushellWindowViews` for stable per-view state. `FushellWindowController` owns each create/readiness operation and rolls back failed attachment; root disposal reclaims pending and ready windows. Closing the last native window deliberately keeps the daemon running; `quit` explicitly exits the process.

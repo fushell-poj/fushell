@@ -10,8 +10,9 @@ final class TrayIconPixmap {
 }
 
 List<TrayIconPixmap> _pixmaps(DBusValue? value) {
-  if (value == null || value.signature != DBusSignature('a(iiay)'))
+  if (value == null || value.signature != DBusSignature('a(iiay)')) {
     return const [];
+  }
   final result = <TrayIconPixmap>[];
   for (final entry in value.asArray()) {
     final fields = entry.asStruct();
@@ -149,8 +150,9 @@ final class TrayItem {
   Future<void> contextMenu({int x = 0, int y = 0}) =>
       _call('ContextMenu', [DBusInt32(x), DBusInt32(y)]);
   Future<void> scroll(int delta, {String orientation = 'vertical'}) {
-    if (orientation != 'vertical' && orientation != 'horizontal')
+    if (orientation != 'vertical' && orientation != 'horizontal') {
       throw ArgumentError.value(orientation, 'orientation');
+    }
     return _call('Scroll', [DBusInt32(delta), DBusString(orientation)]);
   }
 

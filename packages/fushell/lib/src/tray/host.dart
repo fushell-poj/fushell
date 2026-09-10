@@ -204,8 +204,9 @@ final class TrayHost {
     if (_closed ||
         signal.sender != _watcherOwner ||
         signal.values.length != 1 ||
-        signal.values.first is! DBusString)
+        signal.values.first is! DBusString) {
       return;
+    }
     final added = signal.name == 'StatusNotifierItemRegistered';
     if (!added && signal.name != 'StatusNotifierItemUnregistered') return;
     final name = signal.values.first.asString();
@@ -250,8 +251,9 @@ final class TrayHost {
       _items[key] = item;
       await item._start();
       if (!current() || !identical(_items[key], item)) {
-        if (identical(_items[key], item) && !_aliases.containsValue(key))
+        if (identical(_items[key], item) && !_aliases.containsValue(key)) {
           _items.remove(key);
+        }
         if (!identical(_items[key], item)) await item._close();
         return;
       }

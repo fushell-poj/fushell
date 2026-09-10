@@ -159,8 +159,9 @@ final class _FallbackWatcher extends DBusObject {
       : DBusMethodErrorResponse.unknownInterface();
   @override
   Future<DBusMethodResponse> getProperty(String interface, String name) async {
-    if (interface != _watcherName)
+    if (interface != _watcherName) {
       return DBusMethodErrorResponse.unknownInterface();
+    }
     final value = _properties[name];
     return value == null
         ? DBusMethodErrorResponse.unknownProperty()
@@ -169,14 +170,16 @@ final class _FallbackWatcher extends DBusObject {
 
   @override
   Future<DBusMethodResponse> handleMethodCall(DBusMethodCall call) async {
-    if (call.interface != _watcherName)
+    if (call.interface != _watcherName) {
       return DBusMethodErrorResponse.unknownInterface();
+    }
     if (call.name != 'RegisterStatusNotifierItem' &&
         call.name != 'RegisterStatusNotifierHost') {
       return DBusMethodErrorResponse.unknownMethod();
     }
-    if (call.signature != DBusSignature('s') || call.sender == null)
+    if (call.signature != DBusSignature('s') || call.sender == null) {
       return DBusMethodErrorResponse.invalidArgs();
+    }
     if (_closed) return DBusMethodErrorResponse.failed('Watcher is closing');
     final argument = call.values.first.asString();
     final isItem = call.name == 'RegisterStatusNotifierItem';

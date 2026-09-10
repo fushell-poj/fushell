@@ -21,8 +21,9 @@ final class TrayMenuNode {
   bool get isSubmenu => _string(properties, 'children-display') == 'submenu';
 
   static TrayMenuNode _decode(DBusValue value, [int depth = 0]) {
-    if (depth > 64)
+    if (depth > 64) {
       throw const FormatException('Menu nesting exceeds 64 levels');
+    }
     final fields = value.asStruct();
     return TrayMenuNode._(
       fields[0].asInt32(),

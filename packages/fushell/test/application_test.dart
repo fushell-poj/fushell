@@ -14,14 +14,20 @@ void main() {
   late List<MethodCall> nativeCalls;
   late Future<Object?> Function(MethodCall) nativeResponse;
   late MethodChannel channel;
-
+  late Map<int, Completer<void>> completions;
   setUp(() {
     nativeCalls = <MethodCall>[];
+    completions = <int, Completer<void>>{};
     nativeResponse = (_) async => null;
     channel = const MethodChannel(_channelName, _codec);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (MethodCall call) {
           nativeCalls.add(call);
+          if (call.method == 'complete') {
+            final int id =
+                (call.arguments! as Map<Object?, Object?>)['id']! as int;
+            completions.putIfAbsent(id, () => Completer<void>()).complete();
+          }
           return nativeResponse(call);
         });
   });
@@ -40,19 +46,8 @@ void main() {
     return response;
   }
 
-  Future<void> waitForComplete(int id) async {
-    for (var attempt = 0; attempt < 100; attempt++) {
-      if (nativeCalls.any(
-        (MethodCall call) =>
-            call.method == 'complete' &&
-            (call.arguments! as Map<Object?, Object?>)['id'] == id,
-      )) {
-        return;
-      }
-      await Future<void>.delayed(Duration.zero);
-    }
-    fail('completion for invocation $id was not sent');
-  }
+  Future<void> waitForComplete(int id) =>
+      completions.putIfAbsent(id, () => Completer<void>()).future;
 
   Future<void> dispatchAndWait(Map<String, Object?> arguments) async {
     await _dispatch(arguments);
@@ -508,6 +503,67 @@ void main() {
       expect(completion.arguments, <String, Object?>{'id': 13, 'exitCode': 70});
     },
   );
+
+  for (final bool failBeforeReturn in <bool>[true, false]) {
+    for (final bool catchWriteError in <bool>[true, false]) {
+      if (catchWriteError && !failBeforeReturn) continue;
+      test(
+        'failed output exits 70: early=$failBeforeReturn caught=$catchWriteError',
+        () async {
+          final Completer<void> response = deferNativeWrites();
+          final Completer<void> started = Completer<void>();
+          final Completer<void> finishHandler = Completer<void>();
+          late Future<void> write;
+          late FushellCommandOutput output;
+          await FushellApplication.run(
+            onCommand: (invocation) async {
+              output = invocation.output;
+              write = output.writeStdoutText('fails');
+              started.complete();
+              if (catchWriteError) {
+                try {
+                  await write;
+                } on FushellCommandOutputClosedException {
+                  // A handled writer failure must still override exitCode 23.
+                }
+              } else {
+                unawaited(write);
+              }
+              await finishHandler.future;
+              return FushellCommandResult(exitCode: 23);
+            },
+          );
+          await _dispatchId(17);
+          await started.future;
+          final Future<void> settled = expectLater(
+            write,
+            throwsA(isA<FushellCommandOutputClosedException>()),
+          );
+          if (!failBeforeReturn) finishHandler.complete();
+          response.completeError(
+            PlatformException(code: 'ApplicationOutputClosed'),
+          );
+          await settled;
+          if (failBeforeReturn) {
+            expect(
+              () => output.writeStdoutText('after failure'),
+              throwsA(isA<FushellCommandOutputClosedException>()),
+            );
+            finishHandler.complete();
+          }
+          await waitForComplete(17);
+          expect(
+            nativeCalls.where((call) => call.method == 'write'),
+            hasLength(1),
+          );
+          expect(nativeCalls.last.arguments, <String, Object?>{
+            'id': 17,
+            'exitCode': 70,
+          });
+        },
+      );
+    }
+  }
 
   test('cancelled unawaited write has no uncaught zone error', () async {
     final Completer<void> response = deferNativeWrites();

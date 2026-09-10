@@ -164,12 +164,10 @@ class IconResolver {
       String themeName, {
       String? directPath,
     }) async {
-      if (!_safeName(themeName) || !visited.add(directPath ?? themeName))
+      if (!_safeName(themeName) || !visited.add(directPath ?? themeName)) {
         return null;
-      final paths = [
-        if (directPath != null) directPath,
-        for (final root in roots) '$root/$themeName',
-      ];
+      }
+      final paths = [?directPath, for (final root in roots) '$root/$themeName'];
       Map<String, Map<String, String>>? index;
       for (final path in paths) {
         index = await indexes.putIfAbsent(path, () => _readIndex(path));
@@ -449,8 +447,9 @@ class SystemIconThemeDetector {
   static String? _variantTheme(String value) {
     if (value.length < 2) return null;
     final quote = value[0];
-    if ((quote != "'" && quote != '"') || value[value.length - 1] != quote)
+    if ((quote != "'" && quote != '"') || value[value.length - 1] != quote) {
       return null;
+    }
     final result = StringBuffer();
     for (var index = 1; index < value.length - 1; index++) {
       var character = value[index];
@@ -458,8 +457,9 @@ class SystemIconThemeDetector {
         if (++index >= value.length - 1) return null;
         character = value[index];
         // Only quote/backslash escapes can occur in a valid icon theme name.
-        if (character != "'" && character != '"' && character != '\\')
+        if (character != "'" && character != '"' && character != '\\') {
           return null;
+        }
       } else if (character == quote) {
         return null;
       }
@@ -472,8 +472,9 @@ class SystemIconThemeDetector {
     final name = value?.trim();
     if (name == null ||
         !IconResolver._safeName(name) ||
-        RegExp(r'[\x00-\x20,\x7f-\uffff]').hasMatch(name))
+        RegExp(r'[\x00-\x20,\x7f-\uffff]').hasMatch(name)) {
       return null;
+    }
     return name;
   }
 

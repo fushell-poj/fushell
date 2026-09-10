@@ -4,7 +4,7 @@ const cli = @import("cli");
 const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
 const embedded_sdk_lib = @embedFile("fushell_sdk_lib");
 const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
-const library_files = .{ "icons", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher" };
+const library_files = .{ "icons", "windows", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher" };
 
 pub fn execute(init: std.process.Init, options: cli.sdk.Options) !void {
     const target = try exportPackage(init.gpa, init.io, options.output);

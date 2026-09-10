@@ -1,135 +1,133 @@
 import 'dart:async';
-import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fushell/fushell.dart';
+import 'package:fushell/windows.dart';
 import 'settings.dart';
 
-/// 无头壳: main() 不绑定窗口 (引擎以 implicit view 无窗口启动)。
-/// 全部窗口由 FushellWindow.openWindow 创建, 内容用框架 View/ViewCollection
-/// 渲染到对应 view。关闭全部窗口不会退出进程 (显式退出用 FushellProcess.exit)。
+/// Closing all windows deliberately leaves this engine running headless.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final int mainWindowId = await FushellWindow.openWindow(
-    title: 'fushell Flutter Smoke',
-    appId: 'dev.fushell.smoke',
-    width: 800,
-    height: 600,
-  );
-  // 设置窗: 绑定到主窗 (xdg set_parent, transient 语义)。
-  final int settingsWindowId = await FushellWindow.openWindow(
-    title: 'fushell Settings',
-    appId: 'dev.fushell.settings',
-    width: 480,
-    height: 360,
-    parent: mainWindowId,
-  );
-  // 顶部 bar: layer-shell 角色 (与 xdg 窗口互斥的另一种窗口类型)。
-  // 某些 compositor (如无 layer-shell 的 cage) 不支持: 跳过并继续主演示。
-  int? topBarId;
+  final windows = FushellWindowController();
   try {
-    topBarId = await FushellWindow.openWindow(
-      title: 'unused-for-layer',
-      appId: 'unused-for-layer',
-      layer: const LayerSurfaceRole(
-        namespace: 'fushell-smoke',
-        layer: LayerSurfaceLayer.top,
-        anchors: {
-          LayerSurfaceAnchor.top,
-          LayerSurfaceAnchor.left,
-          LayerSurfaceAnchor.right,
-        },
-        exclusiveZone: 32,
-        height: 32,
+    final main = await windows.open(
+      create: () => FushellWindow.openWindow(
+        title: 'fushell Flutter Smoke',
+        appId: 'dev.fushell.smoke',
+        width: 800,
+        height: 600,
       ),
     );
-  } catch (e) {
-    debugPrint('layer-shell window unavailable on this compositor: $e');
+    await windows.open(
+      create: () => FushellWindow.openWindow(
+        title: 'fushell Settings',
+        appId: 'dev.fushell.settings',
+        width: 480,
+        height: 360,
+        parent: main.windowId,
+      ),
+    );
+    FushellOwnedWindow? topBar;
+    try {
+      topBar = await windows.open(
+        create: () => FushellWindow.openWindow(
+          title: 'unused-for-layer',
+          appId: 'unused-for-layer',
+          layer: const LayerSurfaceRole(
+            namespace: 'fushell-smoke',
+            layer: LayerSurfaceLayer.top,
+            anchors: {
+              LayerSurfaceAnchor.top,
+              LayerSurfaceAnchor.left,
+              LayerSurfaceAnchor.right,
+            },
+            exclusiveZone: 32,
+            height: 32,
+          ),
+        ),
+      );
+    } catch (error) {
+      debugPrint('layer-shell window unavailable on this compositor: $error');
+    }
+    runWidget(
+      _SmokeViewCollection(
+        windows: windows,
+        mainWindowId: main.windowId,
+        topBarId: topBar?.windowId,
+      ),
+    );
+  } catch (_) {
+    await windows.dispose();
+    rethrow;
   }
-
-  runWidget(
-    _SmokeViewCollection(
-      mainWindowId: mainWindowId,
-      mainView: await FushellWindow.viewById(mainWindowId),
-      initialSettingsView: await FushellWindow.viewById(settingsWindowId),
-      topBarView: topBarId == null
-          ? null
-          : await FushellWindow.viewById(topBarId),
-    ),
-  );
 }
 
 class _SmokeViewCollection extends StatefulWidget {
   const _SmokeViewCollection({
+    required this.windows,
     required this.mainWindowId,
-    required this.mainView,
-    required this.initialSettingsView,
-    this.topBarView,
+    this.topBarId,
   });
 
+  final FushellWindowController windows;
   final int mainWindowId;
-  final ui.FlutterView mainView;
-  final ui.FlutterView initialSettingsView;
-  final ui.FlutterView? topBarView;
+  final int? topBarId;
 
   @override
   State<_SmokeViewCollection> createState() => _SmokeViewCollectionState();
 }
 
 class _SmokeViewCollectionState extends State<_SmokeViewCollection> {
-  late final Map<int, Widget> _views;
-  late final StreamSubscription<FushellWindowClosedEvent> _closedSubscription;
   int _nextSettingsNumber = 2;
 
   @override
-  void initState() {
-    super.initState();
-    _views = <int, Widget>{
-      widget.mainView.viewId: View(
-        view: widget.mainView,
-        child: FushellSmokeApp(onOpenSettingsWindow: _openSettingsWindow),
-      ),
-      widget.initialSettingsView.viewId: View(
-        view: widget.initialSettingsView,
-        child: const SettingsApp(),
-      ),
-      if (widget.topBarView case final topBarView?)
-        topBarView.viewId: View(view: topBarView, child: const _TopBar()),
-    };
-    _closedSubscription = FushellWindow.closed.listen((
-      FushellWindowClosedEvent event,
-    ) {
-      if (!mounted || !_views.containsKey(event.windowId)) return;
-      setState(() => _views.remove(event.windowId));
-    });
-  }
-
-  @override
   void dispose() {
-    unawaited(_closedSubscription.cancel());
+    // This owner also reclaims a create reply arriving after unmount.
+    unawaited(
+      widget.windows.dispose().catchError((Object error, StackTrace stack) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stack,
+            library: 'fushell example',
+            context: ErrorDescription('while disposing owned windows'),
+          ),
+        );
+      }),
+    );
     super.dispose();
   }
 
   Future<void> _openSettingsWindow() async {
     final number = _nextSettingsNumber++;
-    final windowId = await FushellWindow.openWindow(
-      title: 'fushell Settings $number',
-      appId: 'dev.fushell.settings',
-      width: 480,
-      height: 360,
-      parent: widget.mainWindowId,
-    );
-    final view = await FushellWindow.viewById(windowId);
-    if (!mounted) return;
-    setState(() {
-      _views[windowId] = View(view: view, child: const SettingsApp());
-    });
+    try {
+      await widget.windows.open(
+        create: () => FushellWindow.openWindow(
+          title: 'fushell Settings $number',
+          appId: 'dev.fushell.settings',
+          width: 480,
+          height: 360,
+          parent: widget.mainWindowId,
+        ),
+      );
+    } on FushellWindowOpenCancelled {
+      // Unmount/native close intentionally cancelled this attachment.
+    }
   }
 
   @override
-  Widget build(BuildContext context) =>
-      ViewCollection(views: _views.values.toList());
+  Widget build(BuildContext context) => FushellWindowViews(
+    listenable: widget.windows,
+    views: () => widget.windows.windows.map((window) => window.view),
+    builder: (context, view) {
+      if (view.viewId == widget.mainWindowId) {
+        return FushellSmokeApp(onOpenSettingsWindow: _openSettingsWindow);
+      }
+      if (view.viewId == widget.topBarId) return const _TopBar();
+      return const SettingsApp();
+    },
+  );
 }
 
 class FushellSmokeApp extends StatelessWidget {

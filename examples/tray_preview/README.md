@@ -62,3 +62,5 @@ regression. Shared renderer tests cover request races, disposal, and PNG/SVG.
 
 Activation coordinates default to (0, 0), since Wayland does not generally expose
 global window coordinates. Legacy XEmbed trays are not supported.
+
+`FushellWindowViews` tracks view additions/removals with stable per-view keys. Its `onLastViewClosed` callback explicitly calls `FushellProcess.exit`, including the first closure of a view present at the initial build. An empty startup does not exit. Native window closure and process exit remain separate SDK operations.

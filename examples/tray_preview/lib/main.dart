@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:fushell/fushell.dart';
 import 'package:fushell/icons.dart';
 import 'package:fushell/tray.dart';
+import 'package:fushell/windows.dart';
 import 'package:icon_preview/icon_image.dart';
 import 'package:icon_preview/icon_theme.dart';
 
@@ -15,55 +16,17 @@ import 'tray_pixels.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runWidget(const _WindowViews());
+  runWidget(
+    FushellWindowViews(
+      builder: (context, view) => const TrayPreviewApp(),
+      onLastViewClosed: FushellProcess.exit,
+    ),
+  );
   await FushellWindow.openWindow(
     title: 'Tray preview',
     appId: 'dev.fushell.TrayPreview',
     width: 960,
     height: 680,
-  );
-}
-
-class _WindowViews extends StatefulWidget {
-  const _WindowViews();
-  @override
-  State<_WindowViews> createState() => _WindowViewsState();
-}
-
-class _WindowViewsState extends State<_WindowViews>
-    with WidgetsBindingObserver {
-  bool _hadView = false;
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
-  }
-
-  @override
-  void didChangeMetrics() {
-    final views = ui.PlatformDispatcher.instance.views.where(
-      (v) => v.viewId != 0,
-    );
-    if (_hadView && views.isEmpty) {
-      FushellProcess.exit();
-      return;
-    }
-    if (views.isNotEmpty) _hadView = true;
-    setState(() {});
-  }
-
-  @override
-  Widget build(BuildContext context) => ViewCollection(
-    views: [
-      for (final view in ui.PlatformDispatcher.instance.views)
-        if (view.viewId != 0) View(view: view, child: const TrayPreviewApp()),
-    ],
   );
 }
 
