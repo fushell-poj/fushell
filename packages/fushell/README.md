@@ -49,7 +49,8 @@ secondary activation, context menus and scrolling. Each item is bound to its
 unique service owner, so stale handles never send actions to a replacement app.
 `TrayMenu` exposes a live immutable layout, `AboutToShow` and menu events.
 Menu nodes preserve visibility, enabled state, separators, toggles and submenus.
-Rendering, icon-theme lookup and screen coordinates belong to the application.
+Rendering and screen coordinates belong to the application. For theme names,
+use `IconResolver` from `package:fushell/icons.dart` (see below).
 Close menu transports when done. Sharing an explicitly supplied `DBusClient`
 is supported; close all hosts before closing that client. The host only closes
 a client it created itself.
@@ -341,3 +342,45 @@ they never synchronously block the platform thread.
 `packages/fushell` is the canonical SDK source used by in-repository examples.
 `fushell sdk` exports that same package for external consumers; no
 checked-in vendored SDK copy is maintained.
+
+## Linux theme icon lookup
+
+Import `package:fushell/icons.dart` for a pure Dart filesystem resolver. It does
+not require a Flutter platform channel, GTK, or a running Fushell engine.
+The resolver returns file metadata; image decoding and SVG rendering belong to
+the application.
+
+```dart
+import 'package:fushell/icons.dart';
+
+final icons = IconResolver(); // Follow the configured desktop icon theme.
+print(await icons.resolveTheme()); // e.g. Fluent-dark
+final result = await icons.lookup(
+  name: 'network-wireless',
+  size: 24,
+  scale: 2,
+  extraSearchPaths: [], // e.g. a tray item's IconThemePath
+);
+if (result != null) {
+  print(result.path);
+}
+icons.clearCache(); // After installing icons or changing theme files.
+```
+
+Without an explicit theme, the resolver reads the desktop's configured icon
+theme. GNOME-family sessions prefer GSettings; KDE prefers the Icons/Theme
+setting in kdeglobals; other desktops (including Hyprland) prefer GTK settings.
+GTK configuration respects XDG_CONFIG_HOME and XDG_CONFIG_DIRS. GSettings is an
+optional, bounded command fallback; no GTK plugin is required. If no usable
+setting is available, the selected theme falls back to `hicolor`.
+
+Use `await icons.resolveTheme()` to inspect the selected theme. A constructor
+`theme` or a per-lookup `theme` overrides automatic selection. `clearCache()`
+invalidates system-theme detection as well as icon metadata; filesystem and
+desktop-setting changes are not watched automatically. Searches honor theme
+inheritance, size/scale matching and fallback paths. A custom `searchPaths`
+list replaces the default theme roots for private installations and tests.
+Missing icons return null.
+
+See `examples/icon_preview` for an independent lookup inspector and
+`examples/tray_preview` for tray and DBusMenu integration.

@@ -1,5 +1,5 @@
-name: tray_preview
-description: Live StatusNotifierItem host and DBusMenu debugging window.
+name: icon_preview
+description: Freedesktop icon lookup and Flutter rendering preview.
 publish_to: "none"
 version: 0.1.0
 
@@ -9,11 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_svg: ^2.3.0
   fushell:
     path: ../../packages/fushell
-  dbus: ^0.7.15
-  icon_preview:
-    path: ../icon_preview
 
 dev_dependencies:
   flutter_test:

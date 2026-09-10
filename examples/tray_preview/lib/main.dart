@@ -1,12 +1,16 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:fushell/fushell.dart';
+import 'package:fushell/icons.dart';
 import 'package:fushell/tray.dart';
+import 'package:icon_preview/icon_image.dart';
+import 'package:icon_preview/icon_theme.dart';
 
+import 'icon_choice.dart';
+import 'menu_icon.dart';
 import 'tray_pixels.dart';
 
 Future<void> main() async {
@@ -90,15 +94,25 @@ class _PreviewState extends State<_Preview> {
   String? _error;
   bool _connecting = false;
   final List<String> _events = [];
+  final _icons = IconResolver();
+  final _theme = TextEditingController();
+  late final IconThemeSelection _themeSelection;
+  String? _selectedTheme;
+  int _iconRevision = 0;
 
   @override
   void initState() {
     super.initState();
+    _themeSelection = IconThemeSelection(_icons)..addListener(_themeChanged);
+    _theme.addListener(_themeSelection.invalidateDraft);
+    unawaited(_applyTheme());
     unawaited(_connect());
   }
 
   @override
   void dispose() {
+    _themeSelection.dispose();
+    _theme.dispose();
     unawaited(_subscription?.cancel());
     unawaited(_host?.close());
     super.dispose();
@@ -154,6 +168,29 @@ class _PreviewState extends State<_Preview> {
     }
   }
 
+  void _themeChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _applyTheme({bool refresh = false}) async {
+    final theme = await _themeSelection.apply(_theme.text, refresh: refresh);
+    if (!mounted || theme == null) return;
+    setState(() {
+      _selectedTheme = theme;
+      ++_iconRevision;
+    });
+  }
+
+  void _refreshIcons() => unawaited(_applyTheme(refresh: true));
+
+  Widget _itemIcon(TrayItem item, {double size = 24}) => TrayPixmapIcon(
+    item: item,
+    size: size,
+    resolver: _icons,
+    theme: _selectedTheme,
+    revision: _iconRevision,
+  );
+
   Future<void> _menu(TrayItem item) async {
     try {
       final menu = await item.loadMenu();
@@ -166,8 +203,17 @@ class _PreviewState extends State<_Preview> {
         if (mounted)
           await showDialog<void>(
             context: context,
-            builder: (_) =>
-                _MenuDialog(menu: menu, title: item.title, log: _log),
+            builder: (_) => _MenuDialog(
+              menu: menu,
+              title: item.title,
+              log: _log,
+              resolver: _icons,
+              theme: _selectedTheme,
+              revision: _iconRevision,
+              extraPaths: item.iconThemePath.isEmpty
+                  ? const []
+                  : [item.iconThemePath],
+            ),
           );
       } finally {
         await menu.close();
@@ -204,6 +250,26 @@ class _PreviewState extends State<_Preview> {
       body: ListView(
         padding: const EdgeInsets.all(24),
         children: [
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _theme,
+                  decoration: const InputDecoration(
+                    labelText: 'Icon theme (blank = system)',
+                  ),
+                  onSubmitted: (_) => _refreshIcons(),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: _refreshIcons,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Apply / refresh icons'),
+              ),
+            ],
+          ),
+          Text(_themeSelection.label),
+          const SizedBox(height: 16),
           Text(
             _connecting
                 ? 'Connecting…'
@@ -272,7 +338,7 @@ class _PreviewState extends State<_Preview> {
                         item.iconName,
                       ].where((s) => s.isNotEmpty).join('\n'),
                       child: ActionChip(
-                        avatar: TrayPixmapIcon(item: item),
+                        avatar: _itemIcon(item),
                         label: Text(item.title.isEmpty ? item.id : item.title),
                         onPressed: () {
                           setState(() => _selected = item.key);
@@ -300,7 +366,7 @@ class _PreviewState extends State<_Preview> {
                   children: [
                     Row(
                       children: [
-                        TrayPixmapIcon(item: selected, size: 48),
+                        _itemIcon(selected, size: 48),
                         const SizedBox(width: 16),
                         Expanded(
                           child: Text(
@@ -359,10 +425,18 @@ class _MenuDialog extends StatefulWidget {
     required this.menu,
     required this.title,
     required this.log,
+    required this.resolver,
+    required this.theme,
+    required this.revision,
+    required this.extraPaths,
   });
   final TrayMenu menu;
   final String title;
   final void Function(String) log;
+  final IconResolver resolver;
+  final String? theme;
+  final int revision;
+  final List<String> extraPaths;
   @override
   State<_MenuDialog> createState() => _MenuDialogState();
 }
@@ -392,6 +466,15 @@ class _MenuDialogState extends State<_MenuDialog> {
     }
   }
 
+  Widget _menuIcon(TrayMenuNode node) => TrayMenuIcon(
+    resolver: widget.resolver,
+    name: node.iconName,
+    data: node.properties['icon-data'],
+    theme: widget.theme,
+    revision: widget.revision,
+    extraPaths: widget.extraPaths,
+  );
+
   Widget _node(TrayMenuNode node) {
     if (!node.visible) return const SizedBox.shrink();
     if (node.type == 'separator') return const Divider();
@@ -406,6 +489,7 @@ class _MenuDialogState extends State<_MenuDialog> {
         key: PageStorageKey(node.id),
         enabled: node.enabled,
         title: title,
+        leading: _menuIcon(node),
         onExpansionChanged: (open) {
           if (open)
             _run(() async {
@@ -417,7 +501,16 @@ class _MenuDialogState extends State<_MenuDialog> {
       );
     return ListTile(
       enabled: node.enabled,
-      title: title,
+      title: Row(
+        children: [
+          if (node.iconName.isNotEmpty ||
+              node.properties.containsKey('icon-data')) ...[
+            _menuIcon(node),
+            const SizedBox(width: 8),
+          ],
+          Expanded(child: title),
+        ],
+      ),
       leading: node.toggleType.isEmpty
           ? null
           : Icon(
@@ -465,10 +558,20 @@ class _MenuDialogState extends State<_MenuDialog> {
   );
 }
 
-/// The preview renders SNI pixmaps directly. Missing pixmaps stay inspectable by name.
+/// Theme names take priority, retaining the premultiplied SNI pixmap fallback.
 class TrayPixmapIcon extends StatelessWidget {
-  const TrayPixmapIcon({super.key, required this.item, this.size = 24});
+  const TrayPixmapIcon({
+    super.key,
+    required this.item,
+    required this.resolver,
+    this.theme,
+    this.revision = 0,
+    this.size = 24,
+  });
   final TrayItem item;
+  final IconResolver resolver;
+  final String? theme;
+  final int revision;
   final double size;
   @override
   Widget build(BuildContext context) {
@@ -476,27 +579,35 @@ class TrayPixmapIcon extends StatelessWidget {
     final pixmaps = attention && item.attentionIconPixmaps.isNotEmpty
         ? item.attentionIconPixmaps
         : item.iconPixmaps;
-    if (pixmaps.isEmpty) {
-      final name = attention && item.attentionIconName.isNotEmpty
-          ? item.attentionIconName
-          : item.iconName;
-      if (name.startsWith('/') && !name.endsWith('.svg'))
-        return Image.file(
-          File(name),
-          width: size,
-          height: size,
-          errorBuilder: (_, _, _) => Icon(Icons.apps, size: size),
-        );
-      return Icon(
-        attention ? Icons.notifications_active : Icons.apps,
-        size: size,
-      );
+    final name = trayIconName(
+      needsAttention: attention,
+      normalName: item.iconName,
+      attentionName: item.attentionIconName,
+      hasAttentionPixmap: item.attentionIconPixmaps.isNotEmpty,
+    );
+    Widget fallback = Icon(
+      attention ? Icons.notifications_active : Icons.apps,
+      size: size,
+    );
+    if (pixmaps.isNotEmpty) {
+      final sorted = [...pixmaps]..sort((a, b) => a.width.compareTo(b.width));
+      final target = size * MediaQuery.devicePixelRatioOf(context);
+      final pixmap =
+          sorted.where((p) => p.width >= target).firstOrNull ?? sorted.last;
+      fallback = _RawPixmap(pixmap: pixmap, size: size);
     }
-    final sorted = [...pixmaps]..sort((a, b) => a.width.compareTo(b.width));
-    final target = size * MediaQuery.devicePixelRatioOf(context);
-    final pixmap =
-        sorted.where((p) => p.width >= target).firstOrNull ?? sorted.last;
-    return _RawPixmap(pixmap: pixmap, size: size);
+    return ResolvedIcon(
+      resolver: resolver,
+      name: name,
+      theme: theme,
+      size: size,
+      scale: MediaQuery.devicePixelRatioOf(context).ceil(),
+      revision: revision,
+      extraSearchPaths: item.iconThemePath.isEmpty
+          ? const []
+          : [item.iconThemePath],
+      fallback: fallback,
+    );
   }
 }
 
