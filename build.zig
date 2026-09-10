@@ -164,6 +164,23 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
+    // Runtime modules are lazily referenced by runner main and otherwise yield no tests.
+    const text_input_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform_channels.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    text_input_mod.addImport("c", c_mod);
+    text_input_mod.addImport("wayland", wayland_mod);
+    const text_input_tests = b.addTest(.{
+        .root_module = text_input_mod,
+        .filters = &.{ "text input", "text_input." },
+    });
+    const run_text_input_tests = b.addRunArtifact(text_input_tests);
+    const text_input_test_step = b.step("text-input-test", "Test native text input state and platform messages");
+    text_input_test_step.dependOn(&run_text_input_tests.step);
+    test_step.dependOn(text_input_test_step);
     const cli_tests = b.addTest(.{ .root_module = cli_mod });
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const cli_test_step = b.step("cli-test", "Test command parsing and help without Flutter or a display");

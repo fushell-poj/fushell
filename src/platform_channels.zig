@@ -135,6 +135,27 @@ pub fn escapeJsonString(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+fn textInputConfiguration(config: std.json.Value) !struct { action: []const u8, multiline: bool } {
+    if (config != .object) return error.BadArguments;
+    var action: []const u8 = "TextInputAction.done";
+    if (config.object.get("inputAction")) |value| {
+        if (value != .string) return error.BadArguments;
+        action = value.string;
+    }
+    var multiline = false;
+    if (config.object.get("inputType")) |value| {
+        if (value != .object) return error.BadArguments;
+        if (value.object.get("name")) |name| {
+            if (name != .string) return error.BadArguments;
+            multiline = std.mem.eql(u8, name.string, "TextInputType.multiline");
+        } else if (value.object.get("isMultiline")) |legacy| {
+            if (legacy != .bool) return error.BadArguments;
+            multiline = legacy.bool;
+        }
+    }
+    return .{ .action = action, .multiline = multiline };
+}
+
 pub fn handleTextInputMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8, send_fn: SendFn) void {
     var reply: Response = .{
         .context = runner,
@@ -171,7 +192,7 @@ pub fn handleTextInputMessage(runner: anytype, message: c.FlutterPlatformMessage
     const args = root.get("args");
 
     if (std.mem.eql(u8, method, "TextInput.setClient")) {
-        if (args == null or args.? != .array or args.?.array.items.len < 2) {
+        if (args == null or args.? != .array or args.?.array.items.len != 2) {
             runner.sendPlatformMethodError(message.response_handle, "BadArguments", "TextInput.setClient expects [clientId, configuration]");
             return;
         }
@@ -183,25 +204,18 @@ pub fn handleTextInputMessage(runner: anytype, message: c.FlutterPlatformMessage
             },
         };
         const config = args.?.array.items[1];
-        var multiline = false;
-        var action: []const u8 = "done";
-        if (config == .object) {
-            if (config.object.get("inputAction")) |ia| {
-                if (ia == .string) action = ia.string;
-            }
-            if (config.object.get("inputType")) |it| {
-                if (it == .object) {
-                    if (it.object.get("isMultiline")) |ml| {
-                        if (ml == .bool) multiline = ml.bool;
-                    }
-                }
-            }
-        }
+        const configuration = textInputConfiguration(config) catch {
+            runner.sendPlatformMethodError(message.response_handle, "BadArguments", "Invalid text input configuration");
+            return;
+        };
         runner.text_client.clear();
+        runner.text_client.setInputAction(configuration.action) catch {
+            runner.sendPlatformMethodError(message.response_handle, "OutOfMemory", "Unable to retain input action");
+            return;
+        };
         runner.text_client.client_id = id;
         runner.text_client.active = true;
-        runner.text_client.multiline = multiline;
-        runner.text_client.input_action = action;
+        runner.text_client.multiline = configuration.multiline;
         // TextField 聚焦: 启用 IME + 候选框定位。
         // 优先用引擎提供的 EditableText 几何 (transform + marked rect → 真实光标),
         // 避免 popup 先出现在点击处再跳到光标处的闪烁。
@@ -225,26 +239,29 @@ pub fn handleTextInputMessage(runner: anytype, message: c.FlutterPlatformMessage
         return;
     }
     if (std.mem.eql(u8, method, "TextInput.setEditableSizeAndTransform")) {
-        // EditableText 局部 → Flutter root 变换矩阵 (官方 GTK 嵌入器同款协议)。
-        if (args != null and args.? == .object) {
-            if (args.?.object.get("transform")) |tv| {
-                if (tv == .array and tv.array.items.len == 16) {
-                    var ok = true;
-                    for (tv.array.items, 0..) |item, i| {
-                        runner.text_client.transform[i] = switch (item) {
-                            .float => |f| f,
-                            .integer => |iv| @floatFromInt(iv),
-                            else => {
-                                ok = false;
-                                break;
-                            },
-                        };
-                    }
-                    if (ok) runner.text_client.has_transform = true;
-                }
-            }
+        const values = if (args != null and args.? == .object) args.?.object.get("transform") else null;
+        if (values == null or values.? != .array or values.?.array.items.len != 16) {
+            runner.sendPlatformMethodError(message.response_handle, "BadArguments", "transform must contain 16 numbers");
+            return;
         }
-        // transform 到达不代表 rect 到达; 有 rect 时更新候选框位置。
+        var transform: [16]f64 = undefined;
+        for (values.?.array.items, 0..) |value, i| {
+            const number: f64 = switch (value) {
+                .float => |f| f,
+                .integer => |n| @floatFromInt(n),
+                else => {
+                    runner.sendPlatformMethodError(message.response_handle, "BadArguments", "transform must contain numbers");
+                    return;
+                },
+            };
+            if (!std.math.isFinite(number)) {
+                runner.sendPlatformMethodError(message.response_handle, "BadArguments", "transform must contain finite numbers");
+                return;
+            }
+            transform[i] = number;
+        }
+        runner.text_client.transform = transform;
+        runner.text_client.has_transform = true;
         if (runner.text_client.has_marked_rect) runner.updateImeCursorPosition();
         runner.sendEmptyPlatformResponse(message.response_handle);
         return;
@@ -300,30 +317,30 @@ pub fn handleTextInputMessage(runner: anytype, message: c.FlutterPlatformMessage
         return;
     }
     if (std.mem.eql(u8, method, "TextInput.setEditingState")) {
-        // Flutter 端: invokeMethod('TextInput.setEditingState', value.toJSON())
-        // → args 直接是 object (不是 [object] array, 与 setClient 不同)。
         if (args == null or args.? != .object) {
             runner.sendPlatformMethodError(message.response_handle, "BadArguments", "TextInput.setEditingState expects an object");
             return;
         }
-        const state = args.?;
-        if (state == .object) {
-            var text: []const u8 = "";
-            var base: i64 = 0;
-            var extent: i64 = 0;
-            if (state.object.get("text")) |t| {
-                if (t == .string) text = t.string;
-            }
-            if (state.object.get("selectionBase")) |b| {
-                if (b == .integer) base = b.integer;
-            }
-            if (state.object.get("selectionExtent")) |e| {
-                if (e == .integer) extent = e.integer;
-            }
-            runner.text_client.applyEditingState(text, base, extent) catch |err| {
-                std.debug.print("[error] apply editing state failed: {s}\n", .{@errorName(err)});
-            };
+        const fields = args.?.object;
+        const text = fields.get("text");
+        if (text == null or text.? != .string) {
+            runner.sendPlatformMethodError(message.response_handle, "BadArguments", "Editing text must be a string");
+            return;
         }
+        var offsets = [_]i64{ 0, 0, -1, -1 };
+        for ([_][]const u8{ "selectionBase", "selectionExtent", "composingBase", "composingExtent" }, 0..) |key, i| {
+            if (fields.get(key)) |value| {
+                if (value != .integer) {
+                    runner.sendPlatformMethodError(message.response_handle, "BadArguments", "Editing offsets must be integers");
+                    return;
+                }
+                offsets[i] = value.integer;
+            }
+        }
+        runner.text_client.applyEditingStateWithComposing(text.?.string, offsets[0], offsets[1], offsets[2], offsets[3]) catch |err| {
+            runner.sendPlatformMethodError(message.response_handle, @errorName(err), "Unable to update editing state");
+            return;
+        };
         runner.sendEmptyPlatformResponse(message.response_handle);
         return;
     }
@@ -789,4 +806,164 @@ test "clipboard JSON supports escaped payloads larger than four KiB" {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, encoded, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(input, parsed.value.array.items[0].object.get("text").?.string);
+}
+
+const TextInputTestRunner = struct {
+    gpa: std.mem.Allocator,
+    text_client: @import("text_input.zig").Client,
+    active_platform_response: ?*Response = null,
+    response_count: usize = 0,
+    error_code: ?[]const u8 = null,
+    cursor_updates: usize = 0,
+    ime: ?*Ime = null,
+    focused_host: ?*struct { pointer_x: f64, pointer_y: f64 } = null,
+
+    const Ime = struct {
+        fn enable(_: *@This(), _: u32, _: u32) void {}
+        fn disable(_: *@This()) void {}
+        fn setCursorRect(_: *@This(), _: i32, _: i32, _: i32, _: i32) void {}
+    };
+
+    fn send(context: *anyopaque, _: ?*const c.FlutterPlatformMessageResponseHandle, _: []const u8) ResponseSendResult {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.response_count += 1;
+        return .sent;
+    }
+
+    fn sendEmptyPlatformResponse(self: *@This(), _: ?*const c.FlutterPlatformMessageResponseHandle) void {
+        _ = self.active_platform_response.?.empty();
+    }
+
+    fn sendPlatformMethodError(self: *@This(), _: ?*const c.FlutterPlatformMessageResponseHandle, code: []const u8, _: []const u8) void {
+        self.error_code = code;
+        _ = self.active_platform_response.?.send("error");
+    }
+
+    fn updateImeCursorPosition(self: *@This()) void {
+        self.cursor_updates += 1;
+    }
+
+    fn dispatch(self: *@This(), payload: []const u8) !void {
+        self.error_code = null;
+        const previous_count = self.response_count;
+        handleTextInputMessage(self, std.mem.zeroes(c.FlutterPlatformMessage), payload, send);
+        try std.testing.expectEqual(previous_count + 1, self.response_count);
+        try std.testing.expect(self.active_platform_response == null);
+    }
+};
+
+test "text input handler owns parsed action through Enter and repeated client lifecycle" {
+    var parser_storage: [16384]u8 = undefined;
+    var parser = std.heap.FixedBufferAllocator.init(&parser_storage);
+    var runner: TextInputTestRunner = .{
+        .gpa = parser.allocator(),
+        .text_client = .init(std.testing.allocator),
+    };
+    defer runner.text_client.deinit();
+    for (0..3) |_| {
+        parser.reset();
+        // The JSON escape forces action storage into the parser's allocation.
+        try runner.dispatch(
+            \\{"method":"TextInput.setClient","args":[42,{"inputAction":"TextInputAction.sen\u0064","inputType":{"name":"TextInputType.multiline"}}]}
+        );
+        try std.testing.expect(runner.error_code == null);
+        @memset(&parser_storage, 0xa5);
+        var output: [256]u8 = undefined;
+        const action = try runner.text_client.buildActionMessage(&output);
+        try std.testing.expectEqualStrings(
+            \\{"method":"TextInputClient.performAction","args":[42,"TextInputAction.send"]}
+        , action);
+        try std.testing.expect(runner.text_client.multiline);
+        parser.reset();
+        try runner.dispatch(
+            \\{"method":"TextInput.clearClient"}
+        );
+        try std.testing.expect(!runner.text_client.active);
+        try std.testing.expectEqualStrings("TextInputAction.done", runner.text_client.input_action);
+        parser.reset();
+        try runner.dispatch(
+            \\{"method":"TextInput.setClient","args":[43,{}]}
+        );
+        try std.testing.expect(runner.text_client.active);
+        try std.testing.expect(!runner.text_client.multiline);
+        try std.testing.expectEqualStrings("TextInputAction.done", runner.text_client.input_action);
+    }
+}
+
+test "text input handler rejects malformed state without partial mutation" {
+    var runner: TextInputTestRunner = .{ .gpa = std.testing.allocator, .text_client = .init(std.testing.allocator) };
+    defer runner.text_client.deinit();
+    try runner.dispatch(
+        \\{"method":"TextInput.setClient","args":[7,{"inputAction":"TextInputAction.send"}]}
+    );
+    try runner.text_client.applyEditingState("kept", 2, 2);
+    runner.text_client.has_transform = true;
+    runner.text_client.transform = [_]f64{7} ** 16;
+    for ([_][]const u8{
+        \\{"method":"TextInput.setClient","args":[9,null]}
+        ,
+        \\{"method":"TextInput.setClient","args":[9,{"inputAction":false}]}
+        ,
+        \\{"method":"TextInput.setClient","args":[9,{"inputType":{"name":3}}]}
+        ,
+        \\{"method":"TextInput.setEditingState","args":{"text":3,"selectionBase":0,"selectionExtent":0}}
+        ,
+        \\{"method":"TextInput.setEditingState","args":{"text":"lost","selectionBase":"bad","selectionExtent":0}}
+        ,
+        \\{"method":"TextInput.setEditableSizeAndTransform","args":{"transform":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,"bad"]}}
+        ,
+    }) |payload| {
+        try runner.dispatch(payload);
+        try std.testing.expect(runner.error_code != null);
+        try std.testing.expectEqualStrings("BadArguments", runner.error_code.?);
+        try std.testing.expect(runner.text_client.active);
+        try std.testing.expectEqual(@as(i64, 7), runner.text_client.client_id);
+        try std.testing.expectEqualStrings("TextInputAction.send", runner.text_client.input_action);
+        try std.testing.expectEqualStrings("kept", runner.text_client.state.text.items);
+        try std.testing.expectEqual(@as(i64, 2), runner.text_client.state.selection_base);
+        try std.testing.expectEqual([_]f64{7} ** 16, runner.text_client.transform);
+        try std.testing.expectEqual(@as(usize, 0), runner.cursor_updates);
+    }
+}
+
+test "text input handler preserves UTF16 composition and clears omitted ranges" {
+    var runner: TextInputTestRunner = .{ .gpa = std.testing.allocator, .text_client = .init(std.testing.allocator) };
+    defer runner.text_client.deinit();
+    try runner.dispatch(
+        \\{"method":"TextInput.setClient","args":[7,{"inputType":{"name":"TextInputType.text"}}]}
+    );
+    try std.testing.expect(!runner.text_client.multiline);
+    try runner.dispatch(
+        \\{"method":"TextInput.setEditingState","args":{"text":"A😀中Z","selectionBase":3,"selectionExtent":4,"composingBase":1,"composingExtent":4}}
+    );
+    try std.testing.expect(runner.error_code == null);
+    try std.testing.expectEqual(@as(i64, 1), runner.text_client.state.composing_start);
+    try std.testing.expectEqual(@as(i64, 8), runner.text_client.state.composing_end);
+    const update = try runner.text_client.buildUpdateMessageAlloc();
+    defer std.testing.allocator.free(update);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, update, .{});
+    defer parsed.deinit();
+    const fields = parsed.value.object.get("args").?.array.items[1].object;
+    try std.testing.expectEqual(@as(i64, 1), fields.get("composingBase").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), fields.get("composingExtent").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), fields.get("selectionBase").?.integer);
+    try runner.dispatch(
+        \\{"method":"TextInput.setEditingState","args":{"text":"done","selectionBase":4,"selectionExtent":4}}
+    );
+    try std.testing.expectEqual(@as(i64, -1), runner.text_client.state.composing_start);
+    try std.testing.expectEqual(@as(i64, -1), runner.text_client.state.composing_end);
+}
+
+test "text input handler reports action allocation failure without an active partial client" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var runner: TextInputTestRunner = .{ .gpa = std.testing.allocator, .text_client = .init(failing.allocator()) };
+    defer runner.text_client.deinit();
+    try runner.dispatch(
+        \\{"method":"TextInput.setClient","args":[1,{"inputAction":"TextInputAction.send"}]}
+    );
+    try std.testing.expect(runner.error_code != null);
+    try std.testing.expectEqualStrings("OutOfMemory", runner.error_code.?);
+    try std.testing.expect(!runner.text_client.active);
+    try std.testing.expectEqual(@as(i64, -1), runner.text_client.client_id);
+    try std.testing.expectEqualStrings("TextInputAction.done", runner.text_client.input_action);
 }
