@@ -4,7 +4,8 @@ const cli = @import("cli");
 const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
 const embedded_sdk_lib = @embedFile("fushell_sdk_lib");
 const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
-const library_files = .{ "icons", "windows", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher" };
+const library_files = .{ "icons", "windows", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" };
+const support_files = .{ "protocols/wayland.xml", "protocols/ext-workspace-v1.xml", "protocols/README.md", "tool/workspace/generate.dart", "tool/workspace/generate_test.dart", "tool/workspace/README.md" };
 
 pub fn execute(init: std.process.Init, options: cli.sdk.Options) !void {
     const target = try exportPackage(init.gpa, init.io, options.output);
@@ -42,15 +43,22 @@ pub fn exportPackage(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 
     defer lib_file.close(io);
     try lib_file.writeStreamingAll(io, embedded_sdk_lib);
 
-    const tray_dir = try std.fs.path.join(gpa, &.{ lib_dir, "src", "tray" });
-    defer gpa.free(tray_dir);
-    try std.Io.Dir.cwd().createDirPath(io, tray_dir);
     inline for (library_files) |file| {
         const path = try std.fs.path.join(gpa, &.{ lib_dir, file ++ ".dart" });
         defer gpa.free(path);
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
         var output = try std.Io.Dir.cwd().createFile(io, path, .{});
         defer output.close(io);
         try output.writeStreamingAll(io, @embedFile("fushell_sdk_" ++ file));
+    }
+
+    inline for (support_files) |file| {
+        const path = try std.fs.path.join(gpa, &.{ target, file });
+        defer gpa.free(path);
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+        var output = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer output.close(io);
+        try output.writeStreamingAll(io, @embedFile("fushell_sdk_support_" ++ file));
     }
 
     // 写 README.md
@@ -111,5 +119,15 @@ test "released SDK matches the canonical embedded package byte-for-byte" {
         );
         defer std.testing.allocator.free(content);
         try std.testing.expectEqualSlices(u8, @embedFile("fushell_sdk_" ++ file), content);
+    }
+    inline for (support_files) |file| {
+        const content = try tmp.dir.readFileAlloc(
+            std.testing.io,
+            "fushell/" ++ file,
+            std.testing.allocator,
+            .limited(1024 * 1024),
+        );
+        defer std.testing.allocator.free(content);
+        try std.testing.expectEqualSlices(u8, @embedFile("fushell_sdk_support_" ++ file), content);
     }
 }

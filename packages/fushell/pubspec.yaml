@@ -12,5 +12,6 @@ dependencies:
     sdk: flutter
 
 dev_dependencies:
+  xml: ">=6.6.1 <8.0.0"
   flutter_test:
     sdk: flutter

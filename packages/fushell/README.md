@@ -366,7 +366,8 @@ font families already declared by the application remain untouched.
 
 ## Concurrency model (for embedder maintainers)
 
-One engine, one Wayland connection, one event loop (main thread), one shared
+The native renderer uses one engine, one Wayland connection, one event loop
+(main thread), and one shared
 EGL render context. Each window is a `FlutterView` (id 1, 2, …) rendered via
 the FlutterCompositor path: the engine rasterizes into GL backing-store
 textures and `present_view_callback` blits them to the window's EGL surface.
@@ -429,3 +430,62 @@ Missing icons return null.
 
 See `examples/icon_preview` for an independent lookup inspector and
 `examples/tray_preview` for tray and DBusMenu integration.
+
+## Wayland workspaces
+
+Import `package:fushell/workspace.dart` for a pure Dart, asynchronous client for
+`ext-workspace-v1`. It owns an independent Wayland connection and does not require
+a running Fushell engine, GTK, a Flutter platform channel, or a native plugin.
+The compositor must advertise the protocol; otherwise connecting throws
+`WorkspaceException` with code `UnsupportedProtocol`.
+
+```dart
+import 'package:fushell/workspace.dart';
+
+final workspace = await Workspace.connect();
+void printSnapshot() {
+  for (final entry in workspace.workspaces) {
+    print('${entry.name ?? entry.id ?? entry.objectId} active=${entry.isActive}');
+  }
+}
+printSnapshot();
+final subscription = workspace.changes.listen((_) => printSnapshot());
+
+// In response to a user action, using an entry from this connection:
+// await workspace.activate(entry);
+
+// When the owner is disposed:
+await subscription.cancel();
+await workspace.close();
+```
+
+`Workspace.connect()` discovers the socket from `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR`; `socketPath` can override it for private compositors and tests.
+Connection and initial discovery have a bounded `timeout`. The initial snapshot
+is ready when connect completes. Subsequent workspace changes are published
+atomically after the protocol's `done` event. Treat `workspaces` and `groups` as
+immutable snapshots; subscribe to `changes` to obtain replacements.
+
+Entries expose optional persistent IDs and names, coordinates, active/urgent/
+hidden states, group membership, and operation capabilities. Group outputs
+expose optional names and descriptions. Object IDs identify one connection's
+protocol objects; they are not persistent workspace identifiers. Operations
+validate the entry's lifetime and the latest capabilities before sending a
+request followed by `commit`. Available methods are `activate(entry)`,
+`deactivate(entry)`, `remove(entry)`, `assign(entry, group)`, and
+`createWorkspace(group, name)`. A completed operation means the request was sent;
+the compositor's subsequent snapshot is authoritative and may reject or ignore
+a request according to its policy.
+
+An active workspace is not necessarily the keyboard-focused workspace. This
+protocol does not provide window counts, window membership, or global keyboard
+focus. No compositor-specific IPC fallback is included. Closing is idempotent;
+a disconnection terminates this client and records `lastError` when applicable.
+The last snapshot remains readable after closure, but operations fail.
+Create a new `Workspace` to reconnect. The preview at
+`examples/workspace_preview` shows outputs, states, capabilities, and explicit
+activation controls.
+
+The wire bindings are generated from pinned official XML snapshots, rather than
+hand-maintained message opcodes. See the protocol and generator files shipped
+with the SDK for provenance and reproducible regeneration instructions.
