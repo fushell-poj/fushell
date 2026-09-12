@@ -46,6 +46,14 @@ FDs on the platform thread. There is no dummy window Host to own the event loop.
 
 `window_registry.zig` owns stable-address entries. Each real `Host` owns one
 surface role and EGL surface. Dart opens/closes views via platform channels.
+A popup owns an `xdg_popup` role and borrows a mapped parent Host. Layer parents
+attach it using layer-shell `get_popup`; other parents supply an `xdg_surface`.
+The registry records popup ownership independently from toplevel transient
+parenting. One live popup child per parent forms a nested chain: closure walks
+that chain before removing its parent view, including pending AddView callbacks.
+Popup configure events publish effective geometry through the same presentation
+lock as other roles. Positioner updates never predict compositor placement.
+See [native popups](popups.md) for the SDK, input semantics and protocol limits.
 Raster callbacks use the shared GLES3 RenderContext with per-window presentation
 locks; the resource context is separate and shares GL objects. No visible window
 is created until Dart asks, but Wayland/EGL initialize during engine startup.

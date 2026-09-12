@@ -1,6 +1,6 @@
 //! Dart 到 native 窗口生命周期协议的解码器。
 //!
-//! standard-method-codec payload 属于不可信应用输入，因此在创建任何 Wayland
+//! UTF-8 JSON payload 属于不可信应用输入，因此在创建任何 Wayland
 //! 对象前，解析器会拒绝尾随字段、重复或未知 key、无效 UTF-8、非有限尺寸及分配
 //! 溢出。返回的字符串由分配器拥有，必须通过对应 request 的 `deinit` 释放。
 
@@ -10,6 +10,7 @@ pub const channel_name = "dev.fushell/surface";
 pub const open_window_method = "window.open";
 pub const close_window_method = "window.close";
 pub const update_window_method = "window.update";
+pub const reposition_popup_method = "popup.reposition";
 pub const update_layer_method = "layer.update";
 pub const exit_method = "process.exit";
 
@@ -17,6 +18,7 @@ pub const Request = union(enum) {
     open_window: OpenWindowRequest,
     close_window: CloseWindowRequest,
     update_window: WindowUpdateRequest,
+    reposition_popup: RepositionPopupRequest,
     update_layer: LayerUpdateRequest,
     exit: ExitRequest,
 
@@ -25,6 +27,7 @@ pub const Request = union(enum) {
             .open_window => |request| request.id,
             .close_window => |request| request.id,
             .update_window => |request| request.id,
+            .reposition_popup => |request| request.id,
             .update_layer => |request| request.id,
             .exit => |request| request.id,
         };
@@ -35,7 +38,7 @@ pub const Request = union(enum) {
             .open_window => |request| request.deinit(gpa),
             .close_window => {},
             .update_window => |request| request.deinit(gpa),
-            .update_layer => {},
+            .update_layer, .reposition_popup => {},
             .exit => {},
         }
     }
@@ -43,7 +46,7 @@ pub const Request = union(enum) {
 
 /// 添加一个 Flutter view 与 Wayland surface role 的已验证请求。
 ///
-/// `parent` 表示临时 xdg 关系而非所有权；关闭任一 view 都不会递归关闭另一个。
+/// `parent` is transient for toplevels; popup parents own their popup descendants.
 /// native reply 返回所分配的 Flutter `view_id`，它同时也是公开的 Fushell 窗口 ID。
 pub const OpenWindowRequest = struct {
     id: i64,
@@ -59,6 +62,7 @@ pub const OpenWindowRequest = struct {
             .layer => |layer| {
                 gpa.free(layer.namespace);
             },
+            .popup => {},
         }
     }
 };
@@ -97,7 +101,132 @@ pub const ExitRequest = struct {
 pub const Role = union(enum) {
     window: WindowRole,
     layer: LayerRole,
+    popup: PopupRole,
 };
+
+pub const PopupAnchor = enum(u32) {
+    none = 0,
+    top = 1,
+    bottom = 2,
+    left = 3,
+    right = 4,
+    top_left = 5,
+    bottom_left = 6,
+    top_right = 7,
+    bottom_right = 8,
+};
+
+pub const PopupConstraintAdjustment = packed struct(u32) {
+    slide_x: bool = false,
+    slide_y: bool = false,
+    flip_x: bool = false,
+    flip_y: bool = false,
+    resize_x: bool = false,
+    resize_y: bool = false,
+    _padding: u26 = 0,
+};
+
+pub const PopupAnchorRect = struct { x: i32, y: i32, width: i32, height: i32 };
+pub const PopupOffset = struct { x: i32 = 0, y: i32 = 0 };
+pub const PopupPositioner = struct {
+    width: i32,
+    height: i32,
+    anchor_rect: PopupAnchorRect,
+    anchor: PopupAnchor = .none,
+    gravity: PopupAnchor = .none,
+    constraint_adjustment: PopupConstraintAdjustment = .{},
+    offset: PopupOffset = .{},
+    reactive: bool = false,
+};
+pub const PopupRole = struct {
+    positioner: PopupPositioner,
+    input_passthrough: bool = false,
+};
+pub const RepositionPopupRequest = struct {
+    id: i64,
+    window_id: i64,
+    positioner: PopupPositioner,
+};
+
+fn validateKeys(obj: std.json.ObjectMap, allowed: []const []const u8) ParseError!void {
+    for (obj.keys()) |key| {
+        for (allowed) |candidate| {
+            if (std.mem.eql(u8, key, candidate)) break;
+        } else return error.InvalidSurfaceField;
+    }
+}
+
+fn optionalBool(obj: std.json.ObjectMap, key: []const u8) ParseError!bool {
+    const value = obj.get(key) orelse return false;
+    return switch (value) {
+        .bool => |b| b,
+        else => error.InvalidSurfaceField,
+    };
+}
+
+fn popupI32(obj: std.json.ObjectMap, key: []const u8, positive: bool) ParseError!i32 {
+    const value = try optionalI32(obj, key) orelse return error.MissingRequiredSurfaceField;
+    if (positive and value <= 0) return error.InvalidSurfaceField;
+    return value;
+}
+
+fn popupAnchor(obj: std.json.ObjectMap, key: []const u8) ParseError!PopupAnchor {
+    const value = try optionalString(obj, key) orelse return .none;
+    const names = [_][]const u8{ "none", "top", "bottom", "left", "right", "topLeft", "bottomLeft", "topRight", "bottomRight" };
+    for (names, 0..) |name, index| {
+        if (std.mem.eql(u8, name, value)) return @enumFromInt(index);
+    }
+    return error.InvalidSurfaceField;
+}
+
+fn parsePopupPositioner(value: std.json.Value) ParseError!PopupPositioner {
+    const obj = object(value) orelse return error.InvalidSurfaceField;
+    try validateKeys(obj, &.{ "width", "height", "anchorRect", "anchor", "gravity", "constraintAdjustment", "offset", "reactive" });
+    const rect = object(obj.get("anchorRect") orelse return error.MissingRequiredSurfaceField) orelse return error.InvalidSurfaceField;
+    try validateKeys(rect, &.{ "x", "y", "width", "height" });
+    var result: PopupPositioner = .{
+        .width = try popupI32(obj, "width", true),
+        .height = try popupI32(obj, "height", true),
+        .anchor_rect = .{
+            .x = try popupI32(rect, "x", false),
+            .y = try popupI32(rect, "y", false),
+            .width = try popupI32(rect, "width", true),
+            .height = try popupI32(rect, "height", true),
+        },
+        .anchor = try popupAnchor(obj, "anchor"),
+        .gravity = try popupAnchor(obj, "gravity"),
+        .reactive = try optionalBool(obj, "reactive"),
+    };
+    if (obj.get("offset")) |offset_value| {
+        const offset = object(offset_value) orelse return error.InvalidSurfaceField;
+        try validateKeys(offset, &.{ "x", "y" });
+        result.offset = .{ .x = try popupI32(offset, "x", false), .y = try popupI32(offset, "y", false) };
+    }
+    if (obj.get("constraintAdjustment")) |constraints_value| {
+        const constraints = switch (constraints_value) {
+            .array => |a| a,
+            else => return error.InvalidSurfaceField,
+        };
+        const names = [_][]const u8{ "slideX", "slideY", "flipX", "flipY", "resizeX", "resizeY" };
+        var bits: u32 = 0;
+        for (constraints.items) |item| {
+            const name = switch (item) {
+                .string => |s| s,
+                else => return error.InvalidSurfaceField,
+            };
+            for (names, 0..) |candidate, index| {
+                if (std.mem.eql(u8, name, candidate)) {
+                    const bit = @as(u32, 1) << @as(u5, @intCast(index));
+                    if (bits & bit != 0) return error.InvalidSurfaceField;
+                    bits |= bit;
+                    break;
+                }
+            } else return error.InvalidSurfaceField;
+        }
+        result.constraint_adjustment = @bitCast(bits);
+    }
+    return result;
+}
 
 /// surface 首次 commit 前使用的 xdg_toplevel 属性。
 ///
@@ -214,7 +343,23 @@ pub fn parseRequest(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Reques
         const role_value = root.get("role") orelse return error.MissingRequiredSurfaceField;
         const role_object = object(role_value) orelse return error.InvalidSurfaceField;
         const parent = (optionalInt(root, "parent") catch return error.InvalidSurfaceField);
-        return .{ .open_window = .{ .id = id, .role = try parseRole(gpa, role_object), .parent = parent } };
+        const role = try parseRole(gpa, role_object);
+        if (role == .popup) {
+            try validateKeys(root, &.{ "id", "method", "role", "parent" });
+            if (parent == null or parent.? <= 0) return error.InvalidSurfaceField;
+        }
+        return .{ .open_window = .{ .id = id, .role = role, .parent = parent } };
+    }
+
+    if (std.mem.eql(u8, method, reposition_popup_method)) {
+        try validateKeys(root, &.{ "id", "method", "windowId", "positioner" });
+        const window_id = try requiredInt(root, "windowId");
+        if (window_id <= 0) return error.InvalidSurfaceField;
+        return .{ .reposition_popup = .{
+            .id = id,
+            .window_id = window_id,
+            .positioner = try parsePopupPositioner(root.get("positioner") orelse return error.MissingRequiredSurfaceField),
+        } };
     }
 
     if (std.mem.eql(u8, method, close_window_method)) {
@@ -278,6 +423,13 @@ fn parseRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError
     }
     if (std.mem.eql(u8, kind, "layer")) {
         return .{ .layer = try parseLayerRole(gpa, role_object) };
+    }
+    if (std.mem.eql(u8, kind, "popup")) {
+        try validateKeys(role_object, &.{ "kind", "positioner", "inputPassthrough" });
+        return .{ .popup = .{
+            .positioner = try parsePopupPositioner(role_object.get("positioner") orelse return error.MissingRequiredSurfaceField),
+            .input_passthrough = try optionalBool(role_object, "inputPassthrough"),
+        } };
     }
     return error.UnsupportedSurfaceRole;
 }
@@ -562,4 +714,71 @@ test "encode responses" {
     const err = try errorResponse(std.testing.allocator, null, "Bad", "bad request");
     defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "\"ok\":false") != null);
+}
+
+const popup_test_positioner =
+    \\{"width":120,"height":60,"anchorRect":{"x":10,"y":20,"width":30,"height":40}}
+;
+
+test "popup defaults and explicit complete positioner round trip" {
+    const request = try parseRequest(std.testing.allocator, "{\"id\":8,\"method\":\"window.open\",\"parent\":3,\"role\":{\"kind\":\"popup\",\"positioner\":" ++ popup_test_positioner ++ "}}");
+    defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?i64, 3), request.open_window.parent);
+    const popup = request.open_window.role.popup;
+    try std.testing.expectEqual(@as(i32, 120), popup.positioner.width);
+    try std.testing.expectEqual(PopupAnchor.none, popup.positioner.anchor);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(popup.positioner.constraint_adjustment)));
+    try std.testing.expect(!popup.positioner.reactive and !popup.input_passthrough);
+    const explicit = try parseRequest(std.testing.allocator,
+        \\{"id":9,"method":"window.open","parent":3,"role":{"kind":"popup","inputPassthrough":true,"positioner":{"width":2,"height":3,"anchorRect":{"x":0,"y":0,"width":1,"height":1},"anchor":"topLeft","gravity":"bottomRight","constraintAdjustment":["slideX","slideY","flipX","flipY","resizeX","resizeY"],"offset":{"x":-4,"y":5},"reactive":true}}}
+    );
+    defer explicit.deinit(std.testing.allocator);
+    const positioner = explicit.open_window.role.popup.positioner;
+    try std.testing.expectEqual(PopupAnchor.top_left, positioner.anchor);
+    try std.testing.expectEqual(PopupAnchor.bottom_right, positioner.gravity);
+    try std.testing.expectEqual(@as(u32, 63), @as(u32, @bitCast(positioner.constraint_adjustment)));
+    try std.testing.expectEqual(@as(i32, -4), positioner.offset.x);
+    try std.testing.expect(positioner.reactive and explicit.open_window.role.popup.input_passthrough);
+}
+
+test "popup rejects absent invalid parent and unsupported grab field" {
+    for ([_][]const u8{ "", "\"parent\":0,", "\"parent\":-1," }) |parent| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"id\":1,\"method\":\"window.open\",{s}\"role\":{{\"kind\":\"popup\",\"positioner\":{s}}}}}", .{ parent, popup_test_positioner });
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, json));
+    }
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"window.open\",\"parent\":1,\"role\":{\"kind\":\"popup\",\"grab\":true,\"positioner\":" ++ popup_test_positioner ++ "}}"));
+}
+
+test "popup reposition parses full replacement and rejects unknown fields" {
+    const request = try parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"popup.reposition\",\"windowId\":2,\"positioner\":" ++ popup_test_positioner ++ "}");
+    defer request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 2), request.reposition_popup.window_id);
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"popup.reposition\",\"windowId\":2,\"inputPassthrough\":true,\"positioner\":" ++ popup_test_positioner ++ "}"));
+}
+
+test "popup positioner rejects invalid geometry enums flags and types" {
+    const invalid = [_][]const u8{
+        \\{"width":0,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1}}
+        ,
+        \\{"width":2147483648,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1}}
+        ,
+        \\{"width":1.5,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1}}
+        ,
+        \\{"width":1,"height":1,"anchorRect":{"x":0,"y":0,"width":-1,"height":1}}
+        ,
+        \\{"width":1,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1},"anchor":"diagonal"}
+        ,
+        \\{"width":1,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1},"constraintAdjustment":["flipX","flipX"]}
+        ,
+        \\{"width":1,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1},"reactive":1}
+        ,
+        \\{"width":1,"height":1,"anchorRect":{"x":0,"y":0,"width":1,"height":1},"offset":{"x":0,"y":0,"z":1}}
+        ,
+    };
+    for (invalid) |positioner| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"id\":1,\"method\":\"popup.reposition\",\"windowId\":2,\"positioner\":{s}}}", .{positioner});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, json));
+    }
 }

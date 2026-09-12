@@ -2,6 +2,10 @@
 
 A Wayland Flutter embedder with official Flutter multi-view support. One Flutter
 engine and isolate can create and manage multiple native windows from Dart.
+Native [popups](docs/popups.md) provide independently rendered, parent-relative
+surfaces for tooltips and popovers, including children of layer-shell bars.
+The Dart `NativeTooltip` widget in `package:fushell/tooltip.dart` manages native
+popup views, hover timing and theme propagation; see [Tooltip integration](docs/popups.md).
 
 ## Build the tools
 
@@ -9,6 +13,14 @@ The project targets **Zig 0.16.0**. Native development dependencies include
 Wayland, EGL/GLES, xkbcommon, Fontconfig, D-Bus and `pkg-config`/`wayland-scanner`.
 Running graphical applications requires **OpenGL ES 3.0 or newer**, including
 an EGL configuration with an alpha channel. Unsupported contexts fail at startup.
+
+The runtime Flutter Engine must be built with `--enable-fontconfig`. It discovers
+system fonts and applies Fontconfig matching and fallback itself. Fushell uses the
+application assets directly; it does not create system-font overlays or register
+font aliases through Dart. The native launcher retains an explicit Fontconfig
+runtime link so independently launched bundles can load the Engine on NixOS.
+Fontconfig, its runtime dependencies and installed fonts must remain available.
+Application font assets declared in `pubspec.yaml` continue to be managed by Flutter.
 
 ```bash
 nix develop
@@ -54,6 +66,12 @@ The cache is `build/fushell_flutter_engine/<arch>/<revision>/`, with metadata,
 SHA-256 verified shared libraries, an origin record and a persistent lock file.
 Changing repositories invalidates cached metadata. Cooperating processes serialize
 cache publication; failed downloads never become final Engine files.
+
+A rebuilt Engine at the same revision does not automatically invalidate this cache.
+After upgrading an older build to the Fontconfig-enabled release, stop concurrent
+builds and remove the affected project's cached revision directory before rebuilding.
+Refreshing only the shared library leaves it inconsistent with the cached metadata.
+Existing application bundles also need rebuilding; they retain their own Engine.
 
 Engine acquisition overlaps Dart compilation. A project lock protects Flutter's
 shared intermediate outputs. Bundles are assembled in a private sibling staging

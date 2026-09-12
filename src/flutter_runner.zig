@@ -1246,6 +1246,7 @@ fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     processCompositorCloseRequests(runner);
     runner.checkKeyRepeat();
     try runner.runDueFlutterTasks();
+    processPendingWindowRemovals(runner);
     while (try runner.frame_clock.takeDue(runner.now())) |frame| {
         if (runner.engine == null) return error.EngineUnavailable;
         try flutter.ensureSuccess(runner.api.on_vsync(runner.engine, frame.baton, frame.start, frame.target), "FlutterEngineOnVsync");
@@ -1345,6 +1346,11 @@ fn runnerHandleSurfaceRequest(runner: *Runner, response_handle: ?*const c.Flutte
         .open_window => |req| try openWindow(runner, response_handle, req),
         .close_window => |req| try closeWindow(runner, response_handle, req),
         .update_window => |req| try updateWindowSurface(runner, response_handle, req),
+        .reposition_popup => |req| {
+            const host = try runner.registry.activeHostForPlatform(req.window_id);
+            try host.repositionPopup(req.positioner);
+            sendSurfaceSuccess(runner, response_handle, req.id);
+        },
         .update_layer => |req| try updateLayerSurface(runner, response_handle, req),
         .exit => |req| try exitProcess(runner, response_handle, req),
     }
@@ -1355,22 +1361,33 @@ fn runnerHandleSurfaceRequest(runner: *Runner, response_handle: ?*const c.Flutte
 /// view 已在引擎注册、PlatformDispatcher.views 即将可见)。
 pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.OpenWindowRequest) !void {
     runner.registry.lock();
-    const parent_toplevel = if (request.parent) |parent_id| blk: {
+    const parent_host = if (request.parent) |parent_id| blk: {
         const parent_entry = runner.registry.findByViewIdLocked(parent_id) orelse {
             runner.registry.unlock();
             return error.ParentWindowNotFound;
         };
-        if (parent_entry.lifecycle != .active) {
+        if (parent_entry.lifecycle != .active or parent_entry.close_requested) {
             runner.registry.unlock();
-            return error.ParentWindowNotFound;
+            return error.ParentWindowNotReady;
         }
-        break :blk parent_entry.host.toplevel;
+        if (request.role == .popup) {
+            _ = runner.registry.popupParentLocked(parent_id) catch |err| {
+                runner.registry.unlock();
+                return err;
+            };
+        }
+        break :blk &parent_entry.host;
     } else null;
+    if (request.role == .popup and parent_host == null) {
+        runner.registry.unlock();
+        return error.ParentWindowNotFound;
+    }
     const entry = runner.registry.reserveLocked(request.parent) catch |err| {
         runner.registry.unlock();
         return err;
     };
     const view_id = entry.view_id;
+    if (request.role == .popup) entry.popup_parent_view_id = request.parent;
     entry.lifecycle_notification = .{ .context = runner.task_queue, .wake = wakeWindowLifecycle };
     entry.pending_open_response = response_handle;
     entry.pending_open_request_id = request.id;
@@ -1396,8 +1413,9 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
     }
     try host.attach(runner.state, runner.task_queue.io, runner.gpa);
     switch (request.role) {
-        .window => |w| try host.initializeWindowRole(w, parent_toplevel),
+        .window => |w| try host.initializeWindowRole(w, if (parent_host) |parent| parent.toplevel else null),
         .layer => |l| try host.initializeLayerRole(l),
+        .popup => |p| try host.initializePopupRole(p, parent_host.?),
     }
     runner.registry.lock();
     runner.registry.indexSurfaceLocked(entry) catch |err| {
@@ -1438,8 +1456,8 @@ fn addViewCallback(result: [*c]const c.FlutterAddViewResult) callconv(.c) void {
     if (registry.completeAdd(entry, result.*.added)) |notification| notification.notify();
 }
 
-/// Mark a view as removing under the registry lock, then submit RemoveView
-/// without the lock because the engine callback may run synchronously.
+/// Queue ownership-aware removal. Engine calls happen on the platform tick
+/// outside the registry lock because callbacks may run synchronously.
 fn beginWindowRemoval(
     runner: *Runner,
     entry: *WindowEntry,
@@ -1447,17 +1465,21 @@ fn beginWindowRemoval(
     request_id: i64,
 ) !void {
     runner.registry.lock();
-    if (entry.lifecycle == .removing) {
-        runner.registry.unlock();
-        return error.WindowClosePending;
-    }
-    if (entry.lifecycle != .active) {
-        runner.registry.unlock();
-        return error.WindowNotReady;
-    }
-    entry.lifecycle = .removing;
+    defer runner.registry.unlock();
+    if (entry.lifecycle == .removing or entry.close_requested) return error.WindowClosePending;
+    if (entry.lifecycle != .active) return error.WindowNotReady;
     entry.pending_close_response = response_handle;
     entry.pending_close_request_id = request_id;
+    runner.registry.requestCloseTreeLocked(entry);
+    // Submit leaves after AddView results. Parents keep rendering until all
+    // owned children have completed RemoveView and native host cleanup.
+}
+
+fn submitWindowRemoval(runner: *Runner, entry: *WindowEntry) !void {
+    runner.registry.lock();
+    std.debug.assert(entry.lifecycle == .active and entry.close_requested);
+    std.debug.assert(runner.registry.popupChildLocked(entry.view_id) == null);
+    entry.lifecycle = .removing;
     const view_id = entry.view_id;
     runner.registry.unlock();
 
@@ -1468,14 +1490,40 @@ fn beginWindowRemoval(
     remove_info.remove_view_callback = removeViewCallback;
     flutter.ensureSuccess(runner.api.remove_view(runner.engine, &remove_info), "FlutterEngineRemoveView") catch |err| {
         runner.registry.lock();
-        defer runner.registry.unlock();
-        if (entry.lifecycle == .removing and entry.remove_result == null) {
-            entry.lifecycle = .active;
-            entry.pending_close_response = null;
-            entry.pending_close_request_id = 0;
-        }
+        if (entry.remove_result == null) entry.lifecycle = .active;
+        runner.registry.unlock();
         return err;
     };
+}
+
+/// Fail waiting ancestors too: never strand a closing parent or destroy it
+/// around a surviving popup when Flutter refuses to remove that popup.
+fn cancelWindowCloseChain(runner: *Runner, first: *WindowEntry, code: []const u8) void {
+    var cursor: ?*WindowEntry = first;
+    while (cursor) |entry| {
+        runner.registry.lock();
+        entry.close_requested = false;
+        const handle = entry.pending_close_response;
+        const request_id = entry.pending_close_request_id;
+        entry.pending_close_response = null;
+        entry.pending_close_request_id = 0;
+        cursor = if (entry.popup_parent_view_id) |id| runner.registry.findByViewIdLocked(id) else null;
+        runner.registry.unlock();
+        if (handle) |h| runnerSendSurfaceError(runner, h, request_id, code, "popup descendant could not be removed");
+    }
+}
+
+fn processPendingWindowRemovals(runner: *Runner) void {
+    while (true) {
+        runner.registry.lock();
+        const entry = runner.registry.nextRemovalLocked();
+        runner.registry.unlock();
+        const candidate = entry orelse break;
+        submitWindowRemoval(runner, candidate) catch |err| {
+            std.debug.print("[error] deferred view removal failed: {s}\n", .{@errorName(err)});
+            cancelWindowCloseChain(runner, candidate, @errorName(err));
+        };
+    }
 }
 
 /// window.close: RemoveView → removed 回调确认后才销毁 surface。
@@ -1496,7 +1544,7 @@ fn processCompositorCloseRequests(runner: *Runner) void {
     for (0..runner.registry.entries.items.len) |index| {
         runner.registry.lock();
         const entry = runner.registry.entries.items[index];
-        const should_close = entry.lifecycle == .active and entry.host.takeCloseRequest();
+        const should_close = entry.lifecycle == .active and !entry.close_requested and entry.host.takeCloseRequest();
         const view_id = entry.view_id;
         runner.registry.unlock();
         if (!should_close) continue;
@@ -1615,6 +1663,7 @@ fn processViewLifecycleResults(runner: *Runner) void {
                 std.debug.print("window.close: view {d} removed and surface destroyed.\n", .{view_id});
             },
             .remove_failed => {
+                cancelWindowCloseChain(runner, entry, "RemoveViewFailed");
                 std.debug.print("[error] FlutterEngineRemoveView reported removed=false for view {d}\n", .{view_id});
                 if (handle) |h| runnerSendSurfaceError(runner, h, request_id, "RemoveViewFailed", "engine could not remove the view");
             },
@@ -1680,9 +1729,7 @@ fn shutdownEngine(runner: *Runner) void {
 fn shutdownAllWindows(runner: *Runner) void {
     while (true) {
         runner.registry.lock();
-        const entry = if (runner.registry.entries.items.len > 0)
-            runner.registry.entries.items[runner.registry.entries.items.len - 1]
-        else {
+        const entry = runner.registry.newestEntryLocked() orelse {
             runner.registry.unlock();
             return;
         };
@@ -1881,6 +1928,7 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
         std.debug.print("[error] present_view swapBuffers failed: {s}\n", .{@errorName(err)});
         return false;
     };
+    host.has_presented_buffer = true;
     if (!runner.compositor_first_present_logged) {
         std.debug.print("Flutter presented first frame via compositor (view {d}).\n", .{info.view_id});
         runner.compositor_first_present_logged = true;

@@ -26,6 +26,8 @@ pub const Entry = struct {
     lifecycle: Lifecycle = .adding,
     view_id: i64,
     parent_view_id: ?i64 = null,
+    popup_parent_view_id: ?i64 = null,
+    close_requested: bool = false,
     add_result: ?bool = null,
     remove_result: ?bool = null,
     lifecycle_notification: ?LifecycleNotification = null,
@@ -103,7 +105,7 @@ pub const Registry = struct {
         self.lock();
         defer self.unlock();
         const entry = self.findByViewIdLocked(view_id) orelse return error.WindowNotFound;
-        if (entry.lifecycle != .active) return error.WindowNotReady;
+        if (entry.lifecycle != .active or entry.close_requested) return error.WindowNotReady;
         return &entry.host;
     }
 
@@ -153,7 +155,45 @@ pub const Registry = struct {
         @panic("attempted to release an unknown window record");
     }
 
+    /// Popup ownership is distinct from transient toplevel parenting.
+    pub fn popupParentLocked(self: *Registry, view_id: i64) !*Entry {
+        const entry = self.findByViewIdLocked(view_id) orelse return error.ParentWindowNotFound;
+        if (entry.lifecycle != .active or entry.close_requested) return error.ParentWindowNotReady;
+        if (self.popupChildLocked(view_id) != null) return error.PopupParentHasPopup;
+        return entry;
+    }
+
+    pub fn popupChildLocked(self: *Registry, parent_view_id: i64) ?*Entry {
+        for (self.entries.items) |entry| {
+            if (entry.popup_parent_view_id == parent_view_id) return entry;
+        }
+        return null;
+    }
+
+    pub fn requestCloseTreeLocked(self: *Registry, entry: *Entry) void {
+        entry.close_requested = true;
+        if (self.popupChildLocked(entry.view_id)) |child| self.requestCloseTreeLocked(child);
+    }
+
+    pub fn nextRemovalLocked(self: *Registry) ?*Entry {
+        var next: ?*Entry = null;
+        for (self.entries.items) |entry| {
+            if (!entry.close_requested or entry.lifecycle != .active or self.popupChildLocked(entry.view_id) != null) continue;
+            if (next == null or entry.view_id > next.?.view_id) next = entry;
+        }
+        return next;
+    }
+
+    pub fn newestEntryLocked(self: *Registry) ?*Entry {
+        var newest: ?*Entry = null;
+        for (self.entries.items) |entry| {
+            if (newest == null or entry.view_id > newest.?.view_id) newest = entry;
+        }
+        return newest;
+    }
+
     pub fn detachChildrenLocked(self: *Registry, parent_view_id: i64) void {
+        std.debug.assert(self.popupChildLocked(parent_view_id) == null);
         for (self.entries.items) |entry| {
             if (entry.parent_view_id == parent_view_id) entry.parent_view_id = null;
         }
@@ -312,4 +352,80 @@ test "platform host borrow permits reentrant lookup and rejects inactive views" 
     entry.lifecycle = .removing;
     registry.unlock();
     try std.testing.expectError(error.WindowNotReady, registry.activeHostForPlatform(view_id));
+}
+
+test "popup parent rejects siblings in every lifecycle and allows reopening" {
+    var registry = Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    const parent = try registry.reserveLocked(null);
+    parent.lifecycle = .active;
+    try std.testing.expectEqual(parent, try registry.popupParentLocked(parent.view_id));
+    const child = try registry.reserveLocked(parent.view_id);
+    child.popup_parent_view_id = parent.view_id;
+    for ([_]Lifecycle{ .adding, .active, .removing }) |lifecycle| {
+        child.lifecycle = lifecycle;
+        try std.testing.expectError(error.PopupParentHasPopup, registry.popupParentLocked(parent.view_id));
+    }
+    registry.releaseLocked(child);
+    try std.testing.expectEqual(parent, try registry.popupParentLocked(parent.view_id));
+    parent.close_requested = true;
+    try std.testing.expectError(error.ParentWindowNotReady, registry.popupParentLocked(parent.view_id));
+    registry.releaseLocked(parent);
+}
+
+test "popup cascade waits for pending AddView and descendant host release" {
+    var registry = Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    const parent = try registry.reserveLocked(null);
+    parent.lifecycle = .active;
+    const child = try registry.reserveLocked(parent.view_id);
+    child.lifecycle = .active;
+    child.popup_parent_view_id = parent.view_id;
+    const grandchild = try registry.reserveLocked(child.view_id);
+    grandchild.popup_parent_view_id = child.view_id;
+    registry.requestCloseTreeLocked(parent);
+    try std.testing.expect(parent.close_requested and child.close_requested and grandchild.close_requested);
+    try std.testing.expectEqual(null, registry.nextRemovalLocked());
+    _ = registry.completeAdd(grandchild, true);
+    grandchild.add_result = null;
+    grandchild.lifecycle = .active;
+    try std.testing.expectEqual(grandchild, registry.nextRemovalLocked().?);
+    grandchild.lifecycle = .removing;
+    _ = registry.completeRemove(grandchild, true);
+    // A published callback alone is insufficient: native resources still exist.
+    try std.testing.expectEqual(null, registry.nextRemovalLocked());
+    registry.releaseLocked(grandchild);
+    try std.testing.expectEqual(child, registry.nextRemovalLocked().?);
+    registry.releaseLocked(child);
+    try std.testing.expectEqual(parent, registry.nextRemovalLocked().?);
+    registry.releaseLocked(parent);
+}
+
+test "popup parent resumes removal after rejected child AddView" {
+    var registry = Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    const parent = try registry.reserveLocked(null);
+    parent.lifecycle = .active;
+    const child = try registry.reserveLocked(parent.view_id);
+    child.popup_parent_view_id = parent.view_id;
+    registry.requestCloseTreeLocked(parent);
+    _ = registry.completeAdd(child, false);
+    try std.testing.expectEqual(null, registry.nextRemovalLocked());
+    registry.releaseLocked(child);
+    try std.testing.expectEqual(parent, registry.nextRemovalLocked().?);
+    registry.releaseLocked(parent);
+}
+
+test "shutdown creation order survives registry swap removal" {
+    var registry = Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    const root = try registry.reserveLocked(null);
+    const unrelated = try registry.reserveLocked(null);
+    const popup = try registry.reserveLocked(root.view_id);
+    popup.popup_parent_view_id = root.view_id;
+    registry.releaseLocked(unrelated);
+    try std.testing.expectEqual(popup, registry.newestEntryLocked().?);
+    registry.releaseLocked(popup);
+    try std.testing.expectEqual(root, registry.newestEntryLocked().?);
+    registry.releaseLocked(root);
 }

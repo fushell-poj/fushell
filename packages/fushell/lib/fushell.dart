@@ -504,7 +504,6 @@ final class FushellWindow {
   FushellWindow._();
 
   static int _nextRequestId = 1;
-  static Future<void>? _fontFallbackLoad;
   static bool _windowEventsInitialized = false;
   static final StreamController<FushellWindowClosedEvent> _closedEvents =
       StreamController<FushellWindowClosedEvent>.broadcast(sync: true);
@@ -535,7 +534,6 @@ final class FushellWindow {
     LayerSurfaceRole? layer,
   }) async {
     _ensureWindowEventsInitialized();
-    await _ensureSystemFontFallbackLoaded();
     final Map<String, Object?> role = layer == null
         ? <String, Object?>{
             'kind': 'window',
@@ -558,6 +556,52 @@ final class FushellWindow {
       );
     }
     return windowId;
+  }
+
+  /// Creates a non-grabbing popup relative to a live, mapped parent surface.
+  ///
+  /// The parent may be a toplevel, layer surface, or popup. Closing it closes
+  /// its popup descendants first. Input passthrough is fixed at creation.
+  /// A parent that has not submitted its first buffer fails with
+  /// PopupParentNotMapped, even if its openWindow Future has completed.
+  /// Each parent supports one live popup child; a sibling is rejected with
+  /// PopupParentHasPopup. Nested popup chains are supported.
+  static Future<int> openPopup({
+    required int parent,
+    required PopupSurfaceRole popup,
+  }) async {
+    if (parent <= 0) throw RangeError.range(parent, 1, null, 'parent');
+    final role = popup.toJson();
+    _ensureWindowEventsInitialized();
+    final response = await _sendRequest(<String, Object?>{
+      'method': 'window.open',
+      'parent': parent,
+      'role': role,
+    });
+    final windowId = response['windowId'];
+    if (windowId is! int) {
+      throw const FushellSurfaceException(
+        code: 'InvalidResponse',
+        message: 'window.open response is missing windowId',
+      );
+    }
+    return windowId;
+  }
+
+  /// Replaces a popup's complete positioner, including its requested size.
+  ///
+  /// Requires xdg-shell version 3. Native rejects unsupported compositors with
+  /// PopupRepositionUnsupported; a reactive positioner may also fail with
+  /// PopupReactiveUnsupported. Input passthrough cannot be changed here.
+  static Future<void> repositionPopup(
+    int windowId,
+    PopupPositioner positioner,
+  ) async {
+    await _sendRequest(<String, Object?>{
+      'method': 'popup.reposition',
+      'windowId': windowId,
+      'positioner': positioner.toJson(),
+    });
   }
 
   /// 移除 Flutter view，再销毁其 EGL 与 Wayland 资源。
@@ -632,44 +676,6 @@ final class FushellWindow {
       }
       return '';
     });
-  }
-
-  static Future<void> _ensureSystemFontFallbackLoaded() {
-    return _fontFallbackLoad ??= _loadSystemFontFallback();
-  }
-
-  static Future<void> _loadSystemFontFallback() async {
-    const String configAsset = 'fushell_system_fonts/fallback.json';
-    const String fontAsset = 'fushell_system_fonts/system.ttf';
-
-    final String config;
-    try {
-      config = await rootBundle.loadString(configAsset);
-    } on FlutterError {
-      // The application bundle already provides every required fallback.
-      return;
-    }
-
-    final Object? decoded = jsonDecode(config);
-    if (decoded is! Map<String, Object?> ||
-        decoded['aliases'] is! List<Object?>) {
-      throw StateError('$configAsset is malformed');
-    }
-    final List<String> aliases = <String>[];
-    for (final Object? alias in decoded['aliases']! as List<Object?>) {
-      if (alias is! String || alias.isEmpty) {
-        throw StateError('$configAsset contains an invalid font alias');
-      }
-      aliases.add(alias);
-    }
-    if (aliases.isEmpty) return;
-
-    final ByteData font = await rootBundle.load(fontAsset);
-    for (final String alias in aliases) {
-      final FontLoader loader = FontLoader(alias)
-        ..addFont(Future<ByteData>.value(font));
-      await loader.load();
-    }
   }
 
   static Future<Map<String, Object?>> _sendRequest(
@@ -766,6 +772,147 @@ final class FushellProcess {
           ),
     );
   }
+}
+
+/// Immutable creation options for a non-grabbing xdg popup.
+final class PopupSurfaceRole {
+  const PopupSurfaceRole({
+    required this.positioner,
+    this.inputPassthrough = false,
+  });
+
+  final PopupPositioner positioner;
+
+  /// An empty input region lets pointer input reach surfaces underneath.
+  final bool inputPassthrough;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'kind': 'popup',
+    'positioner': positioner.toJson(),
+    'inputPassthrough': inputPassthrough,
+  };
+}
+
+/// Full popup placement in parent-local logical coordinates.
+///
+/// Positive dimensions and signed 32-bit coordinates are checked when serialized.
+/// Constraint adjustments are applied by the compositor; requested placement may
+/// differ from final placement. A reactive positioner requires xdg-shell v3.
+final class PopupPositioner {
+  const PopupPositioner({
+    required this.width,
+    required this.height,
+    required this.anchorRect,
+    this.anchor = PopupAnchor.none,
+    this.gravity = PopupGravity.none,
+    this.constraintAdjustment = const <PopupConstraintAdjustment>{},
+    this.offset = PopupOffset.zero,
+    this.reactive = false,
+  });
+
+  final int width;
+  final int height;
+  final PopupAnchorRect anchorRect;
+  final PopupAnchor anchor;
+  final PopupGravity gravity;
+  final Set<PopupConstraintAdjustment> constraintAdjustment;
+  final PopupOffset offset;
+  final bool reactive;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'width': _popupInt32(width, 'width', positive: true),
+    'height': _popupInt32(height, 'height', positive: true),
+    'anchorRect': anchorRect.toJson(),
+    'anchor': anchor.name,
+    'gravity': gravity.name,
+    'constraintAdjustment': <String>[
+      for (final value in PopupConstraintAdjustment.values)
+        if (constraintAdjustment.contains(value)) value.name,
+    ],
+    'offset': offset.toJson(),
+    'reactive': reactive,
+  };
+}
+
+/// The anchor rectangle within the parent surface's logical geometry.
+final class PopupAnchorRect {
+  const PopupAnchorRect({
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+  });
+
+  final int x;
+  final int y;
+  final int width;
+  final int height;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'x': _popupInt32(x, 'anchorRect.x'),
+    'y': _popupInt32(y, 'anchorRect.y'),
+    'width': _popupInt32(width, 'anchorRect.width', positive: true),
+    'height': _popupInt32(height, 'anchorRect.height', positive: true),
+  };
+}
+
+/// Signed logical displacement after anchoring and gravity are applied.
+final class PopupOffset {
+  const PopupOffset({this.x = 0, this.y = 0});
+
+  static const PopupOffset zero = PopupOffset();
+  final int x;
+  final int y;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'x': _popupInt32(x, 'offset.x'),
+    'y': _popupInt32(y, 'offset.y'),
+  };
+}
+
+/// Point on the anchor rectangle to which the popup is attached.
+enum PopupAnchor {
+  none,
+  top,
+  bottom,
+  left,
+  right,
+  topLeft,
+  topRight,
+  bottomLeft,
+  bottomRight,
+}
+
+/// Direction in which the popup extends from its anchor point.
+enum PopupGravity {
+  none,
+  top,
+  bottom,
+  left,
+  right,
+  topLeft,
+  topRight,
+  bottomLeft,
+  bottomRight,
+}
+
+/// Compositor adjustments permitted when the popup would leave the work area.
+enum PopupConstraintAdjustment {
+  slideX,
+  slideY,
+  flipX,
+  flipY,
+  resizeX,
+  resizeY,
+}
+
+int _popupInt32(int value, String name, {bool positive = false}) {
+  return RangeError.checkValueInInterval(
+    value,
+    positive ? 1 : -2147483648,
+    2147483647,
+    name,
+  );
 }
 
 /// 创建 layer-shell surface 时分配的不可变 role。

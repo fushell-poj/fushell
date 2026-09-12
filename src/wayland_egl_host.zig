@@ -15,6 +15,7 @@ const c = @import("c");
 const surface_channel = @import("surface_channel.zig");
 const display_state = @import("wl_display_state.zig");
 const geometry = @import("window_geometry.zig");
+const popup_geometry = @import("popup_geometry.zig");
 
 const default_width = 800;
 const default_height = 600;
@@ -198,7 +199,7 @@ pub const RenderContext = struct {
 
 /// 恰好对应一个 Flutter view 的 native 呈现与输入端点。
 ///
-/// Host 只会拥有 xdg_toplevel 或 layer-shell role 之一，绝不会同时拥有两者。它借用
+/// Host 拥有 xdg_toplevel、xdg_popup 或 layer-shell role 之一。它借用
 /// 进程级 connection/context，并拥有全部 surface 级 Wayland/EGL 对象。只有 Flutter
 /// 确认 RemoveView 后才能执行 `deinit`，否则 raster 回调可能访问已销毁的 EGL surface。
 pub const Host = struct {
@@ -211,6 +212,19 @@ pub const Host = struct {
     surface: ?*wl.Surface = null,
     xdg_surface: ?*xdg.Surface = null,
     toplevel: ?*xdg.Toplevel = null,
+    popup: ?*xdg.Popup = null,
+    /// Published by the presenter after a successful swap, under present_mutex.
+    has_presented_buffer: bool = false,
+    /// Borrowed; the registry must destroy descendants before this parent.
+    popup_parent: ?*Host = null,
+    popup_dismissed: bool = false,
+    popup_reposition_token: u32 = 0,
+    popup_repositioned_token: ?u32 = null,
+    pending_popup_repositioned_token: ?u32 = null,
+    popup_x: i32 = 0,
+    popup_y: i32 = 0,
+    pending_popup_x: i32 = 0,
+    pending_popup_y: i32 = 0,
     layer_surface: ?*zwlr.LayerSurfaceV1 = null,
     viewport: ?*wp.Viewport = null,
     fractional_scale: ?*wp.FractionalScaleV1 = null,
@@ -298,6 +312,99 @@ pub const Host = struct {
         try self.waitForInitialConfigure();
         try self.attachEglWindowSurface();
         self.state = .ready;
+    }
+
+    /// A non-grabbing popup works for menus and tooltips without a seat serial.
+    /// The parent must outlive this Host, including asynchronous Flutter removal.
+    pub fn initializePopupRole(self: *Host, role: surface_channel.PopupRole, parent: *Host) !void {
+        try self.validatePopupParent(parent);
+        try self.beginRoleInitialization();
+        errdefer self.state = .failed;
+        try validatePopupAnchor(role.positioner, parent);
+        const positioner = try self.createPopupPositioner(role.positioner);
+        defer positioner.destroy();
+        self.popup_parent = parent;
+        self.width = role.positioner.width;
+        self.height = role.positioner.height;
+        try self.createBaseSurface();
+        self.xdg_surface = self.display_state.wm_base.?.getXdgSurface(self.surface.?) catch return error.XdgSurfaceCreateFailed;
+        self.xdg_surface.?.setQueue(self.event_queue.?);
+        self.xdg_surface.?.setListener(*Host, xdgSurfaceListener, self);
+        self.popup = self.xdg_surface.?.getPopup(parent.xdg_surface, positioner) catch return error.XdgPopupCreateFailed;
+        self.popup.?.setQueue(self.event_queue.?);
+        self.popup.?.setListener(*Host, xdgPopupListener, self);
+        // Layer-shell supplies the parent only after get_popup(null), before commit.
+        if (parent.layer_surface) |layer| layer.getPopup(self.popup.?);
+        if (role.input_passthrough) {
+            const region = self.display_state.compositor.?.createRegion() catch return error.WaylandRegionCreateFailed;
+            defer region.destroy();
+            self.surface.?.setInputRegion(region);
+        }
+        self.applyBufferScale();
+        self.surface.?.commit();
+        self.display_state.flush();
+        try self.waitForInitialConfigure();
+        if (self.popup_dismissed) return error.PopupDismissed;
+        try self.attachEglWindowSurface();
+        self.state = .ready;
+    }
+
+    pub fn repositionPopup(self: *Host, requested: surface_channel.PopupPositioner) !void {
+        if (self.state != .ready) return error.SurfaceNotInitialized;
+        const popup = self.popup orelse return error.SurfaceRoleMismatch;
+        if (self.popup_dismissed) return error.PopupDismissed;
+        try self.validatePopupParent(self.popup_parent orelse return error.PopupParentUnavailable);
+        try popup_geometry.requireReposition(popup.getVersion());
+        try validatePopupAnchor(requested, self.popup_parent.?);
+        const positioner = try self.createPopupPositioner(requested);
+        defer positioner.destroy();
+        self.popup_reposition_token +%= 1;
+        popup.reposition(positioner, self.popup_reposition_token);
+        // The request is immediate; only the subsequent configure changes geometry.
+        self.display_state.flush();
+    }
+
+    fn validatePopupParent(self: *Host, parent: *Host) !void {
+        if (parent == self or parent.display_state != self.display_state) return error.InvalidPopupParent;
+        if (!parent.isReady() or parent.close_requested or parent.popup_dismissed) return error.PopupParentUnavailable;
+        if (parent.xdg_surface == null and parent.layer_surface == null) return error.InvalidPopupParent;
+        if (!parent.hasPresentedBuffer()) return error.PopupParentNotMapped;
+    }
+
+    pub fn hasPresentedBuffer(self: *Host) bool {
+        self.present_mutex.lock(self.io) catch unreachable;
+        defer self.present_mutex.unlock(self.io);
+        return self.has_presented_buffer;
+    }
+
+    fn validatePopupAnchor(requested: surface_channel.PopupPositioner, parent: *const Host) !void {
+        const rect = requested.anchor_rect;
+        if (!popup_geometry.anchorFitsParent(rect.x, rect.y, rect.width, rect.height, parent.width, parent.height)) return error.InvalidPopupGeometry;
+    }
+
+    fn createPopupPositioner(self: *Host, requested: surface_channel.PopupPositioner) !*xdg.Positioner {
+        if (requested.width <= 0 or requested.height <= 0 or requested.anchor_rect.width <= 0 or requested.anchor_rect.height <= 0) return error.InvalidPopupGeometry;
+        const wm_base = self.display_state.wm_base orelse return error.XdgShellUnavailable;
+        try popup_geometry.requireReactive(wm_base.getVersion(), requested.reactive);
+        const positioner = wm_base.createPositioner() catch return error.XdgPositionerCreateFailed;
+        positioner.setQueue(self.event_queue.?);
+        positioner.setSize(requested.width, requested.height);
+        const rect = requested.anchor_rect;
+        positioner.setAnchorRect(rect.x, rect.y, rect.width, rect.height);
+        positioner.setAnchor(@enumFromInt(@intFromEnum(requested.anchor)));
+        positioner.setGravity(@enumFromInt(@intFromEnum(requested.gravity)));
+        const constraints = requested.constraint_adjustment;
+        positioner.setConstraintAdjustment(.{
+            .slide_x = constraints.slide_x,
+            .slide_y = constraints.slide_y,
+            .flip_x = constraints.flip_x,
+            .flip_y = constraints.flip_y,
+            .resize_x = constraints.resize_x,
+            .resize_y = constraints.resize_y,
+        });
+        positioner.setOffset(requested.offset.x, requested.offset.y);
+        if (requested.reactive) positioner.setReactive();
+        return positioner;
     }
 
     pub fn initializeLayerRole(self: *Host, layer: surface_channel.LayerRole) !void {
@@ -395,6 +502,7 @@ pub const Host = struct {
     pub fn waitForInitialConfigure(self: *Host) !void {
         while (!self.configured) {
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
+            if (self.popup_dismissed) return error.PopupDismissed;
             self.display_state.flush();
             var fds = [_]c.struct_pollfd{.{
                 .fd = self.display_state.display.?.getFd(),
@@ -485,6 +593,8 @@ pub const Host = struct {
         if (self.egl_window) |window| c.wl_egl_window_destroy(window);
         if (self.fractional_scale) |fractional_scale| fractional_scale.destroy();
         if (self.viewport) |viewport| viewport.destroy();
+        if (self.popup) |popup| popup.destroy();
+        self.popup_parent = null;
         if (self.toplevel) |toplevel| toplevel.destroy();
         if (self.layer_surface) |layer_surface| layer_surface.destroy();
         if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
@@ -846,10 +956,59 @@ fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, self: *Host) void {
 fn xdgSurfaceListener(surface: *xdg.Surface, event: xdg.Surface.Event, self: *Host) void {
     switch (event) {
         .configure => |configure| {
+            if (self.popup != null) {
+                self.popup_x = self.pending_popup_x;
+                self.popup_y = self.pending_popup_y;
+                if (self.pending_popup_repositioned_token) |token| {
+                    self.popup_repositioned_token = token;
+                    self.pending_popup_repositioned_token = null;
+                }
+            }
+            const unchanged_size =
+                (self.pending_width <= 0 or self.pending_width == self.width) and
+                (self.pending_height <= 0 or self.pending_height == self.height);
             surface.ackConfigure(configure.serial);
             self.applyPendingConfigure();
             self.configured = true;
+            if (self.popup != null and unchanged_size) {
+                // Position-only configures do not trigger Flutter metrics/redraw.
+                // Commit their acknowledgement using the existing correctly sized
+                // buffer. Initial mapping and resizes still require a new frame.
+                self.present_mutex.lock(self.io) catch unreachable;
+                defer self.present_mutex.unlock(self.io);
+                if (self.isReady() and !self.close_requested and self.has_presented_buffer) {
+                    var attached_width: c_int = 0;
+                    var attached_height: c_int = 0;
+                    c.wl_egl_window_get_attached_size(self.egl_window, &attached_width, &attached_height);
+                    const metrics = self.presentationMetricsLocked();
+                    // A prior resize configure may still be awaiting its frame.
+                    if (attached_width == metrics.width and attached_height == metrics.height) {
+                        self.surface.?.commit();
+                        self.display_state.flush();
+                    }
+                }
+            }
         },
+    }
+}
+
+fn xdgPopupListener(_: *xdg.Popup, event: xdg.Popup.Event, self: *Host) void {
+    switch (event) {
+        .configure => |configure| {
+            self.pending_popup_x = configure.x;
+            self.pending_popup_y = configure.y;
+            if (configure.width > 0) self.pending_width = configure.width;
+            if (configure.height > 0) self.pending_height = configure.height;
+        },
+        .popup_done => {
+            // Serialize with raster presentation; no further buffer may be mapped.
+            self.present_mutex.lock(self.io) catch unreachable;
+            self.popup_dismissed = true;
+            self.state = .failed;
+            self.present_mutex.unlock(self.io);
+            self.close_requested = true;
+        },
+        .repositioned => |repositioned| self.pending_popup_repositioned_token = repositioned.token,
     }
 }
 
@@ -997,4 +1156,26 @@ test "desired geometry stays private until publication and metrics callback can 
     try std.testing.expect(observer.unlocked);
     try std.testing.expect(observer.coherent);
     try std.testing.expectEqual(Metrics.fromLogical(801, 601, 150), host.metricsSnapshot());
+}
+
+test "popup configure is staged and dismissal prevents further presentation" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io(), .state = .ready };
+    const original = host.metricsSnapshot();
+    xdgPopupListener(undefined, .{ .configure = .{ .x = 12, .y = 18, .width = 240, .height = 80 } }, &host);
+    try std.testing.expectEqual(original, host.metricsSnapshot());
+    try std.testing.expectEqual(@as(i32, 240), host.pending_width);
+    try std.testing.expectEqual(@as(i32, 12), host.pending_popup_x);
+    xdgPopupListener(undefined, .{ .repositioned = .{ .token = 7 } }, &host);
+    try std.testing.expectEqual(@as(?u32, null), host.popup_repositioned_token);
+    try std.testing.expectEqual(@as(?u32, 7), host.pending_popup_repositioned_token);
+    xdgPopupListener(undefined, .popup_done, &host);
+    try std.testing.expect(!host.isReady());
+    try std.testing.expect(host.popup_dismissed);
+    try std.testing.expect(host.takeCloseRequest());
+    try std.testing.expect(!host.takeCloseRequest());
+    // Late configures cannot publish new backing-store dimensions after dismissal.
+    host.applyPendingConfigure();
+    try std.testing.expectEqual(original, host.metricsSnapshot());
 }

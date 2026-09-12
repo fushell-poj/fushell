@@ -265,6 +265,12 @@ final class FushellOwnedWindow {
   ui.FlutterView get view => _view!;
   bool get isClosed => _closed.isCompleted;
 
+  /// Replaces this popup's positioner. Native rejects non-popup handles.
+  Future<void> repositionPopup(PopupPositioner positioner) {
+    if (isClosed) return Future.error(StateError('Window is closed'));
+    return FushellWindow.repositionPopup(windowId, positioner);
+  }
+
   void _markClosed() {
     if (!isClosed) _closed.complete();
   }

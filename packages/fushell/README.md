@@ -10,6 +10,35 @@ window's content to the corresponding `FlutterView` with the framework's
 `View`/`ViewCollection` widgets. Closing **all** windows does not exit the
 process; call `FushellProcess.exit` to terminate. Framework `SystemMouseCursors` work automatically through the native Wayland cursor-shape protocol when the compositor supports it; no Dart-side cursor API is required.
 
+## Fonts
+
+Flutter's engine discovers system fonts through Fontconfig. Fushell requires a
+Fontconfig-enabled Linux engine; installing a font does not make it available to
+an engine built only to scan /usr/share/fonts. The Dart SDK does not copy system
+fonts into application assets or register replacement font aliases.
+
+Use generic families such as `sans-serif`, `serif`, and `monospace` for desktop
+preferences, or declare application-owned fonts in Flutter's `pubspec.yaml`.
+System font selection follows the Fontconfig configuration visible to the running
+process, including on NixOS. After installing or changing system fonts, refresh
+the Fontconfig cache with `fc-cache -f` and restart the application so its engine
+can discover the updated fonts.
+
+## Native tooltips
+
+Import `package:fushell/tooltip.dart` and replace Material Tooltip with
+`NativeTooltip(message: ..., child: ...)` to render outside the parent window.
+Wrap your application-owned root views in `NativeTooltipHost`. The host adds
+and renders its own popup views; do not also include those views in a list of
+all PlatformDispatcher views. It must be above the explicit View/ViewCollection
+tree, not inside a parent View.
+
+For explicit lifetime management, pass a `NativeTooltipController` to the host
+and await `controller.dispose()` before terminating the application. Tooltip
+themes, direction, localization and text scaling are captured from the hovered
+widget. `animationDuration` controls the fade; reduced-motion settings disable
+it. Native popup input is passthrough, and no input grab is requested.
+
 ## Status notifier tray host
 
 Import `package:fushell/tray.dart` for the pure Dart SNI host and DBusMenu client.

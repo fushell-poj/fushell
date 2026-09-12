@@ -74,9 +74,9 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwlr_layer_shell_v1", 4);
     scanner.generate("zwlr_data_control_manager_v1", 2);
     scanner.generate("zwp_text_input_manager_v3", 2);
-    // xdg_surface/xdg_toplevel are created from xdg_wm_base, not globals.
-    // 版本 5: 兼容 wlroots 系 compositor (cage 等最高支持 5); v6 仅新增
-    // popup repositioning, fushell 不需要 (实测 hyprland 支持 v6, cage 报 invalid version)。
+    // xdg_surface, xdg_toplevel and xdg_popup inherit the negotiated wm_base version.
+    // Version 3 adds reactive positioning and popup reposition; cap at version 5
+    // and negotiate against each compositor instead of requiring newer versions.
     scanner.generate("xdg_wm_base", 5);
     const wayland_mod = b.createModule(.{
         .root_source_file = scanner.result,
@@ -138,7 +138,7 @@ pub fn build(b: *std.Build) void {
     build_tool_mod.addAnonymousImport("fushell_sdk_lib", .{
         .root_source_file = b.path("packages/fushell/lib/fushell.dart"),
     });
-    inline for (.{ "icons", "windows", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" }) |file| {
+    inline for (.{ "icons", "windows", "tooltip", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" }) |file| {
         build_tool_mod.addAnonymousImport("fushell_sdk_" ++ file, .{
             .root_source_file = b.path("packages/fushell/lib/" ++ file ++ ".dart"),
         });
@@ -320,7 +320,14 @@ fn linkRuntimeLibraries(module: *std.Build.Module, options: std.Build.Module.Lin
     module.linkSystemLibrary("EGL", options);
     module.linkSystemLibrary("GLESv2", options);
     module.linkSystemLibrary("xkbcommon", options);
-    module.linkSystemLibrary("fontconfig", options);
+    // The dynamically loaded Engine requires Fontconfig. Keep it in the host's
+    // DT_NEEDED list so standalone launches resolve it via the host RUNPATH;
+    // RUNPATH is not inherited by dependencies of a dlopen-loaded Engine.
+    var engine_font_dependency = options;
+    engine_font_dependency.needed = true;
+    // Zig 0.16 appends pkg-config's plain -l flags without honoring .needed.
+    engine_font_dependency.use_pkg_config = .no;
+    module.linkSystemLibrary("fontconfig", engine_font_dependency);
     module.linkSystemLibrary("dbus-1", options);
     module.linkSystemLibrary("dl", options);
 }
@@ -330,6 +337,5 @@ fn linkTranslateCLibraries(translate_c: *std.Build.Step.TranslateC, options: std
     translate_c.linkSystemLibrary("wayland-egl", options);
     translate_c.linkSystemLibrary("EGL", options);
     translate_c.linkSystemLibrary("GLESv2", options);
-    translate_c.linkSystemLibrary("fontconfig", options);
     translate_c.linkSystemLibrary("dbus-1", options);
 }

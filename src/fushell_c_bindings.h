@@ -9,7 +9,6 @@
 #include <wayland-egl.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
-#include <fontconfig/fontconfig.h>
 #include <dbus/dbus.h>
 #include <poll.h>
 #include <flutter_embedder.h>

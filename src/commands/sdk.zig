@@ -4,7 +4,7 @@ const cli = @import("cli");
 const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
 const embedded_sdk_lib = @embedFile("fushell_sdk_lib");
 const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
-const library_files = .{ "icons", "windows", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" };
+const library_files = .{ "icons", "windows", "tooltip", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" };
 const support_files = .{ "protocols/wayland.xml", "protocols/ext-workspace-v1.xml", "protocols/README.md", "tool/workspace/generate.dart", "tool/workspace/generate_test.dart", "tool/workspace/README.md" };
 
 pub fn execute(init: std.process.Init, options: cli.sdk.Options) !void {
