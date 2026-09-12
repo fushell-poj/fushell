@@ -285,6 +285,12 @@ final class FushellOwnedWindow {
     try {
       await Future<void>.sync(() => _owner._closeWindow(windowId));
       _owner._didClose(FushellWindowClosedEvent(windowId: windowId));
+    } on FushellSurfaceException catch (error) {
+      _closing = null;
+      // The compositor may finish closing this owned surface while its close
+      // request is in flight. Only a native close event proves it is gone.
+      if (error.code == 'WindowNotFound' && isClosed) return;
+      rethrow;
     } catch (_) {
       _closing = null;
       rethrow;

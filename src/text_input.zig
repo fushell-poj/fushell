@@ -60,7 +60,7 @@ pub const Client = struct {
 
     pub fn sendUpdate(self: *Client) void {
         const msg = self.buildUpdateMessageAlloc() catch |err| {
-            std.debug.print("[error] Failed to encode text-input update: {s}\n", .{@errorName(err)});
+            std.log.scoped(.input).err("Failed to encode text-input update: {s}", .{@errorName(err)});
             return;
         };
         defer self.gpa.free(msg);

@@ -1,6 +1,7 @@
 //! Fushell process entry point: parse a typed command, then execute it.
 //! Parsing and help never discover Flutter or perform project I/O.
 const std = @import("std");
+pub const std_options: std.Options = @import("logging.zig").options;
 const cli = @import("cli");
 const doctor_native = @import("doctor/native.zig");
 const build_command = @import("commands/build.zig");

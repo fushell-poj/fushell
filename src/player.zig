@@ -27,7 +27,7 @@ fn cleanupBrokerWithRetry(broker: *application_broker.Broker, io: std.Io) !void 
         return;
     }
     if (broker.initial_helper) |helper| {
-        std.debug.print("[error] broker cleanup still owns helper pid {d} after {d} attempts\n", .{ helper.pid, attempts });
+        std.log.scoped(.application).err("broker cleanup still owns helper pid {d} after {d} attempts", .{ helper.pid, attempts });
     }
     return last_error orelse error.BrokerCleanupFailed;
 }
@@ -35,7 +35,7 @@ fn cleanupBrokerWithRetry(broker: *application_broker.Broker, io: std.Io) !void 
 fn finishPlayerFailure(broker: ?*application_broker.Broker, io: std.Io, run_err: anyerror) !u8 {
     if (broker) |active_broker| {
         cleanupBrokerWithRetry(active_broker, io) catch |cleanup_err| {
-            std.debug.print("[error] player failed: {s}; broker cleanup failed: {s}\n", .{ @errorName(run_err), @errorName(cleanup_err) });
+            std.log.scoped(.application).err("player failed: {s}; broker cleanup failed: {s}", .{ @errorName(run_err), @errorName(cleanup_err) });
             return error.RunAndCleanupFailed;
         };
     }

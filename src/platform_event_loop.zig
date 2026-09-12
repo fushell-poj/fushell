@@ -29,7 +29,7 @@ pub const Source = struct {
 
 /// Run until quit/shutdown; state provides the Wayland display and shared queue.
 pub fn run(state: anytype, allocator: std.mem.Allocator, quit: *const std.atomic.Value(bool), message: []const u8, source: Source) !void {
-    std.debug.print("{s}\n", .{message});
+    std.log.scoped(.engine).debug("{s}", .{message});
     var fds: std.ArrayList(std.posix.pollfd) = .empty;
     defer fds.deinit(allocator);
 

@@ -19,6 +19,7 @@ const egl = @import("wayland_egl_host.zig");
 const flutter = @import("flutter_embedder.zig");
 const surface_channel = @import("surface_channel.zig");
 const display_state = @import("wl_display_state.zig");
+const input_provenance = @import("input_provenance.zig");
 const text_input = @import("text_input.zig");
 const platform_channels = @import("platform_channels.zig");
 const clipboard_service = @import("clipboard_service.zig");
@@ -30,6 +31,13 @@ const flutter_task_queue = @import("flutter_task_queue.zig");
 const flutter_compositor = @import("flutter_compositor.zig");
 const window_registry = @import("window_registry.zig");
 const bundle_loader = @import("bundle_loader.zig");
+
+fn encodeKeyboardEvent(buffer: []u8, evdev_code: u32, keysym: u32, modifiers: u32, pressed: bool) ![]u8 {
+    const scan_code = std.math.add(u32, evdev_code, 8) catch return error.InvalidKeyboardCode;
+    return std.fmt.bufPrint(buffer,
+        \\{{"type":"{s}","keymap":"linux","keyCode":{d},"modifiers":{d},"unicodeScalarValues":{d},"scanCode":{d},"toolkit":"gtk"}}
+    , .{ if (pressed) "keydown" else "keyup", keysym, modifiers, xkb.keysymToUtf32(keysym), scan_code });
+}
 const application_broker = @import("application_broker.zig");
 const application_output = @import("application_output.zig");
 const service_uri = @import("service_uri.zig");
@@ -69,11 +77,47 @@ fn runnerFromContext(context: ?*anyopaque) *Runner {
 
 /// 主线程 dispatch 键盘事件: enter/leave 更新焦点窗口, 事件交给引擎
 /// (单引擎: xkb/text_input 为引擎级状态, 焦点窗口由 surface 路由派生)。
+fn activeKeyboardHost(runner: *Runner, surface: ?*wl.Surface) ?*egl.Host {
+    const host = runner.registry.findHostBySurfaceLocked(surface) orelse return null;
+    return runner.registry.activeHostForPlatform(host.view_id) catch null;
+}
+
+fn setKeyboardFocus(runner: *Runner, next: ?*egl.Host) void {
+    const previous = runner.focused_host;
+    if (previous == next) return;
+    runner.focused_host = next;
+    runner.repeat_active_key = null;
+    if (runner.engine == null) return;
+    if (previous) |host| sendViewFocus(runner, host.view_id, false);
+    if (next) |host| sendViewFocus(runner, host.view_id, true);
+}
+
+fn sendViewFocus(runner: *Runner, view_id: i64, focused: bool) void {
+    var event: c.FlutterViewFocusEvent = std.mem.zeroes(c.FlutterViewFocusEvent);
+    event.struct_size = @sizeOf(c.FlutterViewFocusEvent);
+    event.view_id = view_id;
+    event.state = if (focused) c.kFocused else c.kUnfocused;
+    event.direction = c.kUndefined;
+    flutter.ensureSuccess(runner.api.send_view_focus(runner.engine, &event), "FlutterEngineSendViewFocusEvent") catch |err| {
+        std.log.scoped(.input).err("View focus failed: {s}", .{@errorName(err)});
+    };
+}
+
+fn invalidateInputOnKeyboardEvent(tracker: *input_provenance.Tracker, event: display_state.KeyboardEvent) void {
+    switch (event) {
+        .key => |key| if (key.state == .pressed) {
+            tracker.invalidate();
+        },
+        else => {},
+    }
+}
+
 fn displayKeyboardRouter(event: display_state.KeyboardEvent, surface: ?*wl.Surface, context: ?*anyopaque) void {
     const runner = runnerFromContext(context);
+    invalidateInputOnKeyboardEvent(&runner.input_tracker, event);
     switch (event) {
-        .enter => runner.focused_host = runner.registry.findHostBySurfaceLocked(surface),
-        .leave => runner.focused_host = null,
+        .enter => setKeyboardFocus(runner, activeKeyboardHost(runner, surface)),
+        .leave => setKeyboardFocus(runner, null),
         else => {},
     }
     runner.handleKeyboardEvent(event);
@@ -100,43 +144,93 @@ fn imeEventRouter(event: ime_v3.ImeEvent, ctx: ?*anyopaque) void {
         // 事件属于某窗口 surface: 只有焦点窗口才处理 (非焦点窗口的 enter
         // 意味着焦点切换, 真正生效的是新焦点窗口)。
         if (runner.registry.findHostBySurfaceLocked(s)) |host| {
-            if (runner.focused_host != host and event == .enter) {
-                runner.focused_host = host;
-            }
+            if (event == .enter) runner.ime_focused_host = host;
+            if (event == .leave) runner.ime_focused_host = null;
         } else return;
     }
     runner.handleImeEvent(event);
 }
 
-const PointerFocusAction = enum { enter, leave, current };
-
-fn pointerFocusTarget(comptime T: type, focus: *?*T, action: PointerFocusAction, entered: ?*T) ?*T {
-    return switch (action) {
-        .enter => blk: {
-            focus.* = entered;
-            break :blk entered;
-        },
-        .leave => blk: {
-            const target = focus.*;
-            focus.* = null;
-            break :blk target;
-        },
-        .current => focus.*,
+/// Wayland 只有 enter/leave 携带 surface；其余事件必须沿用最近一次 enter 建立的
+/// Host 引用。该引用只由平台线程读写，并在 Host 释放前清除。
+fn inputSeat(runner: *const Runner) input_provenance.Seat {
+    return .{
+        .identity = if (runner.state.pointer != null and runner.state.seat_capabilities.pointer)
+            if (runner.state.seat) |seat| @intFromPtr(seat) else 0
+        else
+            0,
+        .epoch = runner.state.pointer_epoch,
     };
 }
 
-/// Wayland 只有 enter/leave 携带 surface；其余事件必须沿用最近一次 enter 建立的
-/// Host 引用。该引用只由平台线程读写，并在 Host 释放前清除。
+const GrabContext = struct { runner: *Runner, lease: input_provenance.Lease };
+
+fn preparePopupGrab(context: *anyopaque, parent: *egl.Host, popup: *egl.Host) !void {
+    const grab: *GrabContext = @ptrCast(@alignCast(context));
+    const active = try grab.runner.registry.activeHostForPlatform(grab.lease.parent);
+    if (active != parent or parent.surface == null or @intFromPtr(parent.surface.?) != grab.lease.source_surface) return error.PopupInputParentMismatch;
+    try grab.runner.input_tracker.validateLease(grab.lease, inputSeat(grab.runner), nowNs());
+    // No dispatch or fallible work between this ownership transfer and grab.
+    grab.runner.physical_buttons.transfer(grab.lease.raw_button, grab.lease.source_surface, @intFromPtr(popup.surface.?));
+}
+
+/// A compositor may focus an unmapped popup as soon as grab is requested.
+/// Replay the latest native location only when its Flutter view becomes active.
+fn syncPointerFocus(runner: *Runner) void {
+    const next = if (runner.state.pointer != null and runner.state.pointer_enter_serial != null)
+        activeKeyboardHost(runner, runner.state.current_pointer_surface)
+    else
+        null;
+    const target = if (next) |host| if (host.state == .ready and !host.close_requested and !host.popup_dismissed) host else null else null;
+    if (runner.pointer_focused_host == target) return;
+    if (runner.pointer_focused_host) |previous| previous.leavePointerFocus();
+    runner.pointer_focused_host = target;
+    if (target) |host| host.enterPointerFocus(runner.state.pointer_surface_x, runner.state.pointer_surface_y);
+}
+
+fn displaySurfaceRetired(surface: *wl.Surface, context: ?*anyopaque) void {
+    const runner = runnerFromContext(context);
+    runner.physical_buttons.retireSurface(@intFromPtr(surface));
+    if (runner.pointer_focused_host) |host| {
+        if (host.surface == surface) {
+            host.leavePointerFocus();
+            runner.pointer_focused_host = null;
+        }
+    }
+}
+
+fn displayPointerReset(context: ?*anyopaque) void {
+    const runner = runnerFromContext(context);
+    runner.input_tracker.invalidate();
+    runner.physical_buttons.reset();
+    runner.physical_pointer_epoch = runner.state.pointer_epoch;
+    if (runner.pointer_focused_host) |previous| previous.leavePointerFocus();
+    runner.pointer_focused_host = null;
+}
+
 fn displayPointerRouter(event: wl.Pointer.Event, surface: ?*wl.Surface, context: ?*anyopaque) void {
     const runner = runnerFromContext(context);
-    const action: PointerFocusAction = switch (event) {
-        .enter => .enter,
-        .leave => .leave,
-        else => .current,
+    if (runner.physical_pointer_epoch != runner.state.pointer_epoch) {
+        displayPointerReset(context);
+    }
+    const first_press = switch (event) {
+        .button => |button| blk: {
+            const pressed = button.state == .pressed;
+            if (pressed) runner.input_tracker.invalidate();
+            // A queued press after native focus was retired has no source that
+            // could later release or retire it. Releases still clear by code.
+            if (pressed and surface == null) break :blk false;
+            break :blk runner.physical_buttons.update(button.button, pressed, if (surface) |source| @intFromPtr(source) else 0);
+        },
+        else => false,
     };
-    const entered = if (action == .enter) runner.registry.findHostBySurfaceLocked(surface) else null;
-    const target = pointerFocusTarget(egl.Host, &runner.pointer_focused_host, action, entered) orelse return;
-    target.handlePointerEvent(event);
+    syncPointerFocus(runner);
+    switch (event) {
+        .enter, .leave => return, // Focus transitions were delivered by the synchronization.
+        else => {},
+    }
+    const target = runner.pointer_focused_host orelse return;
+    target.handlePointerEvent(event, first_press);
 }
 
 const PendingClipboardRead = struct {
@@ -246,8 +340,13 @@ const Runner = struct {
     /// 键盘焦点窗口 (wl_keyboard.enter 的 surface → 窗口注册表)。
     /// null = 无焦点窗口 (键盘事件被丢弃)。
     focused_host: ?*egl.Host = null,
+    /// IME enter can precede keyboard enter; it never changes keyboard focus.
+    ime_focused_host: ?*egl.Host = null,
     /// 指针 enter 建立的窗口焦点；motion/button/axis 本身不携带 surface。
     pointer_focused_host: ?*egl.Host = null,
+    input_tracker: input_provenance.Tracker = .{},
+    physical_buttons: @import("pointer_buttons.zig").Buttons = .{},
+    physical_pointer_epoch: u64 = 0,
     // 键盘长按重复 (wl_keyboard.repeat_info): delay 后按 rate 模拟 keydown。
     repeat_delay_ms: u32 = 500,
     repeat_rate_per_sec: u32 = 25,
@@ -293,7 +392,7 @@ const Runner = struct {
             .keymap => |km| {
                 self.xkb_state.deinit();
                 self.xkb_state = xkb.Xkb.init(self.gpa, km.data) catch |err| {
-                    std.debug.print("[error] xkb keymap init failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("xkb keymap init failed: {s}", .{@errorName(err)});
                     self.xkb_state = .{};
                     return;
                 };
@@ -302,8 +401,8 @@ const Runner = struct {
                 self.last_modifiers = m.depressed;
                 self.xkb_state.updateModifiers(m.depressed, m.latched, m.locked, m.group, m.group, m.group);
             },
-            .enter => self.focused_host = null, // 由 displayKeyboardRouter 设置 (surface → host)
-            .leave => self.focused_host = null,
+            // The router owns the selected Host; do not erase it on enter.
+            .enter, .leave => self.repeat_active_key = null,
             .repeat => |r| {
                 self.repeat_delay_ms = @intCast(@max(r.delay_ms, 0));
                 self.repeat_rate_per_sec = @intCast(@max(r.rate_per_sec, 0));
@@ -328,14 +427,12 @@ const Runner = struct {
         }
     }
 
-    /// 按键处理: 组合键 / 特殊键 / 可打印字符 → text_client 更新 → 回发引擎。
+    /// Keysyms are translated by Flutter GTK maps; they are not logical key IDs.
     /// 发送 RawKeyEvent 到 flutter/keyevent 通道 (GTK 嵌入器同款格式)。
     fn sendKeyboardEvent(self: *Runner, keycode: u32, pressed: bool) void {
         const sym = self.xkb_state.getSym(keycode);
         var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf,
-            \\{{"type":"{s}","keymap":"linux","keyCode":{d},"modifiers":{d},"unicodeCodePoint":0,"scanCode":{d},"toolkit":"gtk","specifiedLogicalKey":{d},"specifiedPhysicalKey":0}}
-        , .{ if (pressed) "keydown" else "keyup", sym, self.xkb_state.getMods(), keycode, sym }) catch return;
+        const msg = encodeKeyboardEvent(&buf, keycode, sym, self.xkb_state.getMods(), pressed) catch return;
         self.sendToEngine("flutter/keyevent", msg);
     }
 
@@ -345,17 +442,17 @@ const Runner = struct {
         switch (event) {
             .preedit => |p| {
                 self.text_client.setComposing(p.text, p.cursor_begin, p.cursor_end) catch |err| {
-                    std.debug.print("[error] preedit composing failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("preedit composing failed: {s}", .{@errorName(err)});
                 };
             },
             .commit => |text| {
                 self.text_client.insertText(text) catch |err| {
-                    std.debug.print("[error] ime commit insert failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("ime commit insert failed: {s}", .{@errorName(err)});
                 };
             },
             .delete_surrounding => |d| {
                 self.text_client.deleteSurrounding(d.before, d.after) catch |err| {
-                    std.debug.print("[error] ime delete failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("ime delete failed: {s}", .{@errorName(err)});
                 };
             },
             .enter => |e| {
@@ -372,7 +469,7 @@ const Runner = struct {
                         const x = self.text_client.marked_rect_x * t[0] + self.text_client.marked_rect_y * t[4] + t[12];
                         const y = self.text_client.marked_rect_x * t[1] + self.text_client.marked_rect_y * t[5] + t[13];
                         ime.setCursorRect(@intFromFloat(x), @intFromFloat(y), 4, @intFromFloat(@max(self.text_client.marked_rect_h, 16)));
-                    } else if (self.focused_host) |focused| {
+                    } else if (self.ime_focused_host) |focused| {
                         ime.setCursorRect(
                             @intFromFloat(@max(focused.pointer_x, 0)),
                             @intFromFloat(@max(focused.pointer_y, 0)),
@@ -466,7 +563,7 @@ const Runner = struct {
                 const n = self.xkb_state.getUtf8(keycode, &buf);
                 if (n > 0 and !self.xkb_state.ctrl and !self.xkb_state.alt) {
                     self.text_client.insertText(buf[0..n]) catch |err| {
-                        std.debug.print("[error] insertText failed: {s}\n", .{@errorName(err)});
+                        std.log.scoped(.input).err("insertText failed: {s}", .{@errorName(err)});
                         return;
                     };
                 } else {
@@ -482,14 +579,14 @@ const Runner = struct {
         const text = self.text_client.state.text.items;
         if (text.len == 0) return;
         self.clipboard.setText(text) catch |err| {
-            std.debug.print("[error] clipboard set failed: {s}\n", .{@errorName(err)});
+            std.log.scoped(.input).err("clipboard set failed: {s}", .{@errorName(err)});
         };
     }
 
     fn pasteClipboard(self: *Runner) void {
         if (self.pending_clipboard_read != null) return;
         const start = self.clipboard.beginReadText() catch |err| {
-            std.debug.print("[error] clipboard read failed: {s}\n", .{@errorName(err)});
+            std.log.scoped(.input).err("clipboard read failed: {s}", .{@errorName(err)});
             return;
         };
         switch (start) {
@@ -497,7 +594,7 @@ const Runner = struct {
                 defer self.gpa.free(text);
                 if (text.len == 0) return;
                 self.text_client.insertText(text) catch |err| {
-                    std.debug.print("[error] paste failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("paste failed: {s}", .{@errorName(err)});
                     return;
                 };
                 self.sendTextInputUpdate();
@@ -530,7 +627,7 @@ const Runner = struct {
         };
         const result = self.api.send_platform_message(self.engine, &c_message);
         if (result != c.kSuccess) {
-            std.debug.print("[error] FlutterEngineSendPlatformMessage failed: {s}\n", .{flutter.resultName(result)});
+            std.log.scoped(.engine).err("FlutterEngineSendPlatformMessage failed: {s}", .{flutter.resultName(result)});
             self.requestFatal(.platform_message_failed);
         }
     }
@@ -554,7 +651,7 @@ const Runner = struct {
                 if (text) |content| {
                     if (content.len > 0) {
                         self.text_client.insertText(content) catch |err| {
-                            std.debug.print("[error] clipboard paste failed: {s}\n", .{@errorName(err)});
+                            std.log.scoped(.input).err("clipboard paste failed: {s}", .{@errorName(err)});
                             return;
                         };
                         self.sendTextInputUpdate();
@@ -572,7 +669,7 @@ const Runner = struct {
                     return;
                 }
                 const response = platform_channels.encodeClipboardText(self.gpa, text orelse "") catch |err| {
-                    std.debug.print("[error] clipboard getData response allocation failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("clipboard getData response allocation failed: {s}", .{@errorName(err)});
                     self.sendEmptyPlatformResponse(pending.response_handle);
                     return;
                 };
@@ -657,7 +754,7 @@ const Runner = struct {
 
     pub fn notifyWindowClosed(self: *Runner, window_id: i64) void {
         const payload = platform_channels.encodeWindowClosedEvent(self.gpa, window_id) catch |err| {
-            std.debug.print("[error] failed to encode window close event: {s}\n", .{@errorName(err)});
+            std.log.scoped(.window).err("failed to encode window close event: {s}", .{@errorName(err)});
             return;
         };
         defer self.gpa.free(payload);
@@ -667,7 +764,7 @@ const Runner = struct {
     pub fn applicationSetReady(self: *Runner) void {
         self.application_ready = true;
         self.dispatchNextApplicationInvocation() catch |err| {
-            std.debug.print("[error] failed to dispatch application invocation: {s}\n", .{@errorName(err)});
+            std.log.scoped(.application).err("failed to dispatch application invocation: {s}", .{@errorName(err)});
             self.requestFatal(.application_broker_failed);
         };
     }
@@ -754,11 +851,11 @@ const Runner = struct {
                 return;
             }
             if (err == error.CompletionDispatchFailed) {
-                std.debug.print("[error] failed to dispatch queued application invocation\n", .{});
+                std.log.scoped(.application).err("failed to dispatch queued application invocation", .{});
                 self.requestFatal(.application_broker_failed);
                 return;
             }
-            std.debug.print("[error] failed to complete application invocation: {s}\n", .{@errorName(err)});
+            std.log.scoped(.application).err("failed to complete application invocation: {s}", .{@errorName(err)});
             if (err != error.NoActiveInvocation and err != error.InvocationIdMismatch) self.requestFatal(.application_broker_failed);
             const error_result = runnerSendPlatformMethodError(self, response_handle, @errorName(err), @errorName(err));
             if (error_result != .sent) self.requestFatal(.platform_response_failed);
@@ -877,7 +974,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     var aot_source: c.FlutterEngineAOTDataSource = undefined;
 
     const bundle = if (is_aot) blk: {
-        std.debug.print("Flutter engine reports AOT-only execution; using AOT launch path (libapp.so).\n", .{});
+        std.log.scoped(.engine).debug("Flutter engine reports AOT-only execution; using AOT launch path (libapp.so).", .{});
         const aot_bundle = try bundle_loader.loadAot(gpa, options.bundle_path);
         errdefer aot_bundle.deinit(gpa);
         aot_source = std.mem.zeroes(c.FlutterEngineAOTDataSource);
@@ -889,7 +986,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     defer bundle.deinit(gpa);
     defer if (aot_data != null) {
         flutter.ensureSuccess(api.collect_aot_data(aot_data), "FlutterEngineCollectAOTData") catch |err| {
-            std.debug.print("[error] FlutterEngineCollectAOTData failed: {s}\n", .{@errorName(err)});
+            std.log.scoped(.engine).err("FlutterEngineCollectAOTData failed: {s}", .{@errorName(err)});
         };
     };
 
@@ -927,7 +1024,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
             }
         }
     }
-    std.debug.print("Wayland display connected and EGL bootstrap context is ready (headless shell).\n", .{});
+    std.log.scoped(.engine).debug("Wayland display connected and EGL bootstrap context is ready (headless shell).", .{});
 
     var task_queue = try flutter_task_queue.TaskQueue.init(gpa, options.io);
     defer task_queue.deinit();
@@ -937,6 +1034,8 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     runner.text_client.send_fn = textInputSendCallback;
     runner.text_client.send_context = &runner;
     display_state.setPointerEventCallback(state, displayPointerRouter, &runner);
+    state.pointer_reset_callback = displayPointerReset;
+    state.surface_retired_callback = displaySurfaceRetired;
     display_state.setKeyboardEventCallback(state, displayKeyboardRouter, &runner);
     display_state.setScaleChangeCallback(state, struct {
         fn cb(context: ?*anyopaque) void {
@@ -1022,7 +1121,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
         vm_argc += 1;
         vm_argv[vm_argc] = port_arg.ptr;
         vm_argc += 1;
-        std.debug.print("VM service requested on port {d}; waiting for engine URI.\n", .{port});
+        std.log.scoped(.engine).debug("VM service requested on port {d}; waiting for engine URI.", .{port});
     }
     if (vm_argc > 1) {
         project_args.command_line_argc = @intCast(vm_argc);
@@ -1040,14 +1139,14 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     compositor.present_view_callback = presentViewCallback;
     project_args.compositor = &compositor;
 
-    std.debug.print("Starting Flutter engine with bundle assets: {s}\n", .{bundle.assets_path});
+    std.log.scoped(.engine).debug("Starting Flutter engine with bundle assets: {s}", .{bundle.assets_path});
     var engine: c.FlutterEngine = null;
     const run_result = api.run(c.FLUTTER_ENGINE_VERSION, &renderer, &project_args, &runner, &engine);
     try flutter.ensureSuccess(run_result, "FlutterEngineRun");
     runner.engine = engine;
     errdefer if (runner.engine != null) shutdownEngine(&runner);
 
-    std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
+    std.log.scoped(.window).debug("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.", .{});
     var event_loop_error: ?anyerror = null;
     platform_event_loop.run(state, gpa, &runner.quit_requested, "Engine event loop active (headless shell).", .{
         .fd = task_queue.wake_fd,
@@ -1062,7 +1161,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
         .shutdown_fd = options.shutdown_fd,
     }) catch |err| {
         event_loop_error = err;
-        std.debug.print("[error] engine event loop stopped: {s}\n", .{@errorName(err)});
+        std.log.scoped(.engine).err("engine event loop stopped: {s}", .{@errorName(err)});
     };
 
     if (runner.application_broker) |broker| broker.failPending();
@@ -1078,11 +1177,11 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     // Every exit path uses the same teardown order, including signals and a
     // compositor disconnect: stop engine callbacks first, then destroy window
     // resources while the display is still owned by the headless host.
-    std.debug.print("Shutting down Flutter engine.\n", .{});
+    std.log.scoped(.engine).debug("Shutting down Flutter engine.", .{});
     shutdownEngine(&runner);
     shutdownAllWindows(&runner);
     shutdownShared(gpa, state);
-    std.debug.print("engine event loop exited.\n", .{});
+    std.log.scoped(.engine).debug("engine event loop exited.", .{});
     if (event_loop_error) |err| return err;
     return runner.exit_status.value();
 }
@@ -1100,7 +1199,7 @@ fn fromUserData(user_data: ?*anyopaque) *Runner {
 
 fn runsTaskOnCurrentThreadCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const context = user_data orelse {
-        std.debug.print("[error] Flutter task-runner thread check received null context\n", .{});
+        std.log.scoped(.engine).warn("Flutter task-runner thread check rejected null context", .{});
         return false;
     };
     const runner: *Runner = @ptrCast(@alignCast(context));
@@ -1128,7 +1227,7 @@ fn applicationPollReadyCallback(context: ?*anyopaque, ready: []const std.posix.p
     const runner = runnerFromContext(context);
     const broker = runner.application_broker orelse return;
     broker.handlePollFds(ready) catch |err| {
-        std.debug.print("[error] application broker poll failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.application).err("application broker poll failed: {s}", .{@errorName(err)});
         runner.requestFatal(.application_broker_failed);
         return;
     };
@@ -1137,7 +1236,7 @@ fn applicationPollReadyCallback(context: ?*anyopaque, ready: []const std.posix.p
 
 fn postFlutterTaskCallback(task: c.FlutterTask, target_time_nanos: u64, user_data: ?*anyopaque) callconv(.c) void {
     const context = user_data orelse {
-        std.debug.print("[error] Flutter task post received null context\n", .{});
+        std.log.scoped(.engine).warn("Flutter task post rejected null context", .{});
         return;
     };
     const runner: *Runner = @ptrCast(@alignCast(context));
@@ -1219,7 +1318,7 @@ fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
     const runner = fromUserData(user_data);
     if (runner.application_broker) |broker| {
         broker.pump() catch |err| {
-            std.debug.print("[error] application broker pump failed: {s}\n", .{@errorName(err)});
+            std.log.scoped(.application).err("application broker pump failed: {s}", .{@errorName(err)});
             runner.requestFatal(.application_broker_failed);
             return;
         };
@@ -1232,11 +1331,11 @@ fn flutterTaskPumpCallback(user_data: ?*anyopaque) !void {
         if (broker.takeCancellationRequest()) |id|
             runner.sendApplicationCancellation(id);
         if (broker.recoveryExitRequested()) {
-            std.debug.print("Application command ignored cancellation; restarting daemon.\n", .{});
+            std.log.scoped(.application).warn("Application command ignored cancellation; restarting daemon.", .{});
             runner.quit_requested.store(true, .release);
         } else {
             runner.dispatchNextApplicationInvocation() catch |err| {
-                std.debug.print("[error] failed to dispatch queued application invocation: {s}\n", .{@errorName(err)});
+                std.log.scoped(.application).err("failed to dispatch queued application invocation: {s}", .{@errorName(err)});
                 runner.requestFatal(.application_broker_failed);
                 return;
             };
@@ -1280,7 +1379,7 @@ fn metricsCallback(host: *egl.Host, context: ?*anyopaque, host_metrics: egl.Metr
     // 窗口关闭中: 引擎可能已不认这个 view, 发送即 UAF。
     if (runner.engine == null or host.state == .shutting_down) return;
     sendMetrics(runner, host_metrics, host.view_id) catch |err| {
-        std.debug.print("[error] Flutter metrics callback failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.engine).err("Flutter metrics callback failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -1312,15 +1411,23 @@ fn sendPointerEvent(runner: *Runner, host_event: egl.PointerEvent, view_id: i64)
 
 fn pointerCallback(host: *egl.Host, context: ?*anyopaque, host_event: egl.PointerEvent) void {
     const runner = runnerFromContext(context);
+    if (host_event.press_serial) |serial| {
+        runner.input_tracker.record(.{
+            .view_id = host.view_id,
+            .time_us = @as(u64, host_event.time_ms.?) * 1000,
+            .device = 0,
+            .buttons = host_event.buttons,
+        }, inputSeat(runner), serial, host_event.press_button.?, @intFromPtr(host.surface.?), nowNs());
+    }
     sendPointerEvent(runner, host_event, host.view_id) catch |err| {
-        std.debug.print("[error] Flutter pointer callback failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.input).err("Flutter pointer callback failed: {s}", .{@errorName(err)});
     };
 }
 
 fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user_data: ?*anyopaque) callconv(.c) void {
     const runner = fromUserData(user_data);
     if (raw_message == null) {
-        std.debug.print("Received null Flutter platform message.\n", .{});
+        std.log.scoped(.platform).warn("Received null Flutter platform message.", .{});
         return;
     }
     const message = raw_message.*;
@@ -1334,7 +1441,7 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
         .mouse_cursor => platform_channels.handleMouseCursorMessage(runner, message, payload, sendGuardedPlatformResponse),
         .application => platform_channels.handleApplicationChannelMessage(runner, message, payload),
         .unsupported => {
-            std.debug.print("[info] Unsupported Flutter platform channel: {s}\n", .{channel});
+            std.log.scoped(.platform).debug("Unsupported Flutter platform channel: {s}", .{channel});
             runner.sendPlatformResponse(message.response_handle, "");
         },
     }
@@ -1343,6 +1450,18 @@ fn platformMessageCallback(raw_message: [*c]const c.FlutterPlatformMessage, user
 /// Execute one parsed fushell/window or fushell/process lifecycle request.
 fn runnerHandleSurfaceRequest(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.Request) !void {
     switch (request) {
+        .capture_input => |req| {
+            _ = try runner.registry.activeHostForPlatform(req.window_id);
+            const token = try runner.input_tracker.capture(.{
+                .view_id = req.window_id,
+                .time_us = req.time_us,
+                .device = req.device,
+                .buttons = req.buttons,
+            }, inputSeat(runner), nowNs());
+            const response = try std.fmt.allocPrint(runner.gpa, "{{\"id\":{d},\"ok\":true,\"inputToken\":{d}}}", .{ req.id, token });
+            defer runner.gpa.free(response);
+            if (response_handle) |handle| _ = runnerSendPlatformResponse(runner, handle, response);
+        },
         .open_window => |req| try openWindow(runner, response_handle, req),
         .close_window => |req| try closeWindow(runner, response_handle, req),
         .update_window => |req| try updateWindowSurface(runner, response_handle, req),
@@ -1360,6 +1479,14 @@ fn runnerHandleSurfaceRequest(runner: *Runner, response_handle: ?*const c.Flutte
 /// 回复在 add_view_callback 确认 added 后发出 (保证 Dart 收到 windowId 时
 /// view 已在引擎注册、PlatformDispatcher.views 即将可见)。
 pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.OpenWindowRequest) !void {
+    const grab_token = switch (request.role) {
+        .popup => |popup| popup.grab_token,
+        else => null,
+    };
+    var grab_context: ?GrabContext = if (grab_token) |token| .{
+        .runner = runner,
+        .lease = try runner.input_tracker.consume(token, request.parent orelse return error.ParentWindowNotFound, inputSeat(runner), nowNs()),
+    } else null;
     runner.registry.lock();
     const parent_host = if (request.parent) |parent_id| blk: {
         const parent_entry = runner.registry.findByViewIdLocked(parent_id) orelse {
@@ -1415,7 +1542,12 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
     switch (request.role) {
         .window => |w| try host.initializeWindowRole(w, if (parent_host) |parent| parent.toplevel else null),
         .layer => |l| try host.initializeLayerRole(l),
-        .popup => |p| try host.initializePopupRole(p, parent_host.?),
+        .popup => |p| try host.initializePopupRole(p, parent_host.?, if (grab_context) |*ctx| .{
+            .seat = runner.state.seat orelse return error.PopupInputSeatChanged,
+            .serial = ctx.lease.serial,
+            .context = ctx,
+            .prepare = preparePopupGrab,
+        } else null),
     }
     runner.registry.lock();
     runner.registry.indexSurfaceLocked(entry) catch |err| {
@@ -1440,7 +1572,7 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
     add_info.user_data = entry;
     add_info.add_view_callback = addViewCallback;
     try flutter.ensureSuccess(runner.api.add_view(runner.engine, &add_info), "FlutterEngineAddView");
-    std.debug.print("window.open: view {d} (parent {any})\n", .{ view_id, request.parent });
+    std.log.scoped(.window).debug("window.open: view {d} (parent {any})", .{ view_id, request.parent });
 }
 
 fn wakeWindowLifecycle(context: *anyopaque) void {
@@ -1470,6 +1602,7 @@ fn beginWindowRemoval(
     if (entry.lifecycle != .active) return error.WindowNotReady;
     entry.pending_close_response = response_handle;
     entry.pending_close_request_id = request_id;
+    runner.input_tracker.invalidateView(entry.view_id);
     runner.registry.requestCloseTreeLocked(entry);
     // Submit leaves after AddView results. Parents keep rendering until all
     // owned children have completed RemoveView and native host cleanup.
@@ -1520,7 +1653,7 @@ fn processPendingWindowRemovals(runner: *Runner) void {
         runner.registry.unlock();
         const candidate = entry orelse break;
         submitWindowRemoval(runner, candidate) catch |err| {
-            std.debug.print("[error] deferred view removal failed: {s}\n", .{@errorName(err)});
+            std.log.scoped(.window).err("deferred view removal failed: {s}", .{@errorName(err)});
             cancelWindowCloseChain(runner, candidate, @errorName(err));
         };
     }
@@ -1535,7 +1668,7 @@ pub fn closeWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMe
     };
     runner.registry.unlock();
     try beginWindowRemoval(runner, entry, response_handle, request.id);
-    std.debug.print("window.close: view {d} (remove pending)\n", .{request.window_id});
+    std.log.scoped(.window).debug("window.close: view {d} (remove pending)", .{request.window_id});
 }
 
 /// Wayland close listeners only set a flag. The next platform-thread tick
@@ -1550,10 +1683,10 @@ fn processCompositorCloseRequests(runner: *Runner) void {
         if (!should_close) continue;
 
         beginWindowRemoval(runner, entry, null, 0) catch |err| {
-            std.debug.print("[error] compositor close failed for view {d}: {s}\n", .{ view_id, @errorName(err) });
+            std.log.scoped(.window).err("compositor close failed for view {d}: {s}", .{ view_id, @errorName(err) });
             continue;
         };
-        std.debug.print("compositor close: view {d} (remove pending)\n", .{view_id});
+        std.log.scoped(.window).debug("compositor close: view {d} (remove pending)", .{view_id});
     }
 }
 
@@ -1630,8 +1763,15 @@ fn processViewLifecycleResults(runner: *Runner) void {
         runner.registry.unlock();
 
         if (release_entry) {
+            runner.input_tracker.invalidateView(view_id);
             if (runner.focused_host == &entry.host) runner.focused_host = null;
+            if (runner.ime_focused_host == &entry.host) runner.ime_focused_host = null;
             if (runner.pointer_focused_host == &entry.host) runner.pointer_focused_host = null;
+            if (runner.state.current_pointer_surface == entry.host.surface) {
+                runner.state.current_pointer_surface = null;
+                runner.state.pointer_enter_serial = null;
+            }
+            if (runner.state.current_keyboard_surface == entry.host.surface) runner.state.current_keyboard_surface = null;
             // A presentation may have acquired the host before it was marked
             // removing. Wait for it before destroying the surface or entry.
             entry.host.present_mutex.lockUncancelable(runner.registry.io);
@@ -1646,8 +1786,12 @@ fn processViewLifecycleResults(runner: *Runner) void {
         switch (completion) {
             .none => {},
             .add_succeeded => {
+                // Initial configure dispatch may have delivered keyboard.enter
+                // before AddView and surface indexing completed.
+                setKeyboardFocus(runner, activeKeyboardHost(runner, runner.state.current_keyboard_surface));
+                syncPointerFocus(runner);
                 const response = surface_channel.openSuccessResponse(runner.gpa, request_id, view_id) catch |err| {
-                    std.debug.print("[error] Failed to encode window.open response: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.window).err("Failed to encode window.open response: {s}", .{@errorName(err)});
                     runner.requestFatal(.platform_response_encoding_failed);
                     break;
                 };
@@ -1655,16 +1799,16 @@ fn processViewLifecycleResults(runner: *Runner) void {
                 if (handle) |h| _ = runnerSendPlatformResponse(runner, h, response);
             },
             .add_failed => {
-                std.debug.print("[error] FlutterEngineAddView reported added=false for view {d}\n", .{view_id});
+                std.log.scoped(.window).err("FlutterEngineAddView reported added=false for view {d}", .{view_id});
                 if (handle) |h| runnerSendSurfaceError(runner, h, request_id, "AddViewFailed", "engine rejected the new view");
             },
             .remove_succeeded => {
                 if (handle) |h| sendSurfaceSuccess(runner, h, request_id);
-                std.debug.print("window.close: view {d} removed and surface destroyed.\n", .{view_id});
+                std.log.scoped(.window).debug("window.close: view {d} removed and surface destroyed.", .{view_id});
             },
             .remove_failed => {
                 cancelWindowCloseChain(runner, entry, "RemoveViewFailed");
-                std.debug.print("[error] FlutterEngineRemoveView reported removed=false for view {d}\n", .{view_id});
+                std.log.scoped(.window).err("FlutterEngineRemoveView reported removed=false for view {d}", .{view_id});
                 if (handle) |h| runnerSendSurfaceError(runner, h, request_id, "RemoveViewFailed", "engine could not remove the view");
             },
         }
@@ -1700,12 +1844,12 @@ pub fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMe
     if (runner.application_broker) |broker| {
         if (broker.hasActiveInvocation()) {
             runner.exit_after_application_command = true;
-            std.debug.print("process.exit({d}) requested; deferring shutdown until the active command reply is sent.\n", .{request.code});
+            std.log.scoped(.engine).debug("process.exit({d}) requested; deferring shutdown until the active command reply is sent.", .{request.code});
             return;
         }
     }
     runner.quit_requested.store(true, .release);
-    std.debug.print("process.exit({d}) requested; stopping event loop.\n", .{request.code});
+    std.log.scoped(.engine).debug("process.exit({d}) requested; stopping event loop.", .{request.code});
 }
 
 /// Engine shutdown joins callbacks before their registry entries, wake queue, or
@@ -1727,6 +1871,8 @@ fn shutdownEngine(runner: *Runner) void {
 
 /// Engine callbacks have stopped; destroy the remaining platform windows.
 fn shutdownAllWindows(runner: *Runner) void {
+    runner.state.pointer_reset_callback = null;
+    runner.state.surface_retired_callback = null;
     while (true) {
         runner.registry.lock();
         const entry = runner.registry.newestEntryLocked() orelse {
@@ -1749,7 +1895,7 @@ fn runnerSurfaceRequestErrorCode(_: *Runner, err: anyerror) []const u8 {
 
 pub fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: i64) void {
     const response = surface_channel.successResponse(runner.gpa, id) catch |err| {
-        std.debug.print("[error] Failed to encode fushell surface success response: {s}\n", .{@errorName(err)});
+        std.log.scoped(.window).err("Failed to encode fushell surface success response: {s}", .{@errorName(err)});
         runner.requestFatal(.platform_response_encoding_failed);
         return;
     };
@@ -1759,7 +1905,7 @@ pub fn sendSurfaceSuccess(runner: *Runner, response_handle: ?*const c.FlutterPla
 
 fn runnerSendSurfaceError(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, id: ?i64, code: []const u8, message: []const u8) void {
     const response = surface_channel.errorResponse(runner.gpa, id, code, message) catch |err| {
-        std.debug.print("[error] Failed to encode fushell surface error response: {s}\n", .{@errorName(err)});
+        std.log.scoped(.window).err("Failed to encode fushell surface error response: {s}", .{@errorName(err)});
         runner.requestFatal(.platform_response_encoding_failed);
         return;
     };
@@ -1774,7 +1920,7 @@ fn runnerSendPlatformMethodError(
     message: []const u8,
 ) platform_channels.ResponseSendResult {
     const response = platform_channels.encodeMethodError(runner.gpa, code, message) catch |err| {
-        std.debug.print("[error] Failed to encode Flutter method error: {s}\n", .{@errorName(err)});
+        std.log.scoped(.platform).err("Failed to encode Flutter method error: {s}", .{@errorName(err)});
         runner.requestFatal(.platform_response_encoding_failed);
         return .engine_failed;
     };
@@ -1803,17 +1949,17 @@ fn runnerSendPlatformResponse(runner: *Runner, response_handle: ?*const c.Flutte
 
 pub fn sendRawPlatformResponse(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, response: []const u8) platform_channels.ResponseSendResult {
     if (response_handle == null) {
-        std.debug.print("Flutter platform message had no response handle.\n", .{});
+        std.log.scoped(.platform).debug("Flutter platform message had no response handle.", .{});
         return .not_requested;
     }
     if (runner.engine == null) {
-        std.debug.print("[error] Cannot reply to Flutter platform message before engine handle is available.\n", .{});
+        std.log.scoped(.platform).err("Cannot reply to Flutter platform message before engine handle is available.", .{});
         runner.requestFatal(.platform_response_failed);
         return .engine_unavailable;
     }
     const result = runner.api.send_platform_message_response(runner.engine, response_handle, response.ptr, response.len);
     if (result != c.kSuccess) {
-        std.debug.print("[error] FlutterEngineSendPlatformMessageResponse failed: {s}\n", .{flutter.resultName(result)});
+        std.log.scoped(.engine).err("FlutterEngineSendPlatformMessageResponse failed: {s}", .{flutter.resultName(result)});
         runner.requestFatal(.platform_response_failed);
         return .engine_failed;
     }
@@ -1829,7 +1975,7 @@ fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     // raster 渲染目标永远是 bootstrap pbuffer (compositor 路径: 引擎渲进 backing
     // store 纹理, 窗口 surface 只用于呈现)。
     runner.render_context.makeCurrent() catch |err| {
-        std.debug.print("[error] Flutter make_current callback failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("Flutter make_current callback failed: {s}", .{@errorName(err)});
         return false;
     };
     return true;
@@ -1838,7 +1984,7 @@ fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
 fn makeResourceCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
     runner.render_context.makeResourceCurrent() catch |err| {
-        std.debug.print("[error] Flutter make_resource_current callback failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("Flutter make_resource_current callback failed: {s}", .{@errorName(err)});
         return false;
     };
     return true;
@@ -1847,7 +1993,7 @@ fn makeResourceCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
 fn clearCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
     runner.render_context.clearCurrent() catch |err| {
-        std.debug.print("[error] Flutter clear_current callback failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("Flutter clear_current callback failed: {s}", .{@errorName(err)});
         return false;
     };
     return true;
@@ -1857,7 +2003,7 @@ fn presentCallback(user_data: ?*anyopaque) callconv(.c) bool {
     const runner = fromUserData(user_data);
     // compositor 路径下呈现由 present_view_callback 接管 (官方 GTK 嵌入器同款 no-op)。
     if (!runner.first_present_logged) {
-        std.debug.print("renderer present invoked; presentation handled by compositor present_view_callback.\n", .{});
+        std.log.scoped(.render).debug("renderer present invoked; presentation handled by compositor present_view_callback.", .{});
         runner.first_present_logged = true;
     }
     return true;
@@ -1870,7 +2016,7 @@ fn createBackingStoreCallback(config_ptr: [*c]const c.FlutterBackingStoreConfig,
     const config: *const c.FlutterBackingStoreConfig = @ptrCast(config_ptr);
     const output: *c.FlutterBackingStore = @ptrCast(backing_store_ptr);
     flutter_compositor.createBackingStore(config, output) catch |err| {
-        std.debug.print("[error] create_backing_store failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("create_backing_store failed: {s}", .{@errorName(err)});
         return false;
     };
     return true;
@@ -1881,7 +2027,7 @@ fn collectBackingStoreCallback(backing_store_ptr: [*c]const c.FlutterBackingStor
     _ = user_data;
     const backing_store: *const c.FlutterBackingStore = @ptrCast(backing_store_ptr);
     flutter_compositor.collectBackingStore(backing_store) catch |err| {
-        std.debug.print("[error] collect_backing_store failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("collect_backing_store failed: {s}", .{@errorName(err)});
         return false;
     };
     return true;
@@ -1912,7 +2058,7 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
 
     if (!host.isReady()) return true;
     runner.render_context.makeSurfaceCurrent(host.egl_surface) catch |err| {
-        std.debug.print("[error] present_view makeSurfaceCurrent failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("present_view makeSurfaceCurrent failed: {s}", .{@errorName(err)});
         return false;
     };
     // RemoveView completion may destroy the native window once this lock drops.
@@ -1921,16 +2067,16 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
     };
     const metrics = host.presentationMetricsLocked();
     flutter_compositor.presentFrame(&runner.blitter, info, @intCast(metrics.width), @intCast(metrics.height)) catch |err| {
-        std.debug.print("[error] present_view frame failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("present_view frame failed: {s}", .{@errorName(err)});
         return false;
     };
     runner.render_context.swapBuffers(host.egl_surface) catch |err| {
-        std.debug.print("[error] present_view swapBuffers failed: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).err("present_view swapBuffers failed: {s}", .{@errorName(err)});
         return false;
     };
     host.has_presented_buffer = true;
     if (!runner.compositor_first_present_logged) {
-        std.debug.print("Flutter presented first frame via compositor (view {d}).\n", .{info.view_id});
+        std.log.scoped(.render).debug("Flutter presented first frame via compositor (view {d}).", .{info.view_id});
         runner.compositor_first_present_logged = true;
     }
     return true;
@@ -1952,7 +2098,7 @@ fn glProcResolverCallback(user_data: ?*anyopaque, name: [*c]const u8) callconv(.
     if (runner.state.gles_library) |*gles_library| {
         if (gles_library.lookup(?*anyopaque, std.mem.span(name_z))) |symbol| return symbol;
     }
-    std.debug.print("Flutter GL proc resolver could not resolve: {s}\n", .{name_z});
+    std.log.scoped(.render).debug("Flutter GL proc resolver could not resolve: {s}", .{name_z});
     return null;
 }
 
@@ -1970,6 +2116,8 @@ pub var vm_service: service_uri.State = .{};
 fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
     const safe_tag = if (tag == null) "flutter" else std.mem.span(tag);
     const safe_message = if (message == null) "" else std.mem.span(message);
+    // The embedder callback has no severity field: preserve Dart prints, engine
+    // failures, and service announcements verbatim in every build mode.
     std.debug.print("[{s}] {s}\n", .{ safe_tag, safe_message });
 
     // 解析 VM service 地址: "The Dart VM service is listening on http://..."
@@ -1987,17 +2135,113 @@ fn logMessageCallback(tag: [*c]const u8, message: [*c]const u8, user_data: ?*any
     }
 }
 
-test "pointer focus survives surface-less events and clears before reuse" {
-    var first: u8 = 1;
-    var second: u8 = 2;
-    var focus: ?*u8 = null;
-
-    try std.testing.expectEqual(&first, pointerFocusTarget(u8, &focus, .enter, &first).?);
-    try std.testing.expectEqual(&first, pointerFocusTarget(u8, &focus, .current, null).?);
-    try std.testing.expectEqual(&first, pointerFocusTarget(u8, &focus, .leave, null).?);
-    try std.testing.expect(focus == null);
-    try std.testing.expect(pointerFocusTarget(u8, &focus, .current, null) == null);
-    try std.testing.expectEqual(&second, pointerFocusTarget(u8, &focus, .enter, &second).?);
+test "early native pointer focus replays only the latest live active view" {
+    const Mode = enum { activate, leave, seat_loss, close, transfer, retire_pending, retire_active };
+    const Fixed = @TypeOf(@as(wl.Pointer.Event, .{ .enter = undefined }).enter.surface_x);
+    const Recorder = struct {
+        events: [16]egl.PointerEvent = undefined,
+        count: usize = 0,
+        fn pointer(_: *egl.Host, context: ?*anyopaque, event: egl.PointerEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+    };
+    for ([_]Mode{ .activate, .leave, .seat_loss, .close, .transfer, .retire_pending, .retire_active }) |mode| {
+        var registry = WindowRegistry.init(std.testing.allocator, std.testing.io);
+        defer registry.deinit();
+        const entry = try registry.reserveLocked(null);
+        defer registry.releaseLocked(entry);
+        const surface: *wl.Surface = @ptrFromInt(1);
+        const other: *wl.Surface = @ptrFromInt(2);
+        var recorder: Recorder = .{};
+        entry.host.surface = surface;
+        entry.host.view_id = entry.view_id;
+        entry.host.state = .ready;
+        entry.host.setPointerCallback(Recorder.pointer, &recorder);
+        var state: display_state.DisplayState = .{ .pointer = @ptrFromInt(3), .pointer_event_callback = displayPointerRouter, .pointer_reset_callback = displayPointerReset, .surface_retired_callback = displaySurfaceRetired };
+        var runner: Runner = undefined;
+        runner.registry = &registry;
+        runner.state = &state;
+        runner.pointer_focused_host = null;
+        runner.input_tracker = .{};
+        runner.physical_buttons = .{};
+        runner.physical_pointer_epoch = 0;
+        state.pointer_event_context = &runner;
+        // A pre-commit grab can send enter before native surface indexing.
+        display_state.routePointerEvent(&state, .{ .enter = .{ .serial = 1, .surface = surface, .surface_x = Fixed.fromDouble(10), .surface_y = Fixed.fromDouble(20) } });
+        display_state.routePointerEvent(&state, .{ .motion = .{ .time = 1, .surface_x = Fixed.fromDouble(30), .surface_y = Fixed.fromDouble(40) } });
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 2, .time = 2, .button = 0x111, .state = .pressed } });
+        try std.testing.expectEqual(@as(usize, 0), recorder.count);
+        try registry.indexSurfaceLocked(entry);
+        syncPointerFocus(&runner); // Indexed, but AddView is still pending.
+        display_state.routePointerEvent(&state, .{ .motion = .{ .time = 3, .surface_x = Fixed.fromDouble(45), .surface_y = Fixed.fromDouble(55) } });
+        try std.testing.expectEqual(@as(usize, 0), recorder.count);
+        switch (mode) {
+            .activate, .retire_active => {},
+            .retire_pending => {
+                state.retireSurfaceInput(surface);
+                try std.testing.expectEqual(@as(usize, 0), runner.physical_buttons.count);
+            },
+            .leave => display_state.routePointerEvent(&state, .{ .leave = .{ .serial = 3, .surface = surface } }),
+            .seat_loss => {
+                state.resetPointerInput();
+                state.pointer = null;
+            },
+            .close => entry.close_requested = true,
+            .transfer => display_state.routePointerEvent(&state, .{ .enter = .{ .serial = 3, .surface = other, .surface_x = Fixed.fromDouble(1), .surface_y = Fixed.fromDouble(2) } }),
+        }
+        entry.lifecycle = .active;
+        syncPointerFocus(&runner); // The same completion hook used by AddView.
+        if (mode != .activate and mode != .retire_active) {
+            try std.testing.expectEqual(@as(usize, 0), recorder.count);
+            try std.testing.expect(runner.pointer_focused_host == null);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 2), recorder.count);
+        try std.testing.expectEqual(egl.PointerPhase.add, recorder.events[0].phase);
+        try std.testing.expectEqual(egl.PointerPhase.hover, recorder.events[1].phase);
+        try std.testing.expectEqual(@as(f64, 45), recorder.events[1].x);
+        try std.testing.expectEqual(@as(f64, 55), recorder.events[1].y);
+        // Drop release of the old pre-activation press; future clicks work.
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 4, .time = 4, .button = 0x111, .state = .released } });
+        try std.testing.expectEqual(@as(usize, 2), recorder.count);
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 5, .time = 5, .button = 0x110, .state = .pressed } });
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 6, .time = 6, .button = 0x110, .state = .released } });
+        try std.testing.expectEqual(egl.PointerPhase.down, recorder.events[2].phase);
+        try std.testing.expectEqual(egl.PointerPhase.up, recorder.events[3].phase);
+        // A stale leave for a different surface cannot erase current focus.
+        display_state.routePointerEvent(&state, .{ .leave = .{ .serial = 7, .surface = other } });
+        try std.testing.expect(runner.pointer_focused_host == &entry.host);
+        // Loss while A holds a button must emit remove immediately, even if
+        // the next native enter targets that same window and coordinates.
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 8, .time = 8, .button = 0x110, .state = .pressed } });
+        if (mode == .retire_active) {
+            // Escape destroys the source while held; its outside release never
+            // reaches this client. The next enter/press must be eligible.
+            state.retireSurfaceInput(surface);
+        } else {
+            state.resetPointerInput();
+        }
+        try std.testing.expectEqual(@as(usize, 6), recorder.count);
+        try std.testing.expectEqual(egl.PointerPhase.remove, recorder.events[5].phase);
+        try std.testing.expect(runner.pointer_focused_host == null);
+        try std.testing.expectEqual(@as(usize, 0), runner.physical_buttons.count);
+        try std.testing.expectEqual(@as(i64, 0), entry.host.pointer_buttons);
+        state.pointer = @ptrFromInt(4);
+        display_state.routePointerEvent(&state, .{ .enter = .{ .serial = 9, .surface = surface, .surface_x = Fixed.fromDouble(45), .surface_y = Fixed.fromDouble(55) } });
+        try std.testing.expectEqual(egl.PointerPhase.add, recorder.events[6].phase);
+        try std.testing.expectEqual(egl.PointerPhase.hover, recorder.events[7].phase);
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 10, .time = 10, .button = 0x110, .state = .pressed } });
+        try std.testing.expectEqual(egl.PointerPhase.down, recorder.events[8].phase);
+        try std.testing.expectEqual(@as(?u32, 10), recorder.events[8].press_serial);
+        display_state.routePointerEvent(&state, .{ .button = .{ .serial = 11, .time = 11, .button = 0x110, .state = .released } });
+        display_state.routePointerEvent(&state, .{ .leave = .{ .serial = 12, .surface = surface } });
+        syncPointerFocus(&runner);
+        try std.testing.expectEqual(@as(usize, 11), recorder.count);
+        try std.testing.expectEqual(egl.PointerPhase.remove, recorder.events[10].phase);
+        try std.testing.expect(runner.pointer_focused_host == null);
+    }
 }
 
 test "physical key transition is applied exactly once" {
@@ -2045,4 +2289,235 @@ test "key repeat reuses held key without xkb transition" {
     try std.testing.expectEqual(@as(usize, 1), state.transitions);
     try std.testing.expectEqual(@as(usize, 2), handler.repeats);
     try std.testing.expectEqual(@as(usize, 2), handler.text_updates);
+}
+
+test "native keyboard focus survives enter and is forwarded to the correct view" {
+    const Fake = struct {
+        var views: [4]i64 = undefined;
+        var states: [4]c.FlutterViewFocusState = undefined;
+        var count: usize = 0;
+        fn focus(_: c.FlutterEngine, event: *const c.FlutterViewFocusEvent) callconv(.c) c.FlutterEngineResult {
+            views[count] = event.view_id;
+            states[count] = event.state;
+            count += 1;
+            return c.kSuccess;
+        }
+    };
+    Fake.count = 0;
+    var api: flutter.Api = undefined;
+    api.send_view_focus = Fake.focus;
+    var runner: Runner = undefined;
+    runner.api = &api;
+    runner.engine = @ptrFromInt(1);
+    runner.focused_host = null;
+    runner.repeat_active_key = 30;
+    var first: egl.Host = .{ .view_id = 7 };
+    var second: egl.Host = .{ .view_id = 8 };
+    setKeyboardFocus(&runner, &first);
+    runner.handleKeyboardEvent(.{ .enter = .{ .surface = undefined, .keys = undefined } });
+    try std.testing.expect(runner.focused_host == &first);
+    try std.testing.expect(runner.repeat_active_key == null);
+    setKeyboardFocus(&runner, &second);
+    setKeyboardFocus(&runner, &second);
+    setKeyboardFocus(&runner, null);
+    try std.testing.expectEqual(@as(usize, 4), Fake.count);
+    try std.testing.expectEqualSlices(i64, &.{ 7, 7, 8, 8 }, &Fake.views);
+    try std.testing.expectEqualSlices(c.FlutterViewFocusState, &.{ c.kFocused, c.kUnfocused, c.kFocused, c.kUnfocused }, &Fake.states);
+}
+
+test "physical keyboard press invalidates mouse credentials but release does not" {
+    var tracker: input_provenance.Tracker = .{};
+    const fingerprint: input_provenance.Fingerprint = .{ .view_id = 7, .time_us = 1000, .device = 0, .buttons = 2 };
+    const seat: input_provenance.Seat = .{ .identity = 1, .epoch = 0 };
+    tracker.record(fingerprint, seat, 4, 0x111, 1, 0);
+    invalidateInputOnKeyboardEvent(&tracker, .{ .key = .{ .serial = 5, .time = 2, .key = 1, .state = .released } });
+    const token = try tracker.capture(fingerprint, seat, 1);
+    invalidateInputOnKeyboardEvent(&tracker, .{ .key = .{ .serial = 6, .time = 3, .key = 1, .state = .pressed } });
+    try std.testing.expectError(error.PopupInputUnavailable, tracker.consume(token, 7, seat, 2));
+}
+
+test "IME enter cannot suppress keyboard focus or deferred AddView synchronization" {
+    var registry = WindowRegistry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    const entry = try registry.reserveLocked(null);
+    defer registry.releaseLocked(entry);
+    var stub: u8 = 0;
+    const surface: *wl.Surface = @ptrCast(&stub);
+    entry.host.surface = surface;
+    entry.host.view_id = entry.view_id;
+    try registry.indexSurfaceLocked(entry);
+    var state: display_state.DisplayState = .{ .current_keyboard_surface = surface };
+    var runner: Runner = undefined;
+    runner.registry = &registry;
+    runner.state = &state;
+    runner.engine = null;
+    runner.focused_host = null;
+    runner.ime_focused_host = null;
+    runner.text_client.active = false;
+    runner.repeat_active_key = null;
+    // The popup exists natively but AddView has not completed.
+    imeEventRouter(.{ .enter = .{ .surface = surface } }, &runner);
+    try std.testing.expect(runner.ime_focused_host == &entry.host);
+    try std.testing.expect(runner.focused_host == null);
+    setKeyboardFocus(&runner, activeKeyboardHost(&runner, state.current_keyboard_surface));
+    try std.testing.expect(runner.focused_host == null);
+    entry.lifecycle = .active;
+    setKeyboardFocus(&runner, activeKeyboardHost(&runner, state.current_keyboard_surface));
+    try std.testing.expect(runner.focused_host == &entry.host);
+    // A later normal IME-first keyboard transition also retains the notification.
+    setKeyboardFocus(&runner, null);
+    imeEventRouter(.{ .enter = .{ .surface = surface } }, &runner);
+    displayKeyboardRouter(.{ .enter = .{ .surface = surface, .keys = undefined } }, surface, &runner);
+    try std.testing.expect(runner.focused_host == &entry.host);
+}
+
+test "GTK keyboard messages use keysyms and XKB scan codes without logical overrides" {
+    for ([_]struct { evdev: u32, sym: u32 }{ .{ .evdev = 1, .sym = 0xff1b }, .{ .evdev = 105, .sym = 0xff51 } }) |key| {
+        var buffer: [512]u8 = undefined;
+        const message = try encodeKeyboardEvent(&buffer, key.evdev, key.sym, 0, true);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, key.evdev + 8), object.get("scanCode").?.integer);
+        try std.testing.expectEqual(@as(i64, key.sym), object.get("keyCode").?.integer);
+        try std.testing.expect(!object.contains("specifiedLogicalKey"));
+        try std.testing.expect(!object.contains("specifiedPhysicalKey"));
+    }
+}
+
+test "GTK printable payload retains Unicode with Shift and Control" {
+    for ([_]struct { sym: u32, mods: u32, scalar: u32 }{
+        .{ .sym = 'a', .mods = 0, .scalar = 'a' },
+        .{ .sym = 'A', .mods = 1, .scalar = 'A' },
+        .{ .sym = 0x01004e2d, .mods = 0, .scalar = 0x4e2d },
+        .{ .sym = 'c', .mods = 4, .scalar = 'c' },
+    }) |key| {
+        var buffer: [512]u8 = undefined;
+        const message = try encodeKeyboardEvent(&buffer, 30, key.sym, key.mods, true);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, message, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, key.scalar), parsed.value.object.get("unicodeScalarValues").?.integer);
+        try std.testing.expect(!parsed.value.object.contains("unicodeCodePoint"));
+        try std.testing.expectEqual(@as(i64, key.mods), parsed.value.object.get("modifiers").?.integer);
+    }
+}
+
+test "pointer leave and button release preserve originating credentials and physical state" {
+    var state: display_state.DisplayState = .{};
+    var runner: Runner = undefined;
+    runner.state = &state;
+    runner.pointer_focused_host = null;
+    runner.input_tracker = .{};
+    runner.physical_buttons = .{};
+    runner.physical_pointer_epoch = 0;
+    const fingerprint: input_provenance.Fingerprint = .{ .view_id = 7, .time_us = 1000, .device = 0, .buttons = 2 };
+    const seat: input_provenance.Seat = .{ .identity = 1, .epoch = 0 };
+    runner.input_tracker.record(fingerprint, seat, 4, 0x111, 1, 0);
+    _ = runner.physical_buttons.update(0x111, true, 1);
+    const surface: *wl.Surface = @ptrFromInt(1);
+    displayPointerRouter(.{ .leave = .{ .serial = 5, .surface = surface } }, surface, &runner);
+    try std.testing.expectEqual(@as(usize, 1), runner.physical_buttons.count);
+    displayPointerRouter(.{ .button = .{ .serial = 6, .time = 2, .button = 0x111, .state = .released } }, null, &runner);
+    try std.testing.expectEqual(@as(usize, 0), runner.physical_buttons.count);
+    const token = try runner.input_tracker.capture(fingerprint, seat, 1);
+    const lease = try runner.input_tracker.consume(token, 7, seat, 2);
+    displayPointerRouter(.{ .button = .{ .serial = 7, .time = 3, .button = 0x111, .state = .pressed } }, null, &runner);
+    try std.testing.expectError(error.PopupInputUnavailable, runner.input_tracker.validateLease(lease, seat, 3));
+}
+
+test "grab preparation transfers only the validated still-held trigger" {
+    const Mode = enum { held, released, foreign_owner, non_grab, invalid_lease, nested };
+    for ([_]Mode{ .held, .released, .foreign_owner, .non_grab, .invalid_lease, .nested }) |mode| {
+        var registry = WindowRegistry.init(std.testing.allocator, std.testing.io);
+        defer registry.deinit();
+        const parent = try registry.reserveLocked(null);
+        defer registry.releaseLocked(parent);
+        const child = try registry.reserveLocked(parent.view_id);
+        defer registry.releaseLocked(child);
+        parent.host.surface = @ptrFromInt(11);
+        parent.host.view_id = parent.view_id;
+        parent.host.state = .ready;
+        parent.lifecycle = .active;
+        child.host.surface = @ptrFromInt(12);
+        child.host.view_id = child.view_id;
+        child.host.state = .ready;
+        child.lifecycle = .active;
+        var state: display_state.DisplayState = .{ .seat = @ptrFromInt(20), .pointer = @ptrFromInt(21), .seat_capabilities = .{ .pointer = true }, .surface_retired_callback = displaySurfaceRetired };
+        var runner: Runner = undefined;
+        runner.registry = &registry;
+        runner.state = &state;
+        runner.pointer_focused_host = null;
+        runner.input_tracker = .{};
+        runner.physical_buttons = .{};
+        state.pointer_event_context = &runner;
+        const fingerprint: input_provenance.Fingerprint = .{ .view_id = parent.view_id, .time_us = 1000, .device = 0, .buttons = 2 };
+        const seat = inputSeat(&runner);
+        const timestamp = nowNs();
+        runner.input_tracker.record(fingerprint, seat, 31, 0x111, 11, timestamp);
+        const token = try runner.input_tracker.capture(fingerprint, seat, timestamp);
+        var context: GrabContext = .{ .runner = &runner, .lease = try runner.input_tracker.consume(token, parent.view_id, seat, timestamp) };
+        _ = runner.physical_buttons.update(0x111, true, if (mode == .foreign_owner) 99 else 11);
+        if (mode == .released) _ = runner.physical_buttons.update(0x111, false, 0);
+        // An unrelated held code is never cleared or reassigned by transfer.
+        _ = runner.physical_buttons.update(0x113, true, 99);
+        const held_count = runner.physical_buttons.count;
+        if (mode == .invalid_lease) {
+            runner.input_tracker.invalidate();
+            try std.testing.expectError(error.PopupInputUnavailable, preparePopupGrab(&context, &parent.host, &child.host));
+        } else if (mode != .non_grab) {
+            try preparePopupGrab(&context, &parent.host, &child.host);
+        }
+        try std.testing.expectEqual(held_count, runner.physical_buttons.count);
+        if (mode == .nested) {
+            // Release the root trigger, then use a fresh child press for its child.
+            _ = runner.physical_buttons.update(0x111, false, 12);
+            _ = runner.physical_buttons.update(0x113, false, 12);
+            try std.testing.expect(runner.physical_buttons.update(0x110, true, 12));
+            var nested_fingerprint = fingerprint;
+            nested_fingerprint.view_id = child.view_id;
+            nested_fingerprint.time_us = 2000;
+            nested_fingerprint.buttons = 1;
+            runner.input_tracker.invalidate();
+            runner.input_tracker.record(nested_fingerprint, seat, 32, 0x110, 12, timestamp);
+            const nested_token = try runner.input_tracker.capture(nested_fingerprint, seat, timestamp);
+            context.lease = try runner.input_tracker.consume(nested_token, child.view_id, seat, timestamp);
+            var grandchild: egl.Host = .{ .surface = @ptrFromInt(13) };
+            try preparePopupGrab(&context, &child.host, &grandchild);
+            state.retireSurfaceInput(child.host.surface.?);
+            try std.testing.expectEqual(@as(usize, 1), runner.physical_buttons.count);
+            state.retireSurfaceInput(grandchild.surface.?);
+            try std.testing.expect(runner.physical_buttons.update(0x110, true, 11));
+            continue;
+        }
+        state.retireSurfaceInput(child.host.surface.?);
+        // The foreign code still prevents a new first press after child removal.
+        try std.testing.expect(!runner.physical_buttons.update(0x110, true, 11));
+        _ = runner.physical_buttons.update(0x110, false, 0);
+        _ = runner.physical_buttons.update(0x113, false, 0);
+        const transferred = mode == .held or mode == .released;
+        try std.testing.expectEqual(transferred, runner.physical_buttons.update(0x111, true, 11));
+    }
+}
+
+test "orphaned presses invalidate leases without creating unretirable held state" {
+    var registry = WindowRegistry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    var state: display_state.DisplayState = .{ .pointer = @ptrFromInt(3) };
+    var runner: Runner = undefined;
+    runner.registry = &registry;
+    runner.state = &state;
+    runner.pointer_focused_host = null;
+    runner.input_tracker = .{};
+    runner.physical_buttons = .{};
+    runner.physical_pointer_epoch = 0;
+    displayPointerRouter(.{ .button = .{ .serial = 1, .time = 1, .button = 0x111, .state = .pressed } }, null, &runner);
+    try std.testing.expectEqual(@as(usize, 0), runner.physical_buttons.count);
+    const surface: *wl.Surface = @ptrFromInt(1);
+    // Non-null pre-index input must still count, including unsupported chords.
+    displayPointerRouter(.{ .button = .{ .serial = 2, .time = 2, .button = 0x113, .state = .pressed } }, surface, &runner);
+    try std.testing.expectEqual(@as(usize, 1), runner.physical_buttons.count);
+    try std.testing.expect(!runner.physical_buttons.update(0x111, true, 1));
+    displayPointerRouter(.{ .button = .{ .serial = 3, .time = 3, .button = 0x113, .state = .released } }, null, &runner);
+    displayPointerRouter(.{ .button = .{ .serial = 4, .time = 4, .button = 0x111, .state = .released } }, null, &runner);
+    try std.testing.expect(runner.physical_buttons.update(0x111, true, 1));
 }

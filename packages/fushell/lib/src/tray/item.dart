@@ -4,25 +4,54 @@ part of '../../tray.dart';
 final class TrayIconPixmap {
   TrayIconPixmap(this.width, this.height, List<int> bytes)
     : bytes = Uint8List.fromList(bytes).asUnmodifiableView();
+  TrayIconPixmap._owned(this.width, this.height, Uint8List bytes)
+    : bytes = bytes.asUnmodifiableView();
   final int width;
   final int height;
   final Uint8List bytes;
 }
 
-List<TrayIconPixmap> _pixmaps(DBusValue? value) {
-  if (value == null || value.signature != DBusSignature('a(iiay)')) {
-    return const [];
-  }
-  final result = <TrayIconPixmap>[];
-  for (final entry in value.asArray()) {
-    final fields = entry.asStruct();
-    final width = fields[0].asInt32(), height = fields[1].asInt32();
-    final bytes = fields[2].asByteArray().toList();
-    if (width > 0 && height > 0 && width * height * 4 == bytes.length) {
-      result.add(TrayIconPixmap(width, height, bytes));
+List<TrayIconPixmap> _pixmaps(DBusValue? value) => _TrayPixmapCache(value).all;
+
+// Retain protocol values and convert only requested sizes, once per value.
+final class _TrayPixmapCache {
+  _TrayPixmapCache(DBusValue? value) {
+    if (value?.signature != DBusSignature('a(iiay)')) return;
+    for (final entry in value!.asArray()) {
+      final fields = entry.asStruct();
+      final width = fields[0].asInt32(), height = fields[1].asInt32();
+      final bytes = fields[2].asByteArray();
+      if (width > 0 && height > 0 && width * height * 4 == bytes.length) {
+        entries.add((width, height, bytes));
+      }
     }
   }
-  return List.unmodifiable(result);
+  final entries = <(int, int, Iterable<int>)>[];
+  final _decoded = <int, TrayIconPixmap>{};
+  List<TrayIconPixmap>? _all;
+  TrayIconPixmap _at(int index) => _decoded.putIfAbsent(index, () {
+    final (width, height, bytes) = entries[index];
+    return TrayIconPixmap._owned(
+      width,
+      height,
+      Uint8List(width * height * 4)..setAll(0, bytes),
+    );
+  });
+  List<TrayIconPixmap> get all => _all ??= List.unmodifiable([
+    for (var i = 0; i < entries.length; i++) _at(i),
+  ]);
+  TrayIconPixmap? best(int size, int maxSize) {
+    int? selected;
+    for (var i = 0; i < entries.length; i++) {
+      final entry = entries[i];
+      if (entry.$1 > maxSize || entry.$2 > maxSize) continue;
+      if (selected == null ||
+          (entry.$1 - size).abs() < (entries[selected].$1 - size).abs()) {
+        selected = i;
+      }
+    }
+    return selected == null ? null : _at(selected);
+  }
 }
 
 final class TrayToolTip {
@@ -58,6 +87,28 @@ final class TrayItem {
   bool _closed = false;
   int _revision = 0;
   Future<void>? _closing;
+  int _iconVersion = 0;
+  final _pixmapCaches = <String, _TrayPixmapCache>{};
+
+  /// Changes only when advertised icon inputs change, not on title/menu updates.
+  /// Snapshot this value: a TrayItem is mutable and keeps its identity.
+  int get iconVersion => _iconVersion;
+  _TrayPixmapCache _cache(String key) =>
+      _pixmapCaches.putIfAbsent(key, () => _TrayPixmapCache(_properties[key]));
+
+  /// Whether valid attention pixmaps exist, without allocating their bytes.
+  bool get hasAttentionIconPixmaps =>
+      _cache('AttentionIconPixmap').entries.isNotEmpty;
+
+  /// Selects the closest width (first wins ties), copying only that pixmap.
+  /// Returned immutable pixmaps are shared until their property changes.
+  TrayIconPixmap? bestIconPixmap({
+    int size = 20,
+    int maxSize = 512,
+    bool attention = false,
+  }) => _cache(
+    attention && hasAttentionIconPixmaps ? 'AttentionIconPixmap' : 'IconPixmap',
+  ).best(size, maxSize);
 
   String get id => _string(_properties, 'Id');
   String get title => _string(_properties, 'Title');
@@ -67,11 +118,11 @@ final class TrayItem {
   String get iconThemePath => _string(_properties, 'IconThemePath');
   String get attentionIconName => _string(_properties, 'AttentionIconName');
   String get overlayIconName => _string(_properties, 'OverlayIconName');
-  List<TrayIconPixmap> get iconPixmaps => _pixmaps(_properties['IconPixmap']);
+  List<TrayIconPixmap> get iconPixmaps => _cache('IconPixmap').all;
   List<TrayIconPixmap> get attentionIconPixmaps =>
-      _pixmaps(_properties['AttentionIconPixmap']);
+      _cache('AttentionIconPixmap').all;
   List<TrayIconPixmap> get overlayIconPixmaps =>
-      _pixmaps(_properties['OverlayIconPixmap']);
+      _cache('OverlayIconPixmap').all;
   bool get itemIsMenu => _boolean(_properties, 'ItemIsMenu');
   Map<String, DBusValue> get properties => Map.unmodifiable(_properties);
   TrayToolTip? get toolTip {
@@ -122,6 +173,21 @@ final class TrayItem {
         .getAllProperties(_itemInterface)
         .timeout(_callTimeout);
     if (_closed || revision != _revision) return;
+    const iconKeys = [
+      'IconName',
+      'IconPixmap',
+      'AttentionIconName',
+      'AttentionIconPixmap',
+      'OverlayIconName',
+      'OverlayIconPixmap',
+      'IconThemePath',
+    ];
+    if (iconKeys.any((key) => _properties[key] != properties[key]) ||
+        (_string(_properties, 'Status') == 'NeedsAttention') !=
+            (_string(properties, 'Status') == 'NeedsAttention')) {
+      ++_iconVersion;
+    }
+    _pixmapCaches.removeWhere((key, _) => _properties[key] != properties[key]);
     _properties = properties;
     _notify();
   }

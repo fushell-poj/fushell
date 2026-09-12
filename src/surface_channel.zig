@@ -11,6 +11,7 @@ pub const open_window_method = "window.open";
 pub const close_window_method = "window.close";
 pub const update_window_method = "window.update";
 pub const reposition_popup_method = "popup.reposition";
+pub const capture_input_method = "input.capture";
 pub const update_layer_method = "layer.update";
 pub const exit_method = "process.exit";
 
@@ -19,6 +20,7 @@ pub const Request = union(enum) {
     close_window: CloseWindowRequest,
     update_window: WindowUpdateRequest,
     reposition_popup: RepositionPopupRequest,
+    capture_input: CaptureInputRequest,
     update_layer: LayerUpdateRequest,
     exit: ExitRequest,
 
@@ -28,6 +30,7 @@ pub const Request = union(enum) {
             .close_window => |request| request.id,
             .update_window => |request| request.id,
             .reposition_popup => |request| request.id,
+            .capture_input => |request| request.id,
             .update_layer => |request| request.id,
             .exit => |request| request.id,
         };
@@ -38,7 +41,7 @@ pub const Request = union(enum) {
             .open_window => |request| request.deinit(gpa),
             .close_window => {},
             .update_window => |request| request.deinit(gpa),
-            .update_layer, .reposition_popup => {},
+            .update_layer, .reposition_popup, .capture_input => {},
             .exit => {},
         }
     }
@@ -141,6 +144,14 @@ pub const PopupPositioner = struct {
 pub const PopupRole = struct {
     positioner: PopupPositioner,
     input_passthrough: bool = false,
+    grab_token: ?u64 = null,
+};
+pub const CaptureInputRequest = struct {
+    id: i64,
+    window_id: i64,
+    time_us: u64,
+    device: i32,
+    buttons: i64,
 };
 pub const RepositionPopupRequest = struct {
     id: i64,
@@ -351,6 +362,16 @@ pub fn parseRequest(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Reques
         return .{ .open_window = .{ .id = id, .role = role, .parent = parent } };
     }
 
+    if (std.mem.eql(u8, method, capture_input_method)) {
+        try validateKeys(root, &.{ "id", "method", "windowId", "timeMicros", "device", "buttons" });
+        const window_id = try requiredInt(root, "windowId");
+        const time_us = try requiredInt(root, "timeMicros");
+        const device = try requiredInt(root, "device");
+        const buttons = try requiredInt(root, "buttons");
+        if (window_id <= 0 or time_us < 0 or device != 0 or buttons <= 0 or buttons > 16 or @popCount(@as(u64, @intCast(buttons))) != 1) return error.InvalidSurfaceField;
+        return .{ .capture_input = .{ .id = id, .window_id = window_id, .time_us = @intCast(time_us), .device = 0, .buttons = buttons } };
+    }
+
     if (std.mem.eql(u8, method, reposition_popup_method)) {
         try validateKeys(root, &.{ "id", "method", "windowId", "positioner" });
         const window_id = try requiredInt(root, "windowId");
@@ -425,10 +446,16 @@ fn parseRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError
         return .{ .layer = try parseLayerRole(gpa, role_object) };
     }
     if (std.mem.eql(u8, kind, "popup")) {
-        try validateKeys(role_object, &.{ "kind", "positioner", "inputPassthrough" });
+        try validateKeys(role_object, &.{ "kind", "positioner", "inputPassthrough", "grabToken" });
+        const token = try optionalInt(role_object, "grabToken");
+        const passthrough = try optionalBool(role_object, "inputPassthrough");
+        if (token) |value| {
+            if (value <= 0 or value > (1 << 53) - 1 or passthrough) return error.InvalidSurfaceField;
+        }
         return .{ .popup = .{
             .positioner = try parsePopupPositioner(role_object.get("positioner") orelse return error.MissingRequiredSurfaceField),
-            .input_passthrough = try optionalBool(role_object, "inputPassthrough"),
+            .input_passthrough = passthrough,
+            .grab_token = if (token) |value| @intCast(value) else null,
         } };
     }
     return error.UnsupportedSurfaceRole;
@@ -781,4 +808,23 @@ test "popup positioner rejects invalid geometry enums flags and types" {
         defer std.testing.allocator.free(json);
         try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, json));
     }
+}
+
+test "input capture requires exact mouse event fields" {
+    const request = try parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"input.capture\",\"windowId\":7,\"timeMicros\":12000,\"device\":0,\"buttons\":2}");
+    try std.testing.expectEqual(@as(i64, 7), request.capture_input.window_id);
+    try std.testing.expectEqual(@as(u64, 12000), request.capture_input.time_us);
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"input.capture\",\"windowId\":7,\"timeMicros\":12000,\"device\":1,\"buttons\":2}"));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"input.capture\",\"windowId\":7,\"timeMicros\":12000,\"device\":0,\"buttons\":3}"));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"input.capture\",\"windowId\":7,\"timeMicros\":-1,\"device\":0,\"buttons\":2}"));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":1,\"method\":\"input.capture\",\"windowId\":7,\"timeMicros\":12000,\"device\":0,\"buttons\":2,\"serial\":99}"));
+}
+
+test "popup grab token is optional validated and incompatible with passthrough" {
+    const request = try parseRequest(std.testing.allocator, "{\"id\":2,\"method\":\"window.open\",\"parent\":7,\"role\":{\"kind\":\"popup\",\"positioner\":{\"width\":10,\"height\":10,\"anchorRect\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1}},\"grabToken\":9}}");
+    try std.testing.expectEqual(@as(?u64, 9), request.open_window.role.popup.grab_token);
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":2,\"method\":\"window.open\",\"parent\":7,\"role\":{\"kind\":\"popup\",\"positioner\":{\"width\":10,\"height\":10,\"anchorRect\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1}},\"grabToken\":0}}"));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":2,\"method\":\"window.open\",\"parent\":7,\"role\":{\"kind\":\"popup\",\"positioner\":{\"width\":10,\"height\":10,\"anchorRect\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1}},\"grabToken\":-1}}"));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":2,\"method\":\"window.open\",\"parent\":7,\"role\":{\"kind\":\"popup\",\"positioner\":{\"width\":10,\"height\":10,\"anchorRect\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1}},\"grabToken\":9007199254740992}}"));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, "{\"id\":2,\"method\":\"window.open\",\"parent\":7,\"role\":{\"kind\":\"popup\",\"positioner\":{\"width\":10,\"height\":10,\"anchorRect\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1}},\"grabToken\":9,\"inputPassthrough\":true}}"));
 }

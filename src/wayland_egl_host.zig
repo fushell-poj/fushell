@@ -45,10 +45,20 @@ pub const PointerEvent = struct {
     scroll_delta_x: f64 = 0,
     scroll_delta_y: f64 = 0,
     time_ms: ?u32 = null,
+    press_serial: ?u32 = null,
+    press_button: ?u32 = null,
 };
 
 pub const MetricsCallback = *const fn (host: *Host, context: ?*anyopaque, metrics: Metrics) void;
 pub const PointerCallback = *const fn (host: *Host, context: ?*anyopaque, event: PointerEvent) void;
+
+/// One consumed input lease, revalidated at the final pre-commit boundary.
+pub const PopupGrab = struct {
+    seat: *wl.Seat,
+    serial: u32,
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, *Host, *Host) anyerror!void,
+};
 pub const State = enum {
     uninitialized,
     initializing,
@@ -123,7 +133,7 @@ pub const RenderContext = struct {
             return eglError("eglChooseConfig (OpenGL ES 3 required)");
         }
         if (config_count == 0) {
-            std.debug.print("OpenGL ES 3 is required: no EGL config supports ES3 with window and pbuffer surfaces.\n", .{});
+            std.log.scoped(.render).err("OpenGL ES 3 is required: no EGL config supports ES3 with window and pbuffer surfaces.", .{});
             return error.OpenGles3Unavailable;
         }
 
@@ -218,6 +228,7 @@ pub const Host = struct {
     /// Borrowed; the registry must destroy descendants before this parent.
     popup_parent: ?*Host = null,
     popup_dismissed: bool = false,
+    popup_grabbing: bool = false,
     popup_reposition_token: u32 = 0,
     popup_repositioned_token: ?u32 = null,
     pending_popup_repositioned_token: ?u32 = null,
@@ -314,9 +325,9 @@ pub const Host = struct {
         self.state = .ready;
     }
 
-    /// A non-grabbing popup works for menus and tooltips without a seat serial.
-    /// The parent must outlive this Host, including asynchronous Flutter removal.
-    pub fn initializePopupRole(self: *Host, role: surface_channel.PopupRole, parent: *Host) !void {
+    /// A popup may grab only using a validated originating input lease.
+    /// The parent outlives this Host, including asynchronous Flutter removal.
+    pub fn initializePopupRole(self: *Host, role: surface_channel.PopupRole, parent: *Host, grab: ?PopupGrab) !void {
         try self.validatePopupParent(parent);
         try self.beginRoleInitialization();
         errdefer self.state = .failed;
@@ -335,6 +346,14 @@ pub const Host = struct {
         self.popup.?.setListener(*Host, xdgPopupListener, self);
         // Layer-shell supplies the parent only after get_popup(null), before commit.
         if (parent.layer_surface) |layer| layer.getPopup(self.popup.?);
+        if (grab) |input| {
+            if (role.input_passthrough) return error.InvalidPopupGrab;
+            if (parent.popup != null and !parent.popup_grabbing) return error.PopupGrabInvalidParent;
+            try self.validatePopupParent(parent);
+            try input.prepare(input.context, parent, self);
+            self.popup.?.grab(input.seat, input.serial);
+            self.popup_grabbing = true;
+        }
         if (role.input_passthrough) {
             const region = self.display_state.compositor.?.createRegion() catch return error.WaylandRegionCreateFailed;
             defer region.destroy();
@@ -598,7 +617,11 @@ pub const Host = struct {
         if (self.toplevel) |toplevel| toplevel.destroy();
         if (self.layer_surface) |layer_surface| layer_surface.destroy();
         if (self.xdg_surface) |xdg_surface| xdg_surface.destroy();
-        if (self.surface) |surface| surface.destroy();
+        if (self.surface) |surface| {
+            self.display_state.retireSurfaceInput(surface);
+            surface.destroy();
+            self.surface = null;
+        }
         // 关键: 显式 flush, 否则 destroy 请求只进本地队列, compositor 收不到
         // → 窗口变成幽灵窗口 (线程已死但窗口还在, hyprland ping 无应答 → 未响应)。
         self.display_state.flush();
@@ -738,7 +761,7 @@ pub const Host = struct {
         }
         if (output_count == 0 or next_scale == self.scale) return;
         self.scale = next_scale;
-        std.debug.print("Using Wayland scale {d} from {d} advertised output(s) before surface enter.\n", .{ next_scale, output_count });
+        std.log.scoped(.render).debug("Using Wayland scale {d} from {d} advertised output(s) before surface enter.", .{ next_scale, output_count });
     }
 
     pub fn recomputeScale(self: *Host) void {
@@ -748,25 +771,25 @@ pub const Host = struct {
         const old_scale = self.scale;
         self.scale = next_scale;
         self.emitMetrics();
-        std.debug.print("Wayland active integer scale changed: {d} -> {d}\n", .{ old_scale, next_scale });
+        std.log.scoped(.render).debug("Wayland active integer scale changed: {d} -> {d}", .{ old_scale, next_scale });
     }
 
     fn createFractionalScaleObjects(self: *Host) void {
         const surface = self.surface orelse return;
         if (self.display_state.viewporter) |viewporter| {
             self.viewport = viewporter.getViewport(surface) catch |err| fallback: {
-                std.debug.print("wp_viewporter.get_viewport failed: {s}\n", .{@errorName(err)});
+                std.log.scoped(.window).err("wp_viewporter.get_viewport failed: {s}", .{@errorName(err)});
                 break :fallback null;
             };
         }
         if (self.display_state.fractional_scale_manager) |manager| {
             self.fractional_scale = manager.getFractionalScale(surface) catch |err| fallback: {
-                std.debug.print("wp_fractional_scale_manager_v1.get_fractional_scale failed: {s}\n", .{@errorName(err)});
+                std.log.scoped(.render).err("wp_fractional_scale_manager_v1.get_fractional_scale failed: {s}", .{@errorName(err)});
                 break :fallback null;
             };
             if (self.fractional_scale) |fractional_scale| {
                 fractional_scale.setListener(*Host, fractionalScaleListener, self);
-                std.debug.print("Wayland fractional scale protocol enabled.\n", .{});
+                std.log.scoped(.render).debug("Wayland fractional scale protocol enabled.", .{});
             }
         }
     }
@@ -780,36 +803,32 @@ pub const Host = struct {
     }
 
     /// 指针事件处理 (由 DisplayState 路由回调调用; 检查事件 surface 是否属于本窗口)。
-    pub fn handlePointerEvent(self: *Host, event: wl.Pointer.Event) void {
+    /// Activate native focus only after the Flutter view is active.
+    pub fn enterPointerFocus(self: *Host, x: f64, y: f64) void {
+        self.pointer_focused = true;
+        self.pointer_buttons = 0;
+        self.pointer_x = x;
+        self.pointer_y = y;
+        self.emitPointer(.{ .phase = .add, .x = self.physicalPointerX(), .y = self.physicalPointerY(), .buttons = 0 });
+        self.emitPointer(.{ .phase = .hover, .x = self.physicalPointerX(), .y = self.physicalPointerY(), .buttons = 0 });
+    }
+
+    pub fn leavePointerFocus(self: *Host) void {
+        if (!self.pointer_focused) return;
+        self.emitPointer(.{ .phase = .remove, .x = self.physicalPointerX(), .y = self.physicalPointerY(), .buttons = self.pointer_buttons });
+        self.pointer_focused = false;
+        self.pointer_buttons = 0;
+    }
+
+    pub fn handlePointerEvent(self: *Host, event: wl.Pointer.Event, first_press: bool) void {
         switch (event) {
             .enter => |enter| {
                 if (enter.surface != self.surface) return;
-                self.pointer_focused = true;
-                self.pointer_x = enter.surface_x.toDouble();
-                self.pointer_y = enter.surface_y.toDouble();
-                self.emitPointer(.{
-                    .phase = .add,
-                    .x = self.physicalPointerX(),
-                    .y = self.physicalPointerY(),
-                    .buttons = self.pointer_buttons,
-                });
-                self.emitPointer(.{
-                    .phase = .hover,
-                    .x = self.physicalPointerX(),
-                    .y = self.physicalPointerY(),
-                    .buttons = self.pointer_buttons,
-                });
+                self.enterPointerFocus(enter.surface_x.toDouble(), enter.surface_y.toDouble());
             },
             .leave => |leave| {
                 if (leave.surface != self.surface) return;
-                self.emitPointer(.{
-                    .phase = .remove,
-                    .x = self.physicalPointerX(),
-                    .y = self.physicalPointerY(),
-                    .buttons = self.pointer_buttons,
-                });
-                self.pointer_focused = false;
-                self.pointer_buttons = 0;
+                self.leavePointerFocus();
             },
             .motion => |motion| {
                 if (!self.pointer_focused) return;
@@ -826,21 +845,26 @@ pub const Host = struct {
             .button => |button| {
                 if (!self.pointer_focused) return;
                 const bit = mouseButtonBit(button.button) orelse {
-                    std.debug.print("Ignoring unsupported Wayland pointer button code: 0x{x}\n", .{button.button});
+                    std.log.scoped(.input).debug("Ignoring unsupported Wayland pointer button code: 0x{x}", .{button.button});
                     return;
                 };
                 const pressed = button.state == .pressed;
+                const previous_buttons = self.pointer_buttons;
+                // Do not emit an up for a press dropped before view activation.
+                if (!pressed and previous_buttons & bit == 0) return;
                 if (pressed) {
                     self.pointer_buttons |= bit;
                 } else {
                     self.pointer_buttons &= ~bit;
                 }
                 self.emitPointer(.{
-                    .phase = if (pressed) .down else .up,
+                    .phase = if (previous_buttons == 0) .down else if (self.pointer_buttons == 0) .up else .move,
                     .x = self.physicalPointerX(),
                     .y = self.physicalPointerY(),
                     .buttons = self.pointer_buttons,
                     .time_ms = button.time,
+                    .press_serial = if (first_press) button.serial else null,
+                    .press_button = if (first_press) button.button else null,
                 });
             },
             .axis => |axis| {
@@ -903,7 +927,7 @@ fn fractionalScaleListener(_: *wp.FractionalScaleV1, event: wp.FractionalScaleV1
             const old_scale_120 = self.activeScale120();
             self.fractional_scale_120 = next_scale_120;
             self.emitMetrics();
-            std.debug.print("Wayland fractional scale changed: {d}/120 -> {d}/120\n", .{ old_scale_120, next_scale_120 });
+            std.log.scoped(.render).debug("Wayland fractional scale changed: {d}/120 -> {d}/120", .{ old_scale_120, next_scale_120 });
         },
     }
 }
@@ -928,7 +952,7 @@ fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSu
         },
         .closed => {
             self.close_requested = true;
-            std.debug.print("layer_surface close requested for view {d}.\n", .{self.view_id});
+            std.log.scoped(.window).debug("layer_surface close requested for view {d}.", .{self.view_id});
         },
     }
 }
@@ -938,7 +962,7 @@ fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, self: *Host) void {
         .enter => |enter| {
             if (self.outputName(enter.output)) |name| {
                 self.entered_outputs.enter(self.display_state.allocator, name) catch |err| {
-                    std.debug.print("Unable to record output membership for global {d}: {}\n", .{ name, err });
+                    std.log.scoped(.render).warn("Unable to record output membership for global {d}: {}", .{ name, err });
                     return;
                 };
                 self.recomputeScale();
@@ -1022,20 +1046,20 @@ fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, self: *Host)
         .wm_capabilities => {},
         .close => {
             self.close_requested = true;
-            std.debug.print("xdg_toplevel close requested for view {d}.\n", .{self.view_id});
+            std.log.scoped(.window).debug("xdg_toplevel close requested for view {d}.", .{self.view_id});
         },
     }
 }
 
 fn openGlesLibrary() ?std.DynLib {
     return std.DynLib.open("libGLESv2.so.2") catch std.DynLib.open("libGLESv2.so") catch |err| {
-        std.debug.print("Unable to open libGLESv2 for GL symbol fallback: {s}\n", .{@errorName(err)});
+        std.log.scoped(.render).warn("Unable to open libGLESv2 for GL symbol fallback: {s}", .{@errorName(err)});
         return null;
     };
 }
 
 fn eglError(comptime step: []const u8) error{EglFailed} {
-    std.debug.print("{s} failed: EGL error 0x{x}\n", .{ step, c.eglGetError() });
+    std.log.scoped(.render).err("{s} failed: EGL error 0x{x}", .{ step, c.eglGetError() });
     return error.EglFailed;
 }
 

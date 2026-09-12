@@ -412,10 +412,10 @@ pub fn handlePlatformChannelMessage(runner: anytype, message: c.FlutterPlatformM
         } else null;
         if (text) |t| {
             runner.clipboard.setText(t) catch |err| {
-                std.debug.print("[error] clipboard set failed: {s}\n", .{@errorName(err)});
+                std.log.scoped(.input).err("clipboard set failed: {s}", .{@errorName(err)});
             };
         } else {
-            std.debug.print("[error] Clipboard.setData: no text in args\n", .{});
+            std.log.scoped(.input).err("Clipboard.setData: no text in args", .{});
         }
         runner.sendEmptyPlatformResponse(message.response_handle);
         return;
@@ -423,7 +423,7 @@ pub fn handlePlatformChannelMessage(runner: anytype, message: c.FlutterPlatformM
     if (std.mem.eql(u8, method, "Clipboard.hasStrings")) {
         // Flutter 3.35+: Ctrl+V 前先查剪贴板是否有内容, 期待 {"value": bool}。
         const response = encodeClipboardHasStrings(runner.gpa, runner.clipboard.hasText()) catch |err| {
-            std.debug.print("[error] clipboard hasStrings response allocation failed: {s}\n", .{@errorName(err)});
+            std.log.scoped(.input).err("clipboard hasStrings response allocation failed: {s}", .{@errorName(err)});
             runner.sendEmptyPlatformResponse(message.response_handle);
             return;
         };
@@ -449,7 +449,7 @@ pub fn handlePlatformChannelMessage(runner: anytype, message: c.FlutterPlatformM
             .immediate => |text| {
                 defer runner.gpa.free(text);
                 const response = encodeClipboardText(runner.gpa, text) catch |err| {
-                    std.debug.print("[error] clipboard getData response allocation failed: {s}\n", .{@errorName(err)});
+                    std.log.scoped(.input).err("clipboard getData response allocation failed: {s}", .{@errorName(err)});
                     runner.sendEmptyPlatformResponse(message.response_handle);
                     return;
                 };
@@ -623,7 +623,7 @@ pub fn handleApplicationChannelMessage(runner: anytype, message: c.FlutterPlatfo
 pub fn handleSurfaceChannelMessage(runner: anytype, message: c.FlutterPlatformMessage, payload: []const u8) void {
     const request = surface_channel.parseRequest(runner.gpa, payload) catch |err| {
         const code = surface_channel.parseErrorCode(err);
-        std.debug.print("[error] Invalid fushell surface message: {s}\n", .{code});
+        std.log.scoped(.platform).err("Invalid fushell surface message: {s}", .{code});
         runner.sendSurfaceError(message.response_handle, null, code, "invalid fushell surface request");
         return;
     };
@@ -631,7 +631,7 @@ pub fn handleSurfaceChannelMessage(runner: anytype, message: c.FlutterPlatformMe
 
     runner.handleSurfaceRequest(message.response_handle, request) catch |err| {
         const code = runner.surfaceRequestErrorCode(err);
-        std.debug.print("[error] Fushell surface request failed: {s}\n", .{code});
+        std.log.scoped(.platform).err("Fushell surface request failed: {s}", .{code});
         runner.sendSurfaceError(message.response_handle, request.id(), code, "fushell surface request failed");
         return;
     };

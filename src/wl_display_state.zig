@@ -59,6 +59,9 @@ pub const DisplayState = struct {
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
     cursor_shape_unavailable_logged: bool = false,
     seat: ?*wl.Seat = null,
+    seat_name: u32 = 0,
+    /// Changes whenever the native pointer/seat lifetime is invalidated.
+    pointer_epoch: u64 = 0,
     /// wl_seat 宣告的 capability。只有对应 bit 存在时才创建 pointer/keyboard proxy；
     /// 无头 compositor 可能宣告一个两项 capability 都没有的 seat，此时无条件调用
     /// get_pointer/get_keyboard 会产生协议错误。
@@ -68,8 +71,13 @@ pub const DisplayState = struct {
     keyboard_event_context: ?*anyopaque = null,
     current_keyboard_surface: ?*wl.Surface = null,
     pointer_event_callback: ?PointerEventCallback = null,
+    pointer_reset_callback: ?*const fn (?*anyopaque) void = null,
+    surface_retired_callback: ?*const fn (*wl.Surface, ?*anyopaque) void = null,
     pointer_event_context: ?*anyopaque = null,
     current_pointer_surface: ?*wl.Surface = null,
+    /// Retained even when the target surface has no active Flutter view yet.
+    pointer_surface_x: f64 = 0,
+    pointer_surface_y: f64 = 0,
     /// cursor-shape-v1 与 wl_pointer.set_cursor 都要求最新 pointer.enter serial；
     /// pointer leave 或 capability 移除后旧 serial 不得复用。
     pointer_enter_serial: ?u32 = null,
@@ -119,12 +127,12 @@ pub const DisplayState = struct {
 
     fn init(self: *DisplayState) !void {
         if (std.c.getenv("WAYLAND_DISPLAY") == null) {
-            std.debug.print("WAYLAND_DISPLAY is not set; start a Wayland compositor or run from a Wayland session.\n", .{});
+            std.log.scoped(.wayland).err("WAYLAND_DISPLAY is not set; start a Wayland compositor or run from a Wayland session.", .{});
             return error.WaylandDisplayUnavailable;
         }
 
         self.display = wl.Display.connect(null) catch {
-            std.debug.print("wl_display_connect failed for WAYLAND_DISPLAY.\n", .{});
+            std.log.scoped(.wayland).err("wl_display_connect failed for WAYLAND_DISPLAY.", .{});
             return error.WaylandDisplayUnavailable;
         };
 
@@ -136,11 +144,11 @@ pub const DisplayState = struct {
         if (self.wm_base) |wm_base| wm_base.setListener(*DisplayState, wmBaseListener, self);
 
         if (self.compositor == null) {
-            std.debug.print("Wayland global missing: wl_compositor\n", .{});
+            std.log.scoped(.wayland).err("Wayland global missing: wl_compositor", .{});
             return error.MissingWaylandGlobal;
         }
         if (self.wm_base == null) {
-            std.debug.print("Wayland global missing: xdg_wm_base\n", .{});
+            std.log.scoped(.wayland).err("Wayland global missing: xdg_wm_base", .{});
             return error.MissingWaylandGlobal;
         }
 
@@ -150,7 +158,7 @@ pub const DisplayState = struct {
         // 1x 渲染 → 在 2x 屏幕上模糊。
         if (self.display.?.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
         for (self.outputs.items) |output_state| {
-            std.debug.print("output {d} scale={d}\n", .{ output_state.name, output_state.scale });
+            std.log.scoped(.render).debug("output {d} scale={d}", .{ output_state.name, output_state.scale });
         }
 
         self.egl_display = c.eglGetDisplay(@ptrCast(self.display.?));
@@ -160,6 +168,9 @@ pub const DisplayState = struct {
     }
 
     fn deinit(self: *DisplayState) void {
+        // Window records have already been freed during final display teardown.
+        self.pointer_reset_callback = null;
+        self.surface_retired_callback = null;
         if (self.egl_display != null and self.egl_display != c.EGL_NO_DISPLAY) {
             _ = c.eglTerminate(self.egl_display);
             self.egl_display = null;
@@ -234,7 +245,7 @@ pub const DisplayState = struct {
         if (self.pointer == null) {
             const seat = self.seat orelse return;
             self.pointer = seat.getPointer() catch {
-                std.debug.print("wl_seat.get_pointer failed.\n", .{});
+                std.log.scoped(.input).err("wl_seat.get_pointer failed.", .{});
                 return;
             };
             self.pointer.?.setListener(*DisplayState, pointerListener, self);
@@ -248,19 +259,37 @@ pub const DisplayState = struct {
         const manager = self.cursor_shape_manager orelse return;
         const pointer = self.pointer orelse return;
         self.cursor_shape_device = manager.getPointer(pointer) catch {
-            std.debug.print("wp_cursor_shape_manager_v1.get_pointer failed.\n", .{});
+            std.log.scoped(.input).err("wp_cursor_shape_manager_v1.get_pointer failed.", .{});
             return;
         };
         if (self.shared_queue) |queue| self.cursor_shape_device.?.setQueue(queue);
     }
 
+    /// Every native surface cleanup retires its input ownership, including failed
+    /// creation before a Flutter view or registry index exists.
+    pub fn retireSurfaceInput(self: *DisplayState, surface: *wl.Surface) void {
+        if (self.current_pointer_surface == surface) {
+            self.current_pointer_surface = null;
+            self.pointer_enter_serial = null;
+        }
+        if (self.current_keyboard_surface == surface) self.current_keyboard_surface = null;
+        if (self.surface_retired_callback) |callback| callback(surface, self.pointer_event_context);
+    }
+
+    /// Notify consumers immediately; a removed pointer sends no final leave.
+    pub fn resetPointerInput(self: *DisplayState) void {
+        self.pointer_epoch +%= 1;
+        self.current_pointer_surface = null;
+        self.pointer_enter_serial = null;
+        if (self.pointer_reset_callback) |callback| callback(self.pointer_event_context);
+    }
+
     fn destroyPointer(self: *DisplayState) void {
+        self.resetPointerInput();
         if (self.cursor_shape_device) |device| device.destroy();
         self.cursor_shape_device = null;
         if (self.pointer) |pointer| pointer.release();
         self.pointer = null;
-        self.current_pointer_surface = null;
-        self.pointer_enter_serial = null;
     }
 
     /// 返回 false 表示 compositor 没有 cursor-shape-v1，调用方应以空 platform
@@ -269,7 +298,7 @@ pub const DisplayState = struct {
     pub fn activateCursorShape(self: *DisplayState, shape: mouse_cursor.Shape) bool {
         if (self.cursor_shape_manager == null) {
             if (!self.cursor_shape_unavailable_logged) {
-                std.debug.print("[info] Wayland compositor does not support cursor-shape-v1; keeping its default cursor.\n", .{});
+                std.log.scoped(.input).debug("Wayland compositor does not support cursor-shape-v1; keeping its default cursor.", .{});
                 self.cursor_shape_unavailable_logged = true;
             }
             return false;
@@ -286,12 +315,26 @@ pub const DisplayState = struct {
         return true;
     }
 
+    fn destroyKeyboard(self: *DisplayState) void {
+        if (self.current_keyboard_surface) |surface| {
+            self.current_keyboard_surface = null;
+            if (self.keyboard_event_callback) |callback| {
+                callback(.{ .leave = .{ .surface = surface } }, surface, self.keyboard_event_context);
+            }
+        }
+        if (self.keyboard) |keyboard| keyboard.release();
+        self.keyboard = null;
+    }
+
     fn ensureKeyboard(self: *DisplayState) void {
+        if (!self.seat_capabilities.keyboard) {
+            self.destroyKeyboard();
+            return;
+        }
         const seat = self.seat orelse return;
         if (self.keyboard != null) return;
-        if (!self.seat_capabilities.keyboard) return; // 无头 compositor: seat 无 keyboard 能力
         self.keyboard = seat.getKeyboard() catch {
-            std.debug.print("wl_seat.get_keyboard failed.\n", .{});
+            std.log.scoped(.input).err("wl_seat.get_keyboard failed.", .{});
             return;
         };
         self.keyboard.?.setListener(*DisplayState, keyboardListener, self);
@@ -340,7 +383,7 @@ pub const DisplayState = struct {
     pub fn openGlesLibrary(self: *DisplayState) void {
         if (self.gles_library != null) return;
         self.gles_library = std.DynLib.open("libGLESv2.so.2") catch std.DynLib.open("libGLESv2.so") catch |err| {
-            std.debug.print("Unable to open libGLESv2 for GL symbol fallback: {s}\n", .{@errorName(err)});
+            std.log.scoped(.render).warn("Unable to open libGLESv2 for GL symbol fallback: {s}", .{@errorName(err)});
             return;
         };
     }
@@ -353,7 +396,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
                 self.compositor = compositor;
             } else if (bindGlobal(registry, global, wl.Output)) |output| {
                 self.addOutput(.{ .name = global.name, .output = output }) catch |err| {
-                    std.debug.print("Unable to track Wayland output {d}: {}\n", .{ global.name, err });
+                    std.log.scoped(.render).warn("Unable to track Wayland output {d}: {}", .{ global.name, err });
                     output.release();
                     return;
                 };
@@ -361,6 +404,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
             } else if (bindGlobal(registry, global, wl.Seat)) |seat| {
                 if (self.seat == null) {
                     self.seat = seat;
+                    self.seat_name = global.name;
                     seat.setListener(*DisplayState, seatListener, self);
                     if (self.data_control) |dc| dc.bindDevice(seat);
                     if (self.ime) |ime| {
@@ -369,7 +413,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
                         }
                     }
                 } else {
-                    std.debug.print("Ignoring additional Wayland seat {d}; only one seat is supported in this MVP.\n", .{global.name});
+                    std.log.scoped(.input).warn("Ignoring additional Wayland seat {d}; only one seat is supported in this MVP.", .{global.name});
                     seat.release();
                 }
             } else if (bindGlobal(registry, global, wp.Viewporter)) |viewporter| {
@@ -400,6 +444,14 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Dis
             }
         },
         .global_remove => |global_remove| {
+            if (global_remove.name == self.seat_name) {
+                self.destroyPointer();
+                self.destroyKeyboard();
+                if (self.seat) |seat| seat.release();
+                self.seat = null;
+                self.seat_name = 0;
+                self.seat_capabilities = .{};
+            }
             _ = self.removeOutput(global_remove.name);
         },
     }
@@ -546,16 +598,30 @@ fn waylandCursorShape(shape: mouse_cursor.Shape) wp.CursorShapeDeviceV1.Shape {
 }
 
 fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *DisplayState) void {
+    routePointerEvent(self, event);
+}
+
+/// Preserve native focus before invoking a consumer that may not know the view yet.
+pub fn routePointerEvent(self: *DisplayState, event: wl.Pointer.Event) void {
     const surface = switch (event) {
         .enter => |enter| blk: {
             self.current_pointer_surface = enter.surface;
             self.pointer_enter_serial = enter.serial;
+            self.pointer_surface_x = enter.surface_x.toDouble();
+            self.pointer_surface_y = enter.surface_y.toDouble();
             break :blk enter.surface;
         },
         .leave => |leave| blk: {
-            self.current_pointer_surface = null;
-            self.pointer_enter_serial = null;
+            if (self.current_pointer_surface == leave.surface) {
+                self.current_pointer_surface = null;
+                self.pointer_enter_serial = null;
+            }
             break :blk leave.surface;
+        },
+        .motion => |motion| blk: {
+            self.pointer_surface_x = motion.surface_x.toDouble();
+            self.pointer_surface_y = motion.surface_y.toDouble();
+            break :blk self.current_pointer_surface;
         },
         else => self.current_pointer_surface,
     };
@@ -581,6 +647,6 @@ fn bindGlobal(registry: *wl.Registry, global: @FieldType(wl.Registry.Event, "glo
 }
 
 fn eglError(comptime step: []const u8) error{EglFailed} {
-    std.debug.print("{s} failed: EGL error 0x{x}\n", .{ step, c.eglGetError() });
+    std.log.scoped(.render).err("{s} failed: EGL error 0x{x}", .{ step, c.eglGetError() });
     return error.EglFailed;
 }

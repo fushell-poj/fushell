@@ -249,7 +249,7 @@ pub const Broker = struct {
 
     fn cleanupBrokerInitializationFailure(broker: *Broker, init_err: anyerror) anyerror {
         broker.deinit() catch |cleanup_err| {
-            std.debug.print("[error] broker initialization failed: {s}; cleanup failed: {s}\n", .{ @errorName(init_err), @errorName(cleanup_err) });
+            std.log.scoped(.application).err("broker initialization failed: {s}; cleanup failed: {s}", .{ @errorName(init_err), @errorName(cleanup_err) });
             return error.OpenInitializationCleanupFailed;
         };
         return init_err;
@@ -1033,7 +1033,7 @@ fn forwardCommand(
         &helper,
     ) catch |inner_err| {
         helper.deinit() catch |cleanup_err| {
-            std.debug.print("[error] forward failed: {s}; helper cleanup failed: {s}\n", .{ @errorName(inner_err), @errorName(cleanup_err) });
+            std.log.scoped(.application).err("forward failed: {s}; helper cleanup failed: {s}", .{ @errorName(inner_err), @errorName(cleanup_err) });
             return error.ForwardAndCleanupFailed;
         };
         return inner_err;

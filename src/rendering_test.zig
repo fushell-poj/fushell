@@ -5,6 +5,8 @@ test {
     _ = @import("wayland_egl_host.zig");
     _ = @import("window_geometry_test.zig");
     _ = @import("popup_geometry.zig");
+    _ = @import("input_provenance.zig");
+    _ = @import("pointer_buttons.zig");
 }
 
 test "host loads Fontconfig before the dynamic Flutter engine" {

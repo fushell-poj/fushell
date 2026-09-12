@@ -53,7 +53,7 @@ pub const Api = struct {
         _ = std.c.dlerror();
         const handle = std.c.dlopen(path_z.ptr, .{ .LAZY = true }) orelse {
             const raw_error = std.c.dlerror() orelse return error.FlutterEngineLoadFailed;
-            std.debug.print("dlopen({s}) failed: {s}\n", .{ library_path, std.mem.span(raw_error) });
+            std.log.scoped(.engine).err("dlopen({s}) failed: {s}", .{ library_path, std.mem.span(raw_error) });
             return error.FlutterEngineLoadFailed;
         };
         errdefer _ = std.c.dlclose(handle);
@@ -92,9 +92,9 @@ fn loadSymbol(comptime T: type, handle: ?*anyopaque, comptime name: [:0]const u8
     const raw = std.c.dlsym(handle, name.ptr) orelse {
         const raw_error = std.c.dlerror();
         if (raw_error) |message| {
-            std.debug.print("dlsym({s}) failed: {s}\n", .{ name, std.mem.span(message) });
+            std.log.scoped(.engine).warn("dlsym({s}) failed: {s}", .{ name, std.mem.span(message) });
         } else {
-            std.debug.print("dlsym({s}) failed\n", .{name});
+            std.log.scoped(.engine).warn("dlsym({s}) failed", .{name});
         }
         return error.FlutterEngineSymbolMissing;
     };
@@ -113,7 +113,7 @@ pub fn resultName(result: c.FlutterEngineResult) []const u8 {
 
 pub fn ensureSuccess(result: c.FlutterEngineResult, step: []const u8) !void {
     if (result == c.kSuccess) return;
-    std.debug.print("{s} failed: {s} ({d})\n", .{ step, resultName(result), result });
+    std.log.scoped(.engine).err("{s} failed: {s} ({d})", .{ step, resultName(result), result });
     return error.FlutterEngineCallFailed;
 }
 

@@ -39,6 +39,13 @@ pub const KEY_Alt_R: u32 = 0xffea;
 pub const KEY_Super_L: u32 = 0xffeb;
 pub const KEY_Super_R: u32 = 0xffec;
 
+extern "c" fn xkb_keysym_to_utf32(keysym: u32) u32;
+
+/// Preserve printable key identity even with Control held.
+pub fn keysymToUtf32(keysym: u32) u32 {
+    return xkb_keysym_to_utf32(keysym);
+}
+
 extern "c" fn xkb_context_new(flags: u32) ?*anyopaque;
 extern "c" fn xkb_context_unref(context: ?*anyopaque) void;
 extern "c" fn xkb_keymap_new_from_string(context: ?*anyopaque, string: [*:0]const u8, format: c_int, flags: u32) ?*anyopaque;

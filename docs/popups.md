@@ -44,9 +44,21 @@ Close a popup with `FushellWindow.closeWindow(popupId)` and observe `FushellWind
 
 ## Input and Tooltip integration
 
-These popups do not request an explicit Wayland input grab. `inputPassthrough: true` creates an empty input region for the entire popup so a tooltip does not intercept pointer input. This option is fixed at creation. A transparent pixel by itself does not create an input hole.
+Popups are non-grabbing by default. Setting inputPassthrough to true creates an empty input region for the entire popup so a tooltip does not intercept pointer input. This option is fixed at creation. A transparent pixel by itself does not create an input hole.
 
-Ordinary popups can receive pointer input, but the API does not promise menu-style keyboard focus or automatic dismissal on outside clicks. Handle application dismissal and native close events. The compositor can dismiss a popup independently; the native `popup_done` event enters the same owned close path.
+For a mouse-triggered menu, call PopupGrab.capture(pointerDownEvent) from the actual pointer-down handler and retain its Future through gesture recognition and asynchronous cleanup. Handle capture failures even if the gesture is cancelled. Pass the resulting credential as PopupSurfaceRole(grab: grab, positioner: positioner) to FushellWindow.openPopup. The credential is bound to grab.windowId, which must equal the popup parent. Keyboard, touch, synthetic and chorded presses are not supported by this capture API; do not manufacture an event or reuse a previous click.
+
+Capture correlates the exact view, timestamp, device and button mask with bounded native press history. It never selects a global latest serial. A credential may be captured once and consumed once; it expires after five seconds and is invalidated by a new press, parent destruction or seat/pointer replacement. Button release and pointer leave alone do not invalidate it, allowing tap handlers and asynchronous cleanup to finish while the pointer moves toward the menu. Ambiguous, stale, mismatched or consumed input is rejected explicitly. There is no silent fallback to a non-grabbing menu.
+
+Attach an error handler to the capture Future immediately in the pointer-down handler, including when a later gesture may cancel without opening a menu. Claim the menu request at tap time before awaiting that Future, so an older delayed capture cannot replace a newer menu. Discard unclaimed credentials after pointer-up or cancellation; keyboard activation must not reuse a previous mouse press.
+
+The native host attaches the popup to its parent and requests xdg_popup.grab before the initial surface commit. Grab cannot be combined with input passthrough. A grabbing child of another popup requires that parent to have a grab; ordinary and layer-shell roots are supported. A compositor may refuse the grab and dismiss the popup immediately. The existing popup_done path closes its owned views and descendants.
+
+A compositor can focus a grabbed popup before it is mapped or registered with Flutter. The host retains the current pointer surface and latest local coordinates, then synchronizes pointer entry when the view becomes active. Presses received before activation are not replayed. Surface removal and pointer loss clear stale focus; pointer loss also immediately cancels Flutter pointer state.
+
+When a grab starts, its still-held triggering button follows the popup’s lifetime. Destroying a surface retires only its owned buttons, because their releases may happen outside the client and never arrive. Ordinary pointer leave does not reset held buttons, so crossing between live surfaces does not bypass chord rejection.
+
+A grab gives the topmost grabbing popup keyboard focus and allows compositor dismissal on an outside click. Clicking another surface belonging to the same application is delivered to that application: the application must close its menu itself. Handle Escape in the popup and observe native close events. Non-grabbing tooltip children remain appropriate for hints inside a grabbing menu.
 
 The standard Flutter Material `Tooltip` continues to draw inside its current view. Replace it explicitly with `NativeTooltip` from `package:fushell/tooltip.dart`; native popups cannot automatically intercept Material tooltips.
 

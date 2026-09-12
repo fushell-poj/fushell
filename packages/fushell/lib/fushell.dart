@@ -571,6 +571,9 @@ final class FushellWindow {
     required PopupSurfaceRole popup,
   }) async {
     if (parent <= 0) throw RangeError.range(parent, 1, null, 'parent');
+    if (popup.grab != null && popup.grab!.windowId != parent) {
+      throw ArgumentError('Popup grab belongs to a different parent view');
+    }
     final role = popup.toJson();
     _ensureWindowEventsInitialized();
     final response = await _sendRequest(<String, Object?>{
@@ -774,23 +777,65 @@ final class FushellProcess {
   }
 }
 
-/// Immutable creation options for a non-grabbing xdg popup.
+/// A native input credential pinned to one actual mouse-down event.
+///
+/// Capture immediately in Listener.onPointerDown and retain the returned Future
+/// until the gesture opens its popup. Native validates expiry and consumes the
+/// credential once. It cannot be reused for another parent or manufactured from
+/// the most recent input event.
+final class PopupGrab {
+  const PopupGrab._(this.windowId, this._token);
+
+  final int windowId;
+  final int _token;
+
+  static Future<PopupGrab> capture(PointerDownEvent event) async {
+    if (event.kind != ui.PointerDeviceKind.mouse || event.buttons == 0) {
+      throw ArgumentError('Popup grabs require a mouse-down event');
+    }
+    final response = await FushellWindow._sendRequest(<String, Object?>{
+      'method': 'input.capture',
+      'windowId': event.viewId,
+      'timeMicros': event.timeStamp.inMicroseconds,
+      'buttons': event.buttons,
+      'device': event.device,
+    });
+    final token = response['inputToken'];
+    if (token is! int || token <= 0 || token > 0x1fffffffffffff) {
+      throw const FushellSurfaceException(
+        code: 'InvalidResponse',
+        message: 'input.capture response is missing a valid inputToken',
+      );
+    }
+    return PopupGrab._(event.viewId, token);
+  }
+}
+
+/// Immutable options for an xdg popup. Tooltips leave [grab] unset.
 final class PopupSurfaceRole {
   const PopupSurfaceRole({
     required this.positioner,
     this.inputPassthrough = false,
+    this.grab,
   });
 
   final PopupPositioner positioner;
 
   /// An empty input region lets pointer input reach surfaces underneath.
   final bool inputPassthrough;
+  final PopupGrab? grab;
 
-  Map<String, Object?> toJson() => <String, Object?>{
-    'kind': 'popup',
-    'positioner': positioner.toJson(),
-    'inputPassthrough': inputPassthrough,
-  };
+  Map<String, Object?> toJson() {
+    if (inputPassthrough && grab != null) {
+      throw ArgumentError('A grabbing popup cannot pass through input');
+    }
+    return <String, Object?>{
+      'kind': 'popup',
+      'positioner': positioner.toJson(),
+      'inputPassthrough': inputPassthrough,
+      if (grab != null) 'grabToken': grab!._token,
+    };
+  }
 }
 
 /// Full popup placement in parent-local logical coordinates.
