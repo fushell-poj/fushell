@@ -445,8 +445,8 @@ test "parse window open request" {
     const json =
         \\{"id":1,"method":"window.open","role":{"kind":"window","title":"Smoke","appId":"dev.fushell.smoke","width":800,"height":600}}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 1), request.id());
     try std.testing.expectEqualStrings("Smoke", request.open_window.role.window.title);
     try std.testing.expectEqual(@as(?i32, 800), request.open_window.role.window.width);
@@ -457,8 +457,8 @@ test "parse window open with parent" {
     const json =
         \\{"id":2,"method":"window.open","parent":7,"role":{"kind":"window","title":"Child","appId":"dev.fushell.child"}}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?i64, 7), request.open_window.parent);
 }
 
@@ -466,8 +466,8 @@ test "parse layer open request" {
     const json =
         \\{"id":3,"method":"window.open","role":{"kind":"layer","namespace":"panel","layer":"top","anchors":["top","left","right"],"margins":{"top":1,"right":2,"bottom":3,"left":4},"exclusiveZone":32,"keyboardInteractivity":"onDemand"}}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 3), request.id());
     try std.testing.expectEqual(.top, request.open_window.role.layer.layer);
     try std.testing.expect(request.open_window.role.layer.anchors.top);
@@ -480,8 +480,8 @@ test "parse close window request" {
     const json =
         \\{"id":4,"method":"window.close","windowId":9}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 9), request.close_window.window_id);
 }
 
@@ -489,8 +489,8 @@ test "parse layer update request" {
     const json =
         \\{"id":5,"method":"layer.update","windowId":3,"update":{"width":0,"height":32,"anchors":["top","left","right"],"margins":{"top":0,"right":1,"bottom":2,"left":3},"exclusiveZone":32,"keyboardInteractivity":"none"}}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 3), request.update_layer.window_id);
     try std.testing.expectEqual(@as(?i32, 0), request.update_layer.update.width);
     try std.testing.expectEqual(@as(?i32, 32), request.update_layer.update.height);
@@ -503,8 +503,8 @@ test "parse window update request" {
     const json =
         \\{"id":6,"method":"window.update","windowId":2,"update":{"title":"New title","appId":"dev.fushell.new"}}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 2), request.update_window.window_id);
     try std.testing.expectEqualStrings("New title", request.update_window.update.title.?);
     try std.testing.expectEqualStrings("dev.fushell.new", request.update_window.update.app_id.?);
@@ -514,15 +514,15 @@ test "parse empty update requests" {
     const layer_json =
         \\{"id":7,"method":"layer.update","windowId":1,"update":{}}
     ;
-    const layer_request = try parseRequest(std.testing.gpa, layer_json);
-    defer layer_request.deinit(std.testing.gpa);
+    const layer_request = try parseRequest(std.testing.allocator, layer_json);
+    defer layer_request.deinit(std.testing.allocator);
     try std.testing.expect(layer_request.update_layer.update.isEmpty());
 
     const window_json =
         \\{"id":8,"method":"window.update","windowId":1,"update":{}}
     ;
-    const window_request = try parseRequest(std.testing.gpa, window_json);
-    defer window_request.deinit(std.testing.gpa);
+    const window_request = try parseRequest(std.testing.allocator, window_json);
+    defer window_request.deinit(std.testing.allocator);
     try std.testing.expect(window_request.update_window.update.isEmpty());
 }
 
@@ -530,8 +530,8 @@ test "parse exit request" {
     const json =
         \\{"id":9,"method":"process.exit","code":2}
     ;
-    const request = try parseRequest(std.testing.gpa, json);
-    defer request.deinit(std.testing.gpa);
+    const request = try parseRequest(std.testing.allocator, json);
+    defer request.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i64, 2), request.exit.code);
 }
 
@@ -539,27 +539,27 @@ test "reject invalid update values" {
     const negative_size =
         \\{"id":10,"method":"layer.update","windowId":1,"update":{"height":-1}}
     ;
-    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.gpa, negative_size));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, negative_size));
 
     const empty_anchors =
         \\{"id":11,"method":"layer.update","windowId":1,"update":{"anchors":[]}}
     ;
-    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.gpa, empty_anchors));
+    try std.testing.expectError(error.InvalidSurfaceField, parseRequest(std.testing.allocator, empty_anchors));
 }
 
 test "reject unsupported method" {
     const json =
         \\{"id":12,"method":"window.spawn","entrypoint":"settings"}
     ;
-    try std.testing.expectError(error.UnsupportedSurfaceMethod, parseRequest(std.testing.gpa, json));
+    try std.testing.expectError(error.UnsupportedSurfaceMethod, parseRequest(std.testing.allocator, json));
 }
 
 test "encode responses" {
-    const ok = try successResponse(std.testing.gpa, 7);
-    defer std.testing.gpa.free(ok);
+    const ok = try successResponse(std.testing.allocator, 7);
+    defer std.testing.allocator.free(ok);
     try std.testing.expectEqualStrings("{\"id\":7,\"ok\":true}", ok);
 
-    const err = try errorResponse(std.testing.gpa, null, "Bad", "bad request");
-    defer std.testing.gpa.free(err);
+    const err = try errorResponse(std.testing.allocator, null, "Bad", "bad request");
+    defer std.testing.allocator.free(err);
     try std.testing.expect(std.mem.indexOf(u8, err, "\"ok\":false") != null);
 }

@@ -46,9 +46,37 @@ FDs on the platform thread. There is no dummy window Host to own the event loop.
 
 `window_registry.zig` owns stable-address entries. Each real `Host` owns one
 surface role and EGL surface. Dart opens/closes views via platform channels.
-Raster callbacks use the shared RenderContext with per-window presentation locks;
-the resource context is separate and shares GL objects. No visible window is
-created until Dart asks, but Wayland/EGL are still initialized during engine startup.
+Raster callbacks use the shared GLES3 RenderContext with per-window presentation
+locks; the resource context is separate and shares GL objects. No visible window
+is created until Dart asks, but Wayland/EGL initialize during engine startup.
+
+`flutter_compositor.presentFrame` owns one complete presentation transaction.
+It initializes the context-owned blitter, saves the affected GL state, clears the
+destination to transparent, composites premultiplied layers, and restores state
+on success or error. A private VAO isolates compositor vertex attributes from
+Flutter. The read framebuffer is untouched. Backing-store allocation publishes
+only a fully allocated RGBA8 texture; collection owns deletion. The blitter must
+be destroyed with its original raster context current, after engine shutdown.
+Each presentation rebinds the bootstrap pbuffer before releasing the window lock,
+so the native view drawable is no longer current when window cleanup may begin.
+
+Requested layer sizes and effective geometry belong to the platform thread.
+`window_geometry.zig` publishes a snapshot under the same lock used to resize the
+EGL window. Raster code reads `presentationMetricsLocked` and keeps that lock
+through buffer swap; platform callers use `metricsSnapshot`. Flutter metrics
+callbacks and Wayland event dispatch run outside the presentation lock.
+Layer size requests retain zero as automatic sizing. Partial updates merge with
+the retained request, never with compositor-confirmed dimensions; configure
+events alone advance the effective layer geometry.
+
+Engine AddView/RemoveView callbacks publish results under the registry lock and
+copy a stable lifecycle notification before unlocking. They never dereference
+the window entry after publication: the platform thread may already have freed
+it. Cleanup waits for admitted presentations before destroying the native host.
+Engine-shutdown failure stops the process before callback targets are released.
+Platform role updates borrow an active host after releasing the registry lock;
+configure waits may dispatch Wayland listeners that acquire that same registry.
+Entry reclamation stays in the outer platform lifecycle pump, outside those waits.
 
 The frame clock queues VSync batons and releases them on software deadlines. This
 prevents immediate recursive frame scheduling. It is explicitly a fallback and

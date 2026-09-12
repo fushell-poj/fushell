@@ -7,6 +7,8 @@ engine and isolate can create and manage multiple native windows from Dart.
 
 The project targets **Zig 0.16.0**. Native development dependencies include
 Wayland, EGL/GLES, xkbcommon, Fontconfig, D-Bus and `pkg-config`/`wayland-scanner`.
+Running graphical applications requires **OpenGL ES 3.0 or newer**, including
+an EGL configuration with an alpha channel. Unsupported contexts fail at startup.
 
 ```bash
 nix develop
@@ -176,6 +178,18 @@ It covers primary/secondary startup, binary argv and cwd transport, streaming
 stdout/stderr frames and exit-code propagation, application-defined window commands, command timeout
 recovery, signal handling, ownership races, secondary fast-path loading, and
 idle CPU/FD stability.
+
+`zig build rendering-test` runs native window-lifecycle and geometry regressions
+without a display; it is also included in `zig build test`. The separate pixel
+suite uses a real headless EGL surface and requires an EGL driver:
+
+```bash
+EGL_PLATFORM=surfaceless LIBGL_ALWAYS_SOFTWARE=1 zig build test-render
+```
+
+With Mesa, this selects software rendering without connecting to the desktop.
+The suite checks transparent empty/partial frames, premultiplied layer blending,
+GL state and vertex-array isolation, allocation validation and resource cleanup.
 
 See [`packages/fushell/README.md`](packages/fushell/README.md) for the Dart API,
 window ownership model, parent relationships, layer surfaces, and multi-view

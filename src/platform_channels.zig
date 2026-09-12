@@ -739,8 +739,8 @@ test "response completes exactly once" {
     };
     var recorder: Recorder = .{};
     var response: Response = .{ .context = &recorder, .handle = null, .send_fn = Recorder.send };
-    _ = response.send("ok");
-    response.empty();
+    try std.testing.expectEqual(ResponseSendResult.sent, response.send("ok"));
+    try std.testing.expectEqual(ResponseSendResult.already_completed, response.empty());
     response.deinit();
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
     try std.testing.expectEqualStrings("ok", recorder.payload);

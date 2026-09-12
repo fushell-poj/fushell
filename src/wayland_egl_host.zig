@@ -14,6 +14,7 @@ const zwlr = wayland.client.zwlr;
 const c = @import("c");
 const surface_channel = @import("surface_channel.zig");
 const display_state = @import("wl_display_state.zig");
+const geometry = @import("window_geometry.zig");
 
 const default_width = 800;
 const default_height = 600;
@@ -23,11 +24,7 @@ const btn_middle = 0x112;
 
 /// 单个 view 上报给 Flutter 的物理 backing-store 尺寸与逻辑到物理缩放比。
 /// width 和 height 始终使用像素尺寸。
-pub const Metrics = struct {
-    width: usize,
-    height: usize,
-    pixel_ratio: f64,
-};
+pub const Metrics = geometry.Metrics;
 
 pub const PointerPhase = enum {
     add,
@@ -82,10 +79,6 @@ const OutputMembership = struct {
     }
 };
 
-fn initialLayerDimension(requested: ?i32) i32 {
-    return requested orelse 0;
-}
-
 fn integerScaleForMembership(membership: *const OutputMembership, outputs: []const display_state.OutputState) i32 {
     var scale: i32 = 1;
     for (outputs) |output_state| {
@@ -117,7 +110,7 @@ pub const RenderContext = struct {
 
         const config_attribs = [_]c.EGLint{
             c.EGL_SURFACE_TYPE,    c.EGL_WINDOW_BIT | c.EGL_PBUFFER_BIT,
-            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_ES2_BIT,
+            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_ES3_BIT,
             c.EGL_RED_SIZE,        8,
             c.EGL_GREEN_SIZE,      8,
             c.EGL_BLUE_SIZE,       8,
@@ -125,16 +118,20 @@ pub const RenderContext = struct {
             c.EGL_NONE,
         };
         var config_count: c.EGLint = 0;
-        if (c.eglChooseConfig(state.egl_display, &config_attribs, &self.egl_config, 1, &config_count) != c.EGL_TRUE or config_count == 0) {
-            return eglError("eglChooseConfig");
+        if (c.eglChooseConfig(state.egl_display, &config_attribs, &self.egl_config, 1, &config_count) != c.EGL_TRUE) {
+            return eglError("eglChooseConfig (OpenGL ES 3 required)");
+        }
+        if (config_count == 0) {
+            std.debug.print("OpenGL ES 3 is required: no EGL config supports ES3 with window and pbuffer surfaces.\n", .{});
+            return error.OpenGles3Unavailable;
         }
 
         const context_attribs = [_]c.EGLint{
-            c.EGL_CONTEXT_CLIENT_VERSION, 2,
+            c.EGL_CONTEXT_CLIENT_VERSION, 3,
             c.EGL_NONE,
         };
         self.egl_context = c.eglCreateContext(state.egl_display, self.egl_config, c.EGL_NO_CONTEXT, &context_attribs);
-        if (self.egl_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext");
+        if (self.egl_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext (OpenGL ES 3 required)");
 
         const pbuffer_attribs = [_]c.EGLint{
             c.EGL_WIDTH,  1,
@@ -148,7 +145,7 @@ pub const RenderContext = struct {
         // Give that thread a dedicated pbuffer/context sharing the raster context's
         // object namespace, so it never contends for the raster EGL context.
         self.resource_context = c.eglCreateContext(state.egl_display, self.egl_config, self.egl_context, &context_attribs);
-        if (self.resource_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext(resource)");
+        if (self.resource_context == c.EGL_NO_CONTEXT) return eglError("eglCreateContext(resource, OpenGL ES 3 required)");
         self.resource_surface = c.eglCreatePbufferSurface(state.egl_display, self.egl_config, &pbuffer_attribs);
         if (self.resource_surface == c.EGL_NO_SURFACE) return eglError("eglCreatePbufferSurface(resource)");
 
@@ -218,8 +215,8 @@ pub const Host = struct {
     viewport: ?*wp.Viewport = null,
     fractional_scale: ?*wp.FractionalScaleV1 = null,
     egl_window: ?*c.struct_wl_egl_window = null,
-    egl_window_width: i32 = 0,
-    egl_window_height: i32 = 0,
+    /// Protected by present_mutex; this snapshot matches the native EGL window.
+    presentation: geometry.Publication = .{},
 
     /// 共享 render context/config；本 Host 只拥有 `egl_surface`。
     render_context: *RenderContext = undefined,
@@ -234,6 +231,10 @@ pub const Host = struct {
     /// 由 xdg close listener 设置，并在下一个平台 tick 消费。不能在协议回调内开始
     /// 移除，因为只有 Flutter 异步回调完成后才会销毁 listener 自己的 Wayland 对象。
     close_requested: bool = false,
+    /// Platform-thread-only client requests; zero remains compositor-controlled.
+    layer_size_request: geometry.LayerSizeRequest = .{},
+    /// Platform-thread-only effective logical dimensions. For layer roles, only
+    /// configure changes these after initialization. Raster reads presentationMetricsLocked.
     width: i32 = default_width,
     height: i32 = default_height,
     pending_width: i32 = 0,
@@ -304,10 +305,10 @@ pub const Host = struct {
         errdefer self.state = .failed;
         if (self.display_state.layer_shell == null) return error.LayerShellUnavailable;
 
-        // layer-shell 以 0 表示由相对两侧 anchor 决定尺寸；不能沿用
-        // xdg window Host 的默认宽高，否则 left+right/top+bottom 不会拉伸。
-        self.width = initialLayerDimension(layer.width);
-        self.height = initialLayerDimension(layer.height);
+        self.layer_size_request = (geometry.LayerSizeRequest{}).updated(layer.width, layer.height);
+        // Effective layer dimensions come only from configure, never from requests.
+        self.width = 0;
+        self.height = 0;
 
         try self.createBaseSurface();
         const namespace_z = try std.heap.c_allocator.dupeZ(u8, layer.namespace);
@@ -315,7 +316,7 @@ pub const Host = struct {
         self.layer_surface = self.display_state.layer_shell.?.getLayerSurface(self.surface.?, null, mapLayer(layer.layer), namespace_z) catch return error.LayerSurfaceCreateFailed;
         self.layer_surface.?.setQueue(self.event_queue.?);
         self.layer_surface.?.setListener(*Host, layerSurfaceListener, self);
-        self.layer_surface.?.setSize(@intCast(@max(self.width, 0)), @intCast(@max(self.height, 0)));
+        self.layer_surface.?.setSize(self.layer_size_request.width, self.layer_size_request.height);
         self.layer_surface.?.setAnchor(mapAnchor(layer.anchors));
         self.layer_surface.?.setMargin(layer.margins.top, layer.margins.right, layer.margins.bottom, layer.margins.left);
         self.layer_surface.?.setExclusiveZone(layer.exclusive_zone);
@@ -332,46 +333,41 @@ pub const Host = struct {
     pub fn updateLayerRole(self: *Host, update: surface_channel.LayerSurfaceUpdate) !bool {
         try self.requireReadyLayerRole();
         if (update.isEmpty()) return false;
-        // 布局变更时与 present 互斥 (同 resizeWindow)。
-        if (update.affectsLayout()) {
+        // Serialize role commits and native resize with raster presentation.
+        // This scope MUST end before waitForUpdateConfigure dispatches listeners.
+        var layout_changed = false;
+        {
             self.present_mutex.lock(self.io) catch unreachable;
             defer self.present_mutex.unlock(self.io);
-        }
+            const layer_surface = self.layer_surface.?;
 
-        const layer_surface = self.layer_surface.?;
-        var layout_changed = false;
+            if (update.width != null or update.height != null) {
+                self.layer_size_request = self.layer_size_request.updated(update.width, update.height);
+                layer_surface.setSize(self.layer_size_request.width, self.layer_size_request.height);
+                layout_changed = true;
+            }
+            if (update.anchors) |anchors| {
+                layer_surface.setAnchor(mapAnchor(anchors));
+                layout_changed = true;
+            }
+            if (update.margins) |margins| {
+                layer_surface.setMargin(margins.top, margins.right, margins.bottom, margins.left);
+                layout_changed = true;
+            }
+            if (update.exclusive_zone) |exclusive_zone| {
+                layer_surface.setExclusiveZone(exclusive_zone);
+                layout_changed = true;
+            }
+            if (update.keyboard_interactivity) |keyboard_interactivity| {
+                layer_surface.setKeyboardInteractivity(mapKeyboardInteractivity(keyboard_interactivity));
+            }
 
-        if (update.width != null or update.height != null) {
-            const next_width = update.width orelse self.width;
-            const next_height = update.height orelse self.height;
-            layer_surface.setSize(@intCast(@max(next_width, 0)), @intCast(@max(next_height, 0)));
-            if (update.width) |width| self.width = width;
-            if (update.height) |height| self.height = height;
-            layout_changed = true;
+            if (layout_changed) self.configured = false;
+            self.surface.?.commit();
         }
-        if (update.anchors) |anchors| {
-            layer_surface.setAnchor(mapAnchor(anchors));
-            layout_changed = true;
-        }
-        if (update.margins) |margins| {
-            layer_surface.setMargin(margins.top, margins.right, margins.bottom, margins.left);
-            layout_changed = true;
-        }
-        if (update.exclusive_zone) |exclusive_zone| {
-            layer_surface.setExclusiveZone(exclusive_zone);
-            layout_changed = true;
-        }
-        if (update.keyboard_interactivity) |keyboard_interactivity| {
-            layer_surface.setKeyboardInteractivity(mapKeyboardInteractivity(keyboard_interactivity));
-        }
-
-        self.applyBufferScale();
-        if (layout_changed) self.configured = false;
-        self.surface.?.commit();
         self.display_state.flush();
         if (layout_changed) {
-            const got_configure = try self.waitForUpdateConfigure();
-            if (!got_configure) self.emitMetrics();
+            try self.waitForUpdateConfigure();
             return true;
         }
         return false;
@@ -415,17 +411,15 @@ pub const Host = struct {
         }
     }
 
-    pub fn attachEglWindowSurface(self: *Host) !void {
-        self.egl_window_width = self.physicalWidthI32();
-        self.egl_window_height = self.physicalHeightI32();
-        self.egl_window = c.wl_egl_window_create(@ptrCast(self.surface.?), self.egl_window_width, self.egl_window_height);
+    fn attachEglWindowSurface(self: *Host) !void {
+        self.present_mutex.lock(self.io) catch unreachable;
+        defer self.present_mutex.unlock(self.io);
+        const next = self.publishGeometryLocked();
+        self.egl_window = c.wl_egl_window_create(@ptrCast(self.surface.?), @intCast(next.width), @intCast(next.height));
         if (self.egl_window == null) return error.WlEglWindowCreateFailed;
 
         self.egl_surface = c.eglCreateWindowSurface(self.display_state.egl_display, self.render_context.egl_config, @ptrCast(self.egl_window.?), null);
-        if (self.egl_surface == c.EGL_NO_SURFACE) {
-            std.debug.print("eglCreateWindowSurface failed: display {*} window {d}x{d} error {x}\n", .{ self.display_state.egl_display, self.egl_window_width, self.egl_window_height, c.eglGetError() });
-            return eglError("eglCreateWindowSurface");
-        }
+        if (self.egl_surface == c.EGL_NO_SURFACE) return eglError("eglCreateWindowSurface");
     }
 
     pub fn setMetricsCallback(self: *Host, callback: MetricsCallback, context: ?*anyopaque) void {
@@ -445,25 +439,27 @@ pub const Host = struct {
         return true;
     }
 
-    pub fn metrics(self: *const Host) Metrics {
-        return .{
-            .width = @intCast(self.physicalWidthI32()),
-            .height = @intCast(self.physicalHeightI32()),
-            .pixel_ratio = self.activeScale(),
-        };
-    }
-
-    pub fn resizeWindow(self: *Host) void {
-        // resize (主线程) 与 present (引擎线程) 互斥: present 侧 tryLock 跳帧。
+    /// Copies published geometry. Do not call while holding present_mutex.
+    pub fn metricsSnapshot(self: *Host) Metrics {
         self.present_mutex.lock(self.io) catch unreachable;
         defer self.present_mutex.unlock(self.io);
+        return self.presentationMetricsLocked();
+    }
+
+    /// Raster must hold present_mutex from this read through EGL presentation.
+    pub fn presentationMetricsLocked(self: *const Host) Metrics {
+        return self.presentation.metrics;
+    }
+
+    fn publishGeometryLocked(self: *Host) Metrics {
         self.applyBufferScale();
-        const physical_width = self.physicalWidthI32();
-        const physical_height = self.physicalHeightI32();
-        if (self.egl_window_width == physical_width and self.egl_window_height == physical_height) return;
-        self.egl_window_width = physical_width;
-        self.egl_window_height = physical_height;
-        if (self.egl_window) |window| c.wl_egl_window_resize(window, physical_width, physical_height, 0, 0);
+        const next = Metrics.fromLogical(self.width, self.height, self.activeScale120());
+        self.presentation.publishLocked(next, self, resizeNativeWindow);
+        return next;
+    }
+
+    fn resizeNativeWindow(self: *Host, width: i32, height: i32) void {
+        if (self.egl_window) |window| c.wl_egl_window_resize(window, width, height, 0, 0);
     }
 
     pub fn isReady(self: *const Host) bool {
@@ -523,11 +519,11 @@ pub const Host = struct {
         if (self.toplevel == null) return error.SurfaceRoleMismatch;
     }
 
-    fn waitForUpdateConfigure(self: *Host) !bool {
+    fn waitForUpdateConfigure(self: *Host) !void {
         var attempts: usize = 0;
         while (!self.configured and attempts < 64) : (attempts += 1) {
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
-            if (self.configured) return true;
+            if (self.configured) return;
             self.display_state.flush();
             var fds = [_]c.struct_pollfd{.{
                 .fd = self.display_state.display.?.getFd(),
@@ -542,9 +538,7 @@ pub const Host = struct {
                 }
             }
         }
-        const got_configure = self.configured;
-        if (!got_configure) self.configured = true;
-        return got_configure;
+        // A timeout leaves effective geometry unchanged; a late configure still applies.
     }
 
     fn createBaseSurface(self: *Host) !void {
@@ -556,19 +550,12 @@ pub const Host = struct {
 
     fn activeScale120(self: *const Host) u32 {
         if (self.fractional_scale_120 > 0) return self.fractional_scale_120;
-        return @intCast(self.scale * 120);
+        return @intCast(@min(@as(u64, @intCast(@max(self.scale, 1))) * 120, std.math.maxInt(u32)));
     }
 
+    /// Platform-thread-only desired scale, for platform input translation.
     pub fn activeScale(self: *const Host) f64 {
         return @as(f64, @floatFromInt(self.activeScale120())) / 120.0;
-    }
-
-    fn physicalWidthI32(self: *const Host) i32 {
-        return physicalFromLogical(self.width, self.activeScale120());
-    }
-
-    fn physicalHeightI32(self: *const Host) i32 {
-        return physicalFromLogical(self.height, self.activeScale120());
     }
 
     fn applyBufferScale(self: *Host) void {
@@ -592,8 +579,13 @@ pub const Host = struct {
         // 仍可能 dispatch 到本窗口的 scale/configure 事件 (fractional_scale_manager
         // 是全局对象, 绑主 queue)。此时引擎句柄已失效, 再发 metrics 会 UAF。
         if (self.state == .shutting_down or self.state == .failed) return;
-        self.resizeWindow();
-        if (self.metrics_callback) |callback| callback(self, self.metrics_context, self.metrics());
+        const next = blk: {
+            self.present_mutex.lock(self.io) catch unreachable;
+            defer self.present_mutex.unlock(self.io);
+            break :blk self.publishGeometryLocked();
+        };
+        // Never call Flutter with present_mutex held: callbacks may reenter the host.
+        if (self.metrics_callback) |callback| callback(self, self.metrics_context, next);
     }
 
     fn applyPendingConfigure(self: *Host) void {
@@ -793,16 +785,10 @@ fn mapKeyboardInteractivity(value: surface_channel.KeyboardInteractivity) zwlr.L
     };
 }
 
-fn physicalFromLogical(logical_size: i32, scale_120: u32) i32 {
-    const logical: i64 = @intCast(@max(logical_size, 1));
-    const scale: i64 = @intCast(@max(scale_120, 120));
-    return @intCast(@divTrunc(logical * scale + 119, 120));
-}
-
 fn fractionalScaleListener(_: *wp.FractionalScaleV1, event: wp.FractionalScaleV1.Event, self: *Host) void {
     switch (event) {
         .preferred_scale => |preferred| {
-            const next_scale_120 = @max(preferred.scale, 120);
+            const next_scale_120 = if (preferred.scale == 0) 120 else preferred.scale;
             if (self.fractional_scale_120 == next_scale_120) return;
             const old_scale_120 = self.activeScale120();
             self.fractional_scale_120 = next_scale_120;
@@ -825,8 +811,8 @@ fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSu
     switch (event) {
         .configure => |configure| {
             layer_surface.ackConfigure(configure.serial);
-            if (configure.width > 0) self.pending_width = @intCast(configure.width);
-            if (configure.height > 0) self.pending_height = @intCast(configure.height);
+            self.pending_width = geometry.resolveLayerDimension(configure.width, self.layer_size_request.width, self.width, default_width);
+            self.pending_height = geometry.resolveLayerDimension(configure.height, self.layer_size_request.height, self.height, default_height);
             self.applyPendingConfigure();
             self.configured = true;
         },
@@ -894,9 +880,28 @@ fn eglError(comptime step: []const u8) error{EglFailed} {
     return error.EglFailed;
 }
 
-test "unspecified layer dimensions remain compositor-controlled" {
-    try std.testing.expectEqual(@as(i32, 0), initialLayerDimension(null));
-    try std.testing.expectEqual(@as(i32, 32), initialLayerDimension(32));
+test "layer partial size requests preserve auto dimensions after configure" {
+    var host: Host = .{};
+    host.layer_size_request = host.layer_size_request.updated(null, 32);
+    try std.testing.expectEqual(@as(u32, 0), host.layer_size_request.width);
+    // Configure changes effective dimensions, never the retained client request.
+    host.width = 1280;
+    host.height = 32;
+    host.layer_size_request = host.layer_size_request.updated(null, 40);
+    try std.testing.expectEqual(@as(u32, 0), host.layer_size_request.width);
+    try std.testing.expectEqual(@as(u32, 40), host.layer_size_request.height);
+    try std.testing.expectEqual(@as(i32, 32), host.height);
+    host.width = 1706;
+    host.layer_size_request = host.layer_size_request.updated(null, 48);
+    try std.testing.expectEqual(@as(u32, 0), host.layer_size_request.width);
+    host.layer_size_request = host.layer_size_request.updated(640, null);
+    try std.testing.expectEqual(@as(u32, 640), host.layer_size_request.width);
+    try std.testing.expectEqual(@as(u32, 48), host.layer_size_request.height);
+    try std.testing.expectEqual(@as(i32, 1706), host.width);
+    host.layer_size_request = host.layer_size_request.updated(0, null);
+    host.layer_size_request = host.layer_size_request.updated(null, 56);
+    try std.testing.expectEqual(@as(u32, 0), host.layer_size_request.width);
+    try std.testing.expectEqual(@as(u32, 56), host.layer_size_request.height);
 }
 
 test "output membership is isolated per window" {
@@ -962,4 +967,34 @@ test "scale calculation includes outputs beyond the former fixed capacity" {
 
     membership.leave(outputs.len);
     try std.testing.expectEqual(@as(i32, 1), integerScaleForMembership(&membership, &outputs));
+}
+
+test "desired geometry stays private until publication and metrics callback can reenter" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io() };
+    const Observer = struct {
+        unlocked: bool = false,
+        coherent: bool = false,
+        fn metricsCallback(changed: *Host, context: ?*anyopaque, metrics_value: Metrics) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.unlocked = changed.present_mutex.tryLock();
+            if (!self.unlocked) return;
+            changed.present_mutex.unlock(changed.io);
+            const snapshot = changed.metricsSnapshot();
+            self.coherent = snapshot.width == metrics_value.width and
+                snapshot.height == metrics_value.height and snapshot.pixel_ratio == metrics_value.pixel_ratio;
+        }
+    };
+    var observer: Observer = .{};
+    host.setMetricsCallback(Observer.metricsCallback, &observer);
+    const original = host.metricsSnapshot();
+    host.width = 801;
+    host.height = 601;
+    host.fractional_scale_120 = 150;
+    try std.testing.expectEqual(original, host.metricsSnapshot());
+    host.emitMetrics();
+    try std.testing.expect(observer.unlocked);
+    try std.testing.expect(observer.coherent);
+    try std.testing.expectEqual(Metrics.fromLogical(801, 601, 150), host.metricsSnapshot());
 }

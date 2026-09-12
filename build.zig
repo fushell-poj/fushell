@@ -169,6 +169,38 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
+
+    const rendering_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/rendering_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    rendering_test_mod.addImport("c", c_mod);
+    rendering_test_mod.addImport("wayland", wayland_mod);
+    linkRuntimeLibraries(rendering_test_mod, dynamic_link_opts);
+    const rendering_tests = b.addTest(.{ .root_module = rendering_test_mod });
+    const run_rendering_tests = b.addRunArtifact(rendering_tests);
+    const rendering_test_step = b.step("rendering-test", "Test native rendering state and window lifecycle without a display");
+    rendering_test_step.dependOn(&run_rendering_tests.step);
+    test_step.dependOn(rendering_test_step);
+
+    const compositor_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/compositor_render_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    compositor_test_mod.addImport("c", c_mod);
+    compositor_test_mod.linkSystemLibrary("EGL", dynamic_link_opts);
+    compositor_test_mod.linkSystemLibrary("GLESv2", dynamic_link_opts);
+    const compositor_tests = b.addExecutable(.{
+        .name = "compositor-render-test",
+        .root_module = compositor_test_mod,
+    });
+    const run_compositor_tests = b.addRunArtifact(compositor_tests);
+    const compositor_test_step = b.step("test-render", "Test real GLES3 composition and state isolation on a headless EGL surface");
+    compositor_test_step.dependOn(&run_compositor_tests.step);
     // Runtime modules are lazily referenced by runner main and otherwise yield no tests.
     const text_input_mod = b.createModule(.{
         .root_source_file = b.path("src/platform_channels.zig"),

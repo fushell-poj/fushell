@@ -246,7 +246,9 @@ test "non-blocking clipboard request remains pending until producer closes" {
         std.os.linux.errno(std.os.linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
     );
     var writer_open = true;
-    defer if (writer_open) std.posix.close(pipe_fds[1]);
+    defer if (writer_open) {
+        _ = std.os.linux.close(pipe_fds[1]);
+    };
 
     var dc: DataControl = undefined;
     dc.gpa = std.testing.allocator;
@@ -255,10 +257,10 @@ test "non-blocking clipboard request remains pending until producer closes" {
     defer dc.cancelRequestText();
 
     try std.testing.expectEqual(DataControl.RequestProgress.pending, try dc.pumpRequestText());
-    try std.testing.expectEqual(@as(usize, 5), try std.posix.write(pipe_fds[1], "hello"));
+    try std.testing.expectEqual(@as(usize, 5), std.os.linux.write(pipe_fds[1], "hello", 5));
     try std.testing.expectEqual(DataControl.RequestProgress.pending, try dc.pumpRequestText());
 
-    std.posix.close(pipe_fds[1]);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.close(pipe_fds[1])));
     writer_open = false;
     const complete = try dc.pumpRequestText();
     const text = switch (complete) {
@@ -284,7 +286,7 @@ test "clipboard source destruction completes an empty request" {
     defer dc.cancelRequestText();
 
     try std.testing.expectEqual(DataControl.RequestProgress.pending, try dc.pumpRequestText());
-    std.posix.close(pipe_fds[1]);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.close(pipe_fds[1])));
     const result = try dc.pumpRequestText();
     switch (result) {
         .complete => |value| try std.testing.expectEqual(@as(?[]u8, null), value),

@@ -214,9 +214,6 @@ const Runner = struct {
     engine_library: []const u8,
     bundle_path: []const u8,
     engine: c.FlutterEngine = null,
-    metrics_generation: std.atomic.Value(u64) = .init(0),
-    rendering_generation: std.atomic.Value(u64) = .init(0),
-    skipped_resize_presents: std.atomic.Value(u32) = .init(0),
     platform_thread_id: std.Thread.Id = undefined,
     task_queue: *flutter_task_queue.TaskQueue,
     bootstrap_render_logged: bool = false,
@@ -236,7 +233,7 @@ const Runner = struct {
     frame_clock: frame_clock.Clock,
 
     // ── compositor 呈现路径 ────────────────────────
-    /// backing store 纹理 → 窗口 surface 的 GLES2 blit 模块。
+    /// Context-owned GLES3 compositor; each presentation isolates a complete frame.
     blitter: gl_blit.Blitter = .{},
     compositor_first_present_logged: bool = false,
 
@@ -269,14 +266,6 @@ const Runner = struct {
 
     pub fn fatalReason(self: *const Runner) ?FatalReason {
         return self.fatal_reason;
-    }
-
-    fn beginMetricsUpdate(self: *Runner) u64 {
-        return self.metrics_generation.fetchAdd(1, .release) + 1;
-    }
-
-    fn beginRender(self: *Runner) void {
-        self.rendering_generation.store(self.metrics_generation.load(.acquire), .release);
     }
 
     /// 键盘长按重复 (wl_keyboard.repeat_info): 到达 repeat 时间点则模拟一次
@@ -544,10 +533,6 @@ const Runner = struct {
             std.debug.print("[error] FlutterEngineSendPlatformMessage failed: {s}\n", .{flutter.resultName(result)});
             self.requestFatal(.platform_message_failed);
         }
-    }
-
-    fn shouldPresentRenderedFrame(self: *Runner) bool {
-        return self.rendering_generation.load(.acquire) == self.metrics_generation.load(.acquire);
     }
 
     fn queueFlutterTask(self: *Runner, task: c.FlutterTask, target_time_nanos: u64) void {
@@ -969,7 +954,6 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     defer runner.clipboard.deinit();
     defer runner.clipboard.cancelReadText();
     defer runner.xkb_state.deinit();
-    defer runner.blitter.deinit();
 
     var renderer: c.FlutterRendererConfig = std.mem.zeroes(c.FlutterRendererConfig);
     renderer.type = c.kOpenGL;
@@ -1061,12 +1045,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     const run_result = api.run(c.FLUTTER_ENGINE_VERSION, &renderer, &project_args, &runner, &engine);
     try flutter.ensureSuccess(run_result, "FlutterEngineRun");
     runner.engine = engine;
-    errdefer if (runner.engine != null) {
-        const shutdown_result = api.shutdown(runner.engine);
-        if (shutdown_result != c.kSuccess) {
-            std.debug.print("[error] FlutterEngineShutdown after startup error failed: {s}\n", .{flutter.resultName(shutdown_result)});
-        }
-    };
+    errdefer if (runner.engine != null) shutdownEngine(&runner);
 
     std.debug.print("Flutter engine is running (headless). Dart may create windows via FushellWindow.openWindow.\n", .{});
     var event_loop_error: ?anyerror = null;
@@ -1100,11 +1079,7 @@ pub fn run(gpa: std.mem.Allocator, options: Options) !u8 {
     // compositor disconnect: stop engine callbacks first, then destroy window
     // resources while the display is still owned by the headless host.
     std.debug.print("Shutting down Flutter engine.\n", .{});
-    flutter.ensureSuccess(api.shutdown(runner.engine), "FlutterEngineShutdown") catch |err| {
-        if (event_loop_error == null) event_loop_error = err;
-        std.debug.print("[error] FlutterEngineShutdown failed: {s}\n", .{@errorName(err)});
-    };
-    runner.engine = null;
+    shutdownEngine(&runner);
     shutdownAllWindows(&runner);
     shutdownShared(gpa, state);
     std.debug.print("engine event loop exited.\n", .{});
@@ -1287,7 +1262,6 @@ fn flutterTaskWakeCallback(user_data: ?*anyopaque) void {
 
 fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics, view_id: i64) !void {
     if (runner.engine == null) return;
-    const generation = runner.beginMetricsUpdate();
     var metrics: c.FlutterWindowMetricsEvent = std.mem.zeroes(c.FlutterWindowMetricsEvent);
     metrics.struct_size = @sizeOf(c.FlutterWindowMetricsEvent);
     metrics.width = host_metrics.width;
@@ -1296,7 +1270,6 @@ fn sendMetrics(runner: *Runner, host_metrics: egl.Metrics, view_id: i64) !void {
     metrics.left = 0;
     metrics.top = 0;
     metrics.view_id = view_id;
-    _ = generation;
     try flutter.ensureSuccess(runner.api.send_window_metrics(runner.engine, &metrics), "FlutterEngineSendWindowMetricsEvent");
     try flutter.ensureSuccess(runner.api.schedule_frame(runner.engine), "FlutterEngineScheduleFrame");
 }
@@ -1398,7 +1371,7 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
         return err;
     };
     const view_id = entry.view_id;
-    entry.lifecycle_wake_context = runner.task_queue;
+    entry.lifecycle_notification = .{ .context = runner.task_queue, .wake = wakeWindowLifecycle };
     entry.pending_open_response = response_handle;
     entry.pending_open_request_id = request.id;
     runner.registry.unlock();
@@ -1411,9 +1384,12 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
     host.render_context = runner.render_context;
     errdefer {
         runner.registry.lock();
+        entry.lifecycle = .removing;
         runner.registry.unindexSurfaceLocked(entry);
         runner.registry.unlock();
+        host.present_mutex.lockUncancelable(runner.registry.io);
         host.deinit();
+        host.present_mutex.unlock(runner.registry.io);
         runner.registry.lock();
         runner.registry.releaseLocked(entry);
         runner.registry.unlock();
@@ -1432,7 +1408,7 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
     host.setMetricsCallback(metricsCallback, runner);
     host.setPointerCallback(pointerCallback, runner);
 
-    const m = host.metrics();
+    const m = host.metricsSnapshot();
     var view_metrics: c.FlutterWindowMetricsEvent = std.mem.zeroes(c.FlutterWindowMetricsEvent);
     view_metrics.struct_size = @sizeOf(c.FlutterWindowMetricsEvent);
     view_metrics.width = m.width;
@@ -1449,8 +1425,7 @@ pub fn openWindow(runner: *Runner, response_handle: ?*const c.FlutterPlatformMes
     std.debug.print("window.open: view {d} (parent {any})\n", .{ view_id, request.parent });
 }
 
-fn notifyWindowLifecycle(entry: *WindowEntry) void {
-    const context = entry.lifecycle_wake_context orelse return;
+fn wakeWindowLifecycle(context: *anyopaque) void {
     const task_queue: *flutter_task_queue.TaskQueue = @ptrCast(@alignCast(context));
     task_queue.notify();
 }
@@ -1459,14 +1434,8 @@ fn notifyWindowLifecycle(entry: *WindowEntry) void {
 /// platform thread owns all Wayland/EGL and response work.
 fn addViewCallback(result: [*c]const c.FlutterAddViewResult) callconv(.c) void {
     const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
-    entry.registry.lock();
-    if (entry.lifecycle != .adding or entry.add_result != null) {
-        entry.registry.unlock();
-        return;
-    }
-    entry.add_result = result.*.added;
-    entry.registry.unlock();
-    notifyWindowLifecycle(entry);
+    const registry = entry.registry;
+    if (registry.completeAdd(entry, result.*.added)) |notification| notification.notify();
 }
 
 /// Mark a view as removing under the registry lock, then submit RemoveView
@@ -1544,14 +1513,8 @@ fn processCompositorCloseRequests(runner: *Runner) void {
 /// after success, the platform thread must perform all Wayland/EGL cleanup.
 fn removeViewCallback(result: [*c]const c.FlutterRemoveViewResult) callconv(.c) void {
     const entry: *WindowEntry = @ptrCast(@alignCast(result.*.user_data.?));
-    entry.registry.lock();
-    if (entry.lifecycle != .removing or entry.remove_result != null) {
-        entry.registry.unlock();
-        return;
-    }
-    entry.remove_result = result.*.removed;
-    entry.registry.unlock();
-    notifyWindowLifecycle(entry);
+    const registry = entry.registry;
+    if (registry.completeRemove(entry, result.*.removed)) |notification| notification.notify();
 }
 
 const ViewLifecycleCompletion = enum {
@@ -1621,7 +1584,11 @@ fn processViewLifecycleResults(runner: *Runner) void {
         if (release_entry) {
             if (runner.focused_host == &entry.host) runner.focused_host = null;
             if (runner.pointer_focused_host == &entry.host) runner.pointer_focused_host = null;
+            // A presentation may have acquired the host before it was marked
+            // removing. Wait for it before destroying the surface or entry.
+            entry.host.present_mutex.lockUncancelable(runner.registry.io);
             entry.host.deinit();
+            entry.host.present_mutex.unlock(runner.registry.io);
             runner.registry.lock();
             if (completion == .remove_succeeded) runner.registry.detachChildrenLocked(view_id);
             runner.registry.releaseLocked(entry);
@@ -1666,18 +1633,14 @@ test "window close notification requires successful RemoveView completion" {
 }
 
 pub fn updateLayerSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.LayerUpdateRequest) !void {
-    runner.registry.lock();
-    defer runner.registry.unlock();
-    const entry = runner.registry.findByViewIdLocked(request.window_id) orelse return error.WindowNotFound;
-    _ = try entry.host.updateLayerRole(request.update);
+    const host = try runner.registry.activeHostForPlatform(request.window_id);
+    _ = try host.updateLayerRole(request.update);
     sendSurfaceSuccess(runner, response_handle, request.id);
 }
 
 pub fn updateWindowSurface(runner: *Runner, response_handle: ?*const c.FlutterPlatformMessageResponseHandle, request: surface_channel.WindowUpdateRequest) !void {
-    runner.registry.lock();
-    defer runner.registry.unlock();
-    const entry = runner.registry.findByViewIdLocked(request.window_id) orelse return error.WindowNotFound;
-    _ = try entry.host.updateWindowRole(request.update);
+    const host = try runner.registry.activeHostForPlatform(request.window_id);
+    _ = try host.updateWindowRole(request.update);
     sendSurfaceSuccess(runner, response_handle, request.id);
 }
 
@@ -1696,7 +1659,24 @@ pub fn exitProcess(runner: *Runner, response_handle: ?*const c.FlutterPlatformMe
     std.debug.print("process.exit({d}) requested; stopping event loop.\n", .{request.code});
 }
 
-/// 退出序列: 引擎已关闭 (无 present), 销毁全部剩余窗口。
+/// Engine shutdown joins callbacks before their registry entries, wake queue, or
+/// context-owned GL objects can be destroyed. Failure cannot safely unwind.
+fn shutdownEngine(runner: *Runner) void {
+    flutter.ensureSuccess(runner.api.shutdown(runner.engine), "FlutterEngineShutdown") catch |err| {
+        std.debug.panic("FlutterEngineShutdown failed: {s}; callback targets must remain alive", .{@errorName(err)});
+    };
+    runner.engine = null;
+    // A VAO is local to the raster context, even when textures are shared.
+    runner.render_context.makeCurrent() catch |err| {
+        std.debug.panic("Cannot bind raster context for blitter teardown: {s}", .{@errorName(err)});
+    };
+    runner.blitter.deinit();
+    runner.render_context.clearCurrent() catch |err| {
+        std.debug.panic("Cannot release raster context after blitter teardown: {s}", .{@errorName(err)});
+    };
+}
+
+/// Engine callbacks have stopped; destroy the remaining platform windows.
 fn shutdownAllWindows(runner: *Runner) void {
     while (true) {
         runner.registry.lock();
@@ -1805,7 +1785,6 @@ fn makeCurrentCallback(user_data: ?*anyopaque) callconv(.c) bool {
         std.debug.print("[error] Flutter make_current callback failed: {s}\n", .{@errorName(err)});
         return false;
     };
-    runner.beginRender();
     return true;
 }
 
@@ -1843,14 +1822,22 @@ fn createBackingStoreCallback(config_ptr: [*c]const c.FlutterBackingStoreConfig,
     _ = user_data;
     const config: *const c.FlutterBackingStoreConfig = @ptrCast(config_ptr);
     const output: *c.FlutterBackingStore = @ptrCast(backing_store_ptr);
-    return flutter_compositor.createBackingStore(config, output);
+    flutter_compositor.createBackingStore(config, output) catch |err| {
+        std.debug.print("[error] create_backing_store failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    return true;
 }
 
 /// compositor: 回收 backing store 纹理。
 fn collectBackingStoreCallback(backing_store_ptr: [*c]const c.FlutterBackingStore, user_data: ?*anyopaque) callconv(.c) bool {
     _ = user_data;
     const backing_store: *const c.FlutterBackingStore = @ptrCast(backing_store_ptr);
-    return flutter_compositor.collectBackingStore(backing_store);
+    flutter_compositor.collectBackingStore(backing_store) catch |err| {
+        std.debug.print("[error] collect_backing_store failed: {s}\n", .{@errorName(err)});
+        return false;
+    };
+    return true;
 }
 
 /// compositor: 将 view 的 layer tree blit 到对应窗口 EGL surface 并 swap。
@@ -1870,11 +1857,10 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
         return true;
     }
     const host = &entry.host;
-    const lock_ok = host.present_mutex.tryLock();
+    // Platform mutations do not call Flutter or dispatch Wayland while holding
+    // this lock. Wait rather than silently dropping a static frame.
+    host.present_mutex.lockUncancelable(host.io);
     runner.registry.unlock();
-    if (!lock_ok) {
-        return true; // resize 中: 跳帧 (引擎会重试下一帧)
-    }
     defer host.present_mutex.unlock(host.io);
 
     if (!host.isReady()) return true;
@@ -1882,15 +1868,15 @@ fn presentViewCallback(info_ptr: [*c]const c.FlutterPresentViewInfo) callconv(.c
         std.debug.print("[error] present_view makeSurfaceCurrent failed: {s}\n", .{@errorName(err)});
         return false;
     };
-    const blitter = &runner.blitter;
-    blitter.init() catch |err| {
-        std.debug.print("[error] blit init failed: {s}\n", .{@errorName(err)});
+    // RemoveView completion may destroy the native window once this lock drops.
+    defer runner.render_context.makeCurrent() catch |err| {
+        std.debug.panic("Cannot release view drawable after presentation: {s}", .{@errorName(err)});
+    };
+    const metrics = host.presentationMetricsLocked();
+    flutter_compositor.presentFrame(&runner.blitter, info, @intCast(metrics.width), @intCast(metrics.height)) catch |err| {
+        std.debug.print("[error] present_view frame failed: {s}\n", .{@errorName(err)});
         return false;
     };
-    const metrics = host.metrics();
-    const vp_w: f32 = @floatFromInt(metrics.width);
-    const vp_h: f32 = @floatFromInt(metrics.height);
-    flutter_compositor.blitLayers(blitter, info, vp_w, vp_h);
     runner.render_context.swapBuffers(host.egl_surface) catch |err| {
         std.debug.print("[error] present_view swapBuffers failed: {s}\n", .{@errorName(err)});
         return false;

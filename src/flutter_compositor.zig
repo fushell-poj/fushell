@@ -1,83 +1,90 @@
-//! Flutter compositor callbacks and OpenGL backing-store presentation.
-//! Backing-store resources are created and collected on the render thread;
-//! each presented layer is routed to the platform-owned window by view id.
-
+//! Flutter backing-store lifecycle and frame presentation on current GLES3 contexts.
 const std = @import("std");
 const c = @import("c");
 const gl_blit = @import("gl_blit.zig");
+const gl = @import("gl_state.zig");
 
-const gl_rgba8: c.GLint = 0x8058;
-
-/// 为 Flutter 分配一张 RGBA8 GLES 渲染纹理。
-///
-/// 调用时引擎的 resource/render context 必须已经 current。纹理名称在
-/// `collectBackingStore` 前归引擎拥有；尺寸向上取整且至少为一个像素，因为 GLES
-/// 不接受零尺寸存储。
-pub fn createBackingStore(config: *const c.FlutterBackingStoreConfig, output: *c.FlutterBackingStore) bool {
-    const width: c.GLsizei = @intFromFloat(@ceil(@max(config.size.width, 1.0)));
-    const height: c.GLsizei = @intFromFloat(@ceil(@max(config.size.height, 1.0)));
+/// Allocation is transactional: output is published only after GL succeeds.
+/// A current shared resource/render context is required. GL errors are reported
+/// and drained, including errors already pending on entry; they are not hidden.
+pub fn createBackingStore(config: *const c.FlutterBackingStoreConfig, output: *c.FlutterBackingStore) !void {
+    const w = config.size.width;
+    const h = config.size.height;
+    if (!std.math.isFinite(w) or !std.math.isFinite(h) or w <= 0 or h <= 0) return error.InvalidBackingStoreSize;
+    try gl.check();
+    const max_size = gl.integer(c.GL_MAX_TEXTURE_SIZE);
+    if (@ceil(w) > @as(f64, @floatFromInt(max_size)) or @ceil(h) > @as(f64, @floatFromInt(max_size))) return error.BackingStoreTooLarge;
+    const width: c.GLsizei = @intFromFloat(@ceil(w));
+    const height: c.GLsizei = @intFromFloat(@ceil(h));
+    // Work on the current texture unit, leaving both the active selector and
+    // every other unit untouched. Null upload pointers must not address a PBO.
+    const previous_texture = gl.integer(c.GL_TEXTURE_BINDING_2D);
+    const previous_unpack = gl.integer(c.GL_PIXEL_UNPACK_BUFFER_BINDING);
+    defer c.glBindTexture(c.GL_TEXTURE_2D, @intCast(previous_texture));
+    defer c.glBindBuffer(c.GL_PIXEL_UNPACK_BUFFER, @intCast(previous_unpack));
     var texture: c.GLuint = 0;
     c.glGenTextures(1, &texture);
-    if (texture == 0) {
-        std.debug.print("[error] glGenTextures failed for backing store {d}x{d}\n", .{ width, height });
-        return false;
-    }
+    if (texture == 0) return error.GlTextureCreateFailed;
+    errdefer c.glDeleteTextures(1, &texture);
     c.glBindTexture(c.GL_TEXTURE_2D, texture);
-    c.glTexImage2D(c.GL_TEXTURE_2D, 0, gl_rgba8, width, height, 0, c.GL_RGBA, c.GL_UNSIGNED_BYTE, null);
+    c.glBindBuffer(c.GL_PIXEL_UNPACK_BUFFER, 0);
+    c.glTexStorage2D(c.GL_TEXTURE_2D, 1, c.GL_RGBA8, width, height);
     c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
     c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
     c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
     c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
-    c.glBindTexture(c.GL_TEXTURE_2D, 0);
-
-    output.* = std.mem.zeroes(c.FlutterBackingStore);
-    output.struct_size = @sizeOf(c.FlutterBackingStore);
-    output.type = c.kFlutterBackingStoreTypeOpenGL;
-    output.unnamed_0.open_gl.type = c.kFlutterOpenGLTargetTypeTexture;
-    output.unnamed_0.open_gl.unnamed_0.texture.target = c.GL_TEXTURE_2D;
-    output.unnamed_0.open_gl.unnamed_0.texture.name = texture;
-    output.unnamed_0.open_gl.unnamed_0.texture.format = @intCast(gl_rgba8);
-    output.unnamed_0.open_gl.unnamed_0.texture.width = @intCast(width);
-    output.unnamed_0.open_gl.unnamed_0.texture.height = @intCast(height);
-    return true;
+    try gl.check();
+    var store = std.mem.zeroes(c.FlutterBackingStore);
+    store.struct_size = @sizeOf(c.FlutterBackingStore);
+    store.type = c.kFlutterBackingStoreTypeOpenGL;
+    store.unnamed_0.open_gl.type = c.kFlutterOpenGLTargetTypeTexture;
+    store.unnamed_0.open_gl.unnamed_0.texture = .{
+        .target = c.GL_TEXTURE_2D,
+        .name = texture,
+        .format = c.GL_RGBA8,
+        .user_data = null,
+        .destruction_callback = textureReleased,
+        .width = @intCast(width),
+        .height = @intCast(height),
+    };
+    output.* = store;
 }
 
-/// 释放此前交给 Flutter 的 GL 纹理。
-///
-/// 引擎保证 backing store 已不再被任何 layer 引用；调用时必须让 Fushell 的共享
-/// resource context 处于 current 状态。
-pub fn collectBackingStore(backing_store: *const c.FlutterBackingStore) bool {
-    if (backing_store.type != c.kFlutterBackingStoreTypeOpenGL) return true;
-    const texture = backing_store.unnamed_0.open_gl.unnamed_0.texture;
-    if (texture.name != 0) {
-        const name = texture.name;
-        c.glDeleteTextures(1, &name);
-    }
-    return true;
+/// Skia's texture release notification does not transfer a second ownership.
+/// The backing-store collection callback is the sole owner of GL deletion,
+/// including the engine's early failure path before a render target is built.
+fn textureReleased(_: ?*anyopaque) callconv(.c) void {}
+
+fn backingTexture(store: *const c.FlutterBackingStore) !c.FlutterOpenGLTexture {
+    if (store.type != c.kFlutterBackingStoreTypeOpenGL) return error.UnsupportedBackingStore;
+    if (store.unnamed_0.open_gl.type != c.kFlutterOpenGLTargetTypeTexture) return error.UnsupportedOpenGLTarget;
+    const texture = store.unnamed_0.open_gl.unnamed_0.texture;
+    if (texture.target != c.GL_TEXTURE_2D or texture.format != c.GL_RGBA8) return error.UnsupportedTextureFormat;
+    if (texture.name == 0) return error.InvalidTexture;
+    return texture;
 }
 
-/// 按顺序把 Flutter backing-store layer 合成到一个窗口 surface。
-///
-/// 偏移与尺寸使用左上角为原点的物理像素。目标 EGL surface 及其默认 framebuffer
-/// 必须已经 current；不支持的 platform-view layer 会报告诊断，而不是静默绘制。
-pub fn blitLayers(blitter: *gl_blit.Blitter, info: *const c.FlutterPresentViewInfo, viewport_width: f32, viewport_height: f32) void {
+/// Flutter calls once when the backing store is no longer used. The caller
+/// makes a compatible resource context current before entering this function.
+pub fn collectBackingStore(store: *const c.FlutterBackingStore) !void {
+    const texture = try backingTexture(store);
+    c.glDeleteTextures(1, &texture.name);
+    try gl.check();
+}
+
+/// Current destination surface, top-left physical-pixel layer coordinates.
+/// Caller swaps only on success. Every frame clears, including an empty frame;
+/// defer restores the caller's GL state on successful and rejected layers alike.
+pub fn presentFrame(blitter: *gl_blit.Blitter, info: *const c.FlutterPresentViewInfo, viewport_width: u32, viewport_height: u32) !void {
+    const frame = try blitter.beginFrame(viewport_width, viewport_height);
+    defer frame.end();
+    if (info.layers_count != 0 and info.layers == null) return error.InvalidLayers;
     for (0..info.layers_count) |index| {
+        if (info.layers[index] == null) return error.InvalidLayer;
         const layer: *const c.FlutterLayer = @ptrCast(info.layers[index]);
-        switch (layer.type) {
-            c.kFlutterLayerContentTypeBackingStore => {
-                const backing_store: *const c.FlutterBackingStore = @ptrCast(layer.unnamed_0.backing_store);
-                const texture = backing_store.unnamed_0.open_gl.unnamed_0.texture;
-                blitter.blitLayer(
-                    texture.name,
-                    @floatCast(layer.offset.x),
-                    @floatCast(layer.offset.y),
-                    @floatCast(layer.size.width),
-                    @floatCast(layer.size.height),
-                    viewport_width,
-                    viewport_height,
-                );
-            },
-            else => std.debug.print("unsupported layer type in present: {}\n", .{layer.type}),
-        }
+        if (layer.type != c.kFlutterLayerContentTypeBackingStore) return error.UnsupportedLayer;
+        if (layer.unnamed_0.backing_store == null) return error.InvalidBackingStore;
+        const texture = try backingTexture(@ptrCast(layer.unnamed_0.backing_store));
+        try frame.draw(texture.name, @floatCast(layer.offset.x), @floatCast(layer.offset.y), @floatCast(layer.size.width), @floatCast(layer.size.height));
     }
 }

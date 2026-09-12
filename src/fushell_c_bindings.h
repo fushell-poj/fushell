@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <wayland-egl.h>
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 #include <fontconfig/fontconfig.h>
 #include <dbus/dbus.h>
 #include <poll.h>

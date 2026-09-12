@@ -1,6 +1,6 @@
 //! Allocator-owned multi-view window registry and lifecycle state machine.
-//! All entry and host dereferences happen while the registry mutex is held;
-//! entries have stable addresses until their RemoveView result is consumed.
+//! Shared entry and host access is protected by the registry mutex. Entries
+//! remain alive until an engine completion is published or the engine shuts down.
 
 const std = @import("std");
 const c = @import("c");
@@ -10,6 +10,17 @@ const wl = wayland.client.wl;
 
 pub const Lifecycle = enum { adding, active, removing };
 
+/// Copied before completion is published; its target must outlive engine shutdown.
+/// Notification never accesses the entry whose completion it announces.
+pub const LifecycleNotification = struct {
+    context: *anyopaque,
+    wake: *const fn (*anyopaque) void,
+
+    pub fn notify(self: LifecycleNotification) void {
+        self.wake(self.context);
+    }
+};
+
 pub const Entry = struct {
     registry: *Registry,
     lifecycle: Lifecycle = .adding,
@@ -17,7 +28,7 @@ pub const Entry = struct {
     parent_view_id: ?i64 = null,
     add_result: ?bool = null,
     remove_result: ?bool = null,
-    lifecycle_wake_context: ?*anyopaque = null,
+    lifecycle_notification: ?LifecycleNotification = null,
     pending_open_response: ?*const c.FlutterPlatformMessageResponseHandle = null,
     pending_open_request_id: i64 = 0,
     pending_close_response: ?*const c.FlutterPlatformMessageResponseHandle = null,
@@ -26,7 +37,7 @@ pub const Entry = struct {
 };
 
 /// Allocator-owned registry with stable record addresses and indexed lookups.
-/// Callers must hold `mutex` while dereferencing an Entry or Host obtained here.
+/// Entry and Host access requires the mutex, except an activeHostForPlatform borrow.
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -60,8 +71,40 @@ pub const Registry = struct {
         self.mutex.unlock(self.io);
     }
 
+    /// The engine owns entry until this call publishes its completion. Only the
+    /// returned notification may be used afterward: a consumer can free entry.
+    pub fn completeAdd(self: *Registry, entry: *Entry, added: bool) ?LifecycleNotification {
+        self.lock();
+        defer self.unlock();
+        if (entry.lifecycle != .adding or entry.add_result != null) return null;
+        const notification = entry.lifecycle_notification;
+        entry.add_result = added;
+        return notification;
+    }
+
+    pub fn completeRemove(self: *Registry, entry: *Entry, removed: bool) ?LifecycleNotification {
+        self.lock();
+        defer self.unlock();
+        if (entry.lifecycle != .removing or entry.remove_result != null) return null;
+        const notification = entry.lifecycle_notification;
+        entry.remove_result = removed;
+        return notification;
+    }
+
     pub fn findByViewIdLocked(self: *Registry, view_id: i64) ?*Entry {
         return self.by_view_id.get(view_id);
+    }
+
+    /// Platform thread only: return a borrowed host without retaining the lock,
+    /// so host operations may dispatch Wayland callbacks that reenter the registry.
+    /// Entries are reclaimed only by platform lifecycle processing, which must
+    /// not run inside nested Wayland dispatch while this borrow is in use.
+    pub fn activeHostForPlatform(self: *Registry, view_id: i64) !*egl.Host {
+        self.lock();
+        defer self.unlock();
+        const entry = self.findByViewIdLocked(view_id) orelse return error.WindowNotFound;
+        if (entry.lifecycle != .active) return error.WindowNotReady;
+        return &entry.host;
     }
 
     pub fn findHostBySurfaceLocked(self: *Registry, surface: ?*wl.Surface) ?*egl.Host {
@@ -140,7 +183,8 @@ test "surface index resolves the owning host and is removed on release" {
     defer registry.unlock();
 
     const entry = try registry.reserveLocked(null);
-    const surface: *wl.Surface = @ptrFromInt(@alignOf(wl.Surface));
+    var surface_stub: u8 = 0;
+    const surface: *wl.Surface = @ptrCast(&surface_stub);
     entry.host.surface = surface;
     try registry.indexSurfaceLocked(entry);
     try std.testing.expectEqual(&entry.host, registry.findHostBySurfaceLocked(surface).?);
@@ -181,4 +225,91 @@ test "repeated reserve and release leaves no stale id records" {
     }
     try std.testing.expect(registry.findByViewIdLocked(previous_view_id) == null);
     try std.testing.expectEqual(@as(usize, 0), registry.entries.items.len);
+}
+
+const CompletionProbe = struct {
+    registry: *Registry,
+    view_id: i64,
+    notified: bool = false,
+
+    fn wake(context: *anyopaque) void {
+        const self: *CompletionProbe = @ptrCast(@alignCast(context));
+        self.registry.lock();
+        defer self.registry.unlock();
+        // The completion consumer has already reclaimed the callback record.
+        std.debug.assert(self.registry.findByViewIdLocked(self.view_id) == null);
+        self.notified = true;
+    }
+};
+
+test "completion notifications survive reclamation before wake" {
+    inline for (.{ Lifecycle.adding, Lifecycle.removing }) |lifecycle| {
+        var registry = Registry.init(std.testing.allocator, std.testing.io);
+        defer registry.deinit();
+        registry.lock();
+        const entry = registry.reserveLocked(null) catch |err| {
+            registry.unlock();
+            return err;
+        };
+        var probe = CompletionProbe{ .registry = &registry, .view_id = entry.view_id };
+        entry.lifecycle = lifecycle;
+        entry.lifecycle_notification = .{ .context = &probe, .wake = CompletionProbe.wake };
+        registry.unlock();
+
+        // Exercise the production publication API. Force the adverse scheduling
+        // order: platform consumes/frees before the engine thread can notify.
+        const notification = if (lifecycle == .adding)
+            registry.completeAdd(entry, false).?
+        else
+            registry.completeRemove(entry, true).?;
+        registry.lock();
+        const result = if (lifecycle == .adding) entry.add_result else entry.remove_result;
+        registry.releaseLocked(entry);
+        registry.unlock();
+        try std.testing.expectEqual(lifecycle == .removing, result.?);
+        notification.notify();
+        try std.testing.expect(probe.notified);
+    }
+}
+
+test "platform host borrow permits reentrant lookup and rejects inactive views" {
+    var registry = Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    registry.lock();
+    const entry = registry.reserveLocked(null) catch |err| {
+        registry.unlock();
+        return err;
+    };
+    const view_id = entry.view_id;
+    registry.unlock();
+    defer {
+        registry.lock();
+        registry.releaseLocked(entry);
+        registry.unlock();
+    }
+
+    try std.testing.expectError(error.WindowNotFound, registry.activeHostForPlatform(view_id + 1));
+    try std.testing.expectError(error.WindowNotReady, registry.activeHostForPlatform(view_id));
+    registry.lock();
+    entry.lifecycle = .active;
+    registry.unlock();
+
+    const host = try registry.activeHostForPlatform(view_id);
+    const NestedDispatch = struct {
+        fn lookup(current: *Registry, id: i64, borrowed: *egl.Host) !void {
+            // Model a synchronous Wayland callback. tryLock makes a retained
+            // lock fail the assertion instead of hanging the regression test.
+            const acquired = current.mutex.tryLock();
+            try std.testing.expect(acquired);
+            defer current.unlock();
+            const found = current.findByViewIdLocked(id).?;
+            try std.testing.expectEqual(borrowed, &found.host);
+        }
+    };
+    try NestedDispatch.lookup(&registry, view_id, host);
+
+    registry.lock();
+    entry.lifecycle = .removing;
+    registry.unlock();
+    try std.testing.expectError(error.WindowNotReady, registry.activeHostForPlatform(view_id));
 }
