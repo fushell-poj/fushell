@@ -12,6 +12,7 @@ const xdg = wayland.client.xdg;
 const wp = wayland.client.wp;
 const zwlr = wayland.client.zwlr;
 const c = @import("c");
+const egl_presentation = @import("egl_presentation.zig");
 const surface_channel = @import("surface_channel.zig");
 const display_state = @import("wl_display_state.zig");
 const geometry = @import("window_geometry.zig");
@@ -108,6 +109,7 @@ fn integerScaleForMembership(membership: *const OutputMembership, outputs: []con
 /// 反初始化本对象前必须先销毁每个 Host 的 EGL surface。
 pub const RenderContext = struct {
     display_state: *display_state.DisplayState = undefined,
+    egl: egl_presentation.Api = .{},
     egl_config: c.EGLConfig = null,
     egl_context: c.EGLContext = null,
     bootstrap_surface: c.EGLSurface = null,
@@ -119,23 +121,10 @@ pub const RenderContext = struct {
         std.debug.assert(state.egl_display != null);
         if (c.eglBindAPI(c.EGL_OPENGL_ES_API) != c.EGL_TRUE) return eglError("eglBindAPI");
 
-        const config_attribs = [_]c.EGLint{
-            c.EGL_SURFACE_TYPE,    c.EGL_WINDOW_BIT | c.EGL_PBUFFER_BIT,
-            c.EGL_RENDERABLE_TYPE, c.EGL_OPENGL_ES3_BIT,
-            c.EGL_RED_SIZE,        8,
-            c.EGL_GREEN_SIZE,      8,
-            c.EGL_BLUE_SIZE,       8,
-            c.EGL_ALPHA_SIZE,      8,
-            c.EGL_NONE,
+        self.egl_config = egl_presentation.chooseConfig(self.egl, std.heap.page_allocator, state.egl_display) catch |err| {
+            std.log.scoped(.render).err("Cannot select RGBA8 ES3 window/pbuffer EGL config with swap interval zero: {s}", .{@errorName(err)});
+            return err;
         };
-        var config_count: c.EGLint = 0;
-        if (c.eglChooseConfig(state.egl_display, &config_attribs, &self.egl_config, 1, &config_count) != c.EGL_TRUE) {
-            return eglError("eglChooseConfig (OpenGL ES 3 required)");
-        }
-        if (config_count == 0) {
-            std.log.scoped(.render).err("OpenGL ES 3 is required: no EGL config supports ES3 with window and pbuffer surfaces.", .{});
-            return error.OpenGles3Unavailable;
-        }
 
         const context_attribs = [_]c.EGLint{
             c.EGL_CONTEXT_CLIENT_VERSION, 3,
@@ -177,7 +166,7 @@ pub const RenderContext = struct {
 
     /// raster 渲染目标: bootstrap pbuffer。
     pub fn makeCurrent(self: *RenderContext) !void {
-        if (c.eglMakeCurrent(self.display_state.egl_display, self.bootstrap_surface, self.bootstrap_surface, self.egl_context) != c.EGL_TRUE) {
+        if (self.egl.make_current(self.display_state.egl_display, self.bootstrap_surface, self.bootstrap_surface, self.egl_context) != c.EGL_TRUE) {
             return eglError("eglMakeCurrent");
         }
     }
@@ -196,14 +185,11 @@ pub const RenderContext = struct {
 
     /// 呈现目标: 某窗口的 EGL surface (同 context, 换 surface)。
     pub fn makeSurfaceCurrent(self: *RenderContext, surface: c.EGLSurface) !void {
-        if (surface == null or surface == c.EGL_NO_SURFACE) return error.EglFailed;
-        if (c.eglMakeCurrent(self.display_state.egl_display, surface, surface, self.egl_context) != c.EGL_TRUE) {
-            return eglError("eglMakeCurrent(window)");
-        }
+        try egl_presentation.bindWindow(self.egl, self.display_state.egl_display, self.egl_context, self.bootstrap_surface, surface);
     }
 
     pub fn swapBuffers(self: *RenderContext, surface: c.EGLSurface) !void {
-        if (c.eglSwapBuffers(self.display_state.egl_display, surface) != c.EGL_TRUE) return eglError("eglSwapBuffers");
+        if (self.egl.swap_buffers(self.display_state.egl_display, surface) != c.EGL_TRUE) return eglError("eglSwapBuffers");
     }
 };
 

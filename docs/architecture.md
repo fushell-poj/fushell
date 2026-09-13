@@ -90,6 +90,23 @@ The frame clock queues VSync batons and releases them on software deadlines. Thi
 prevents immediate recursive frame scheduling. It is explicitly a fallback and
 has not been validated as physical display synchronization.
 
+Window presentation must not add a second pacing dependency on the visibility of
+a particular view. `egl_presentation.zig` enumerates compatible ES3 window/pbuffer
+configs and requires their minimum/maximum swap interval to include zero; EGL may
+otherwise silently clamp a requested interval. Each raster-thread window bind
+sets a checked swap interval of zero before presenting, including newly created
+or recreated surfaces. A failed interval update restores the bootstrap drawable
+before returning; failure to restore is fatal rather than exposing a still-current
+window surface to teardown. The existing presentation lock and successful-path
+bootstrap restore remain in place.
+
+This removes Mesa Wayland frame-callback pacing from individual windows: a hidden
+toplevel must not hold up the shared raster thread waiting for its visibility to
+return. It does not make EGL universally nonblocking: GPU work, buffer release,
+or other driver waits can still occur. The software frame clock remains the
+application pacing source; no input/grab or compositor-visibility heuristic is
+used to decide whether a view can present.
+
 ## Build ownership
 
 `flutter_toolchain.zig` chooses one SDK. `flutter_engine_store.zig` owns neither

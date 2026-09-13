@@ -3,6 +3,7 @@ test {
     _ = @import("flutter_runner.zig");
     _ = @import("window_registry.zig");
     _ = @import("wayland_egl_host.zig");
+    _ = @import("egl_presentation_test.zig");
     _ = @import("window_geometry_test.zig");
     _ = @import("layer_reservation_test.zig");
     _ = @import("popup_geometry.zig");
