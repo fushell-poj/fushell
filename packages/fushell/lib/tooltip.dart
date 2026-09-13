@@ -350,6 +350,7 @@ class NativeTooltip extends StatefulWidget {
     this.exitDuration,
     this.preferBelow,
     this.verticalOffset,
+    this.edgeGap,
     this.decoration,
     this.textStyle,
     this.padding,
@@ -365,7 +366,31 @@ class NativeTooltip extends StatefulWidget {
   final Duration? showDuration;
   final Duration? exitDuration;
   final bool? preferBelow;
+
+  /// Distance from the source center, as in Flutter's Material Tooltip.
+  /// Defaults to TooltipThemeData.verticalOffset, then 24 logical pixels.
+  /// Cannot be supplied together with [edgeGap].
   final double? verticalOffset;
+
+  /// Distance from the source bottom/top edge rather than its center.
+  /// Overrides the theme's verticalOffset. Must be finite and non-negative.
+  /// Integer rounding can shift placement by one logical pixel; this measures
+  /// the popup surface, not its painted bounds. Compositor flip/slide applies.
+  final double? edgeGap;
+
+  void _validatePosition() {
+    if (edgeGap != null && verticalOffset != null) {
+      throw ArgumentError('verticalOffset and edgeGap are mutually exclusive');
+    }
+    if (edgeGap != null && (!edgeGap!.isFinite || edgeGap! < 0)) {
+      throw ArgumentError.value(
+        edgeGap,
+        'edgeGap',
+        'must be finite and non-negative',
+      );
+    }
+  }
+
   final Decoration? decoration;
   final TextStyle? textStyle;
   final EdgeInsetsGeometry? padding;
@@ -395,6 +420,7 @@ class _NativeTooltipState extends State<NativeTooltip>
   @override
   void initState() {
     super.initState();
+    widget._validatePosition();
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -420,7 +446,8 @@ class _NativeTooltipState extends State<NativeTooltip>
         oldWidget.margin != widget.margin ||
         oldWidget.constraints != widget.constraints ||
         oldWidget.preferBelow != widget.preferBelow ||
-        oldWidget.verticalOffset != widget.verticalOffset) {
+        oldWidget.verticalOffset != widget.verticalOffset ||
+        oldWidget.edgeGap != widget.edgeGap) {
       _dismiss();
     }
   }
@@ -557,8 +584,12 @@ class _NativeTooltipState extends State<NativeTooltip>
     final width = math.max(1, (size.width + margin.horizontal).ceil());
     final height = math.max(1, (size.height + margin.vertical).ceil());
     final below = widget.preferBelow ?? tooltipTheme.preferBelow ?? true;
-    final offset = (widget.verticalOffset ?? tooltipTheme.verticalOffset ?? 24)
-        .round();
+    final offset =
+        (widget.edgeGap ??
+                widget.verticalOffset ??
+                tooltipTheme.verticalOffset ??
+                24)
+            .round();
     Widget content = Padding(
       padding: margin,
       child: DecoratedBox(
@@ -618,7 +649,11 @@ class _NativeTooltipState extends State<NativeTooltip>
           width: anchor.width.toInt(),
           height: anchor.height.toInt(),
         ),
-        anchor: below ? PopupAnchor.bottom : PopupAnchor.top,
+        anchor: widget.edgeGap == null
+            ? PopupAnchor.none
+            : below
+            ? PopupAnchor.bottom
+            : PopupAnchor.top,
         gravity: below ? PopupGravity.bottom : PopupGravity.top,
         offset: PopupOffset(y: below ? offset : -offset),
         constraintAdjustment: const {
@@ -669,19 +704,25 @@ class _NativeTooltipState extends State<NativeTooltip>
   }
 
   @override
-  Widget build(BuildContext context) => Semantics(
-    tooltip: widget.excludeFromSemantics || widget.message.isEmpty
-        ? null
-        : widget.message,
-    child: Focus(
-      canRequestFocus: false,
-      skipTraversal: true,
-      onFocusChange: _focus,
-      child: MouseRegion(
-        onEnter: (_) => _enter(),
-        onExit: (_) => _leave(),
-        child: Listener(onPointerDown: (_) => _dismiss(), child: widget.child),
+  Widget build(BuildContext context) {
+    widget._validatePosition();
+    return Semantics(
+      tooltip: widget.excludeFromSemantics || widget.message.isEmpty
+          ? null
+          : widget.message,
+      child: Focus(
+        canRequestFocus: false,
+        skipTraversal: true,
+        onFocusChange: _focus,
+        child: MouseRegion(
+          onEnter: (_) => _enter(),
+          onExit: (_) => _leave(),
+          child: Listener(
+            onPointerDown: (_) => _dismiss(),
+            child: widget.child,
+          ),
+        ),
       ),
-    ),
-  );
+    );
+  }
 }

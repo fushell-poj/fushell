@@ -258,6 +258,10 @@ pub const Host = struct {
     close_requested: bool = false,
     /// Platform-thread-only client requests; zero remains compositor-controlled.
     layer_size_request: geometry.LayerSizeRequest = .{},
+    layer_anchors: surface_channel.AnchorMask = .{},
+    layer_margins: surface_channel.Margins = .{},
+    layer_exclusive_zone: surface_channel.LayerExclusiveZone = .none,
+    layer_last_sent_zone: ?i32 = null,
     /// Platform-thread-only effective logical dimensions. For layer roles, only
     /// configure changes these after initialization. Raster reads presentationMetricsLocked.
     width: i32 = default_width,
@@ -427,11 +431,26 @@ pub const Host = struct {
     }
 
     pub fn initializeLayerRole(self: *Host, layer: surface_channel.LayerRole) !void {
+        try self.initializeLayerProtocol(layer);
+        errdefer self.state = .failed;
+        try self.waitForInitialConfigure();
+        try self.attachEglWindowSurface();
+        self.state = .ready;
+    }
+
+    // Kept separate from EGL attachment so protocol lifecycle can be tested without a display.
+    fn initializeLayerProtocol(self: *Host, layer: surface_channel.LayerRole) !void {
+        // Validate before beginRoleInitialization or any protocol/state mutation.
+        const size = (geometry.LayerSizeRequest{}).updated(layer.width, layer.height);
+        try layer.exclusive_zone.validateSize(layer.anchors, size.width, size.height);
         try self.beginRoleInitialization();
         errdefer self.state = .failed;
         if (self.display_state.layer_shell == null) return error.LayerShellUnavailable;
 
         self.layer_size_request = (geometry.LayerSizeRequest{}).updated(layer.width, layer.height);
+        self.layer_anchors = layer.anchors;
+        self.layer_margins = layer.margins;
+        self.layer_exclusive_zone = layer.exclusive_zone;
         // Effective layer dimensions come only from configure, never from requests.
         self.width = 0;
         self.height = 0;
@@ -445,20 +464,37 @@ pub const Host = struct {
         self.layer_surface.?.setSize(self.layer_size_request.width, self.layer_size_request.height);
         self.layer_surface.?.setAnchor(mapAnchor(layer.anchors));
         self.layer_surface.?.setMargin(layer.margins.top, layer.margins.right, layer.margins.bottom, layer.margins.left);
-        self.layer_surface.?.setExclusiveZone(layer.exclusive_zone);
+        _ = self.syncLayerExclusiveZone(@intCast(self.layer_size_request.width), @intCast(self.layer_size_request.height));
         self.layer_surface.?.setKeyboardInteractivity(mapKeyboardInteractivity(layer.keyboard_interactivity));
 
         self.applyBufferScale();
         self.surface.?.commit();
         self.display_state.flush();
-        try self.waitForInitialConfigure();
-        try self.attachEglWindowSurface();
-        self.state = .ready;
     }
 
     pub fn updateLayerRole(self: *Host, update: surface_channel.LayerSurfaceUpdate) !bool {
         try self.requireReadyLayerRole();
         if (update.isEmpty()) return false;
+        const next_anchors = update.anchors orelse self.layer_anchors;
+        const mode = update.exclusive_zone orelse self.layer_exclusive_zone;
+        const size = self.layer_size_request.updated(update.width, update.height);
+        try mode.validateSize(next_anchors, size.width, size.height);
+        // A new thickness/axis must accompany its requested size in this commit,
+        // never the old stretched cross-axis. Pure mode/margin changes instead
+        // retain the compositor-resolved extent (which may differ from requests).
+        const old_edge = surface_channel.LayerExclusiveZone.exclusiveEdge(self.layer_anchors);
+        const new_edge = surface_channel.LayerExclusiveZone.exclusiveEdge(next_anchors);
+        const old_vertical = old_edge == .top or old_edge == .bottom;
+        const new_vertical = new_edge == .top or new_edge == .bottom;
+        const axis_changed = old_vertical != new_vertical;
+        const zone_width = if (mode == .auto and (axis_changed or size.width != self.layer_size_request.width))
+            @as(i32, @intCast(size.width))
+        else
+            self.width;
+        const zone_height = if (mode == .auto and (axis_changed or size.height != self.layer_size_request.height))
+            @as(i32, @intCast(size.height))
+        else
+            self.height;
         // Serialize role commits and native resize with raster presentation.
         // This scope MUST end before waitForUpdateConfigure dispatches listeners.
         var layout_changed = false;
@@ -466,6 +502,9 @@ pub const Host = struct {
             self.present_mutex.lock(self.io) catch unreachable;
             defer self.present_mutex.unlock(self.io);
             const layer_surface = self.layer_surface.?;
+            self.layer_anchors = next_anchors;
+            self.layer_margins = update.margins orelse self.layer_margins;
+            self.layer_exclusive_zone = mode;
 
             if (update.width != null or update.height != null) {
                 self.layer_size_request = self.layer_size_request.updated(update.width, update.height);
@@ -480,10 +519,7 @@ pub const Host = struct {
                 layer_surface.setMargin(margins.top, margins.right, margins.bottom, margins.left);
                 layout_changed = true;
             }
-            if (update.exclusive_zone) |exclusive_zone| {
-                layer_surface.setExclusiveZone(exclusive_zone);
-                layout_changed = true;
-            }
+            if (self.syncLayerExclusiveZone(zone_width, zone_height)) layout_changed = true;
             if (update.keyboard_interactivity) |keyboard_interactivity| {
                 layer_surface.setKeyboardInteractivity(mapKeyboardInteractivity(keyboard_interactivity));
             }
@@ -494,6 +530,16 @@ pub const Host = struct {
         self.display_state.flush();
         if (layout_changed) {
             try self.waitForUpdateConfigure();
+            if (!self.configured and self.state != .shutting_down and self.state != .failed) {
+                // No configure arrived: retain confirmed geometry, not a provisional
+                // request. A later configure still resolves normally through listener.
+                self.present_mutex.lock(self.io) catch unreachable;
+                defer self.present_mutex.unlock(self.io);
+                if (self.syncLayerExclusiveZone(self.width, self.height)) {
+                    self.surface.?.commit();
+                    self.display_state.flush();
+                }
+            }
             return true;
         }
         return false;
@@ -643,7 +689,7 @@ pub const Host = struct {
     }
 
     fn requireReadyLayerRole(self: *Host) !void {
-        if (self.state != .ready) return error.SurfaceNotInitialized;
+        if (self.state != .ready or self.close_requested) return error.SurfaceNotInitialized;
         if (self.layer_surface == null) return error.SurfaceRoleMismatch;
     }
 
@@ -654,9 +700,9 @@ pub const Host = struct {
 
     fn waitForUpdateConfigure(self: *Host) !void {
         var attempts: usize = 0;
-        while (!self.configured and attempts < 64) : (attempts += 1) {
+        while (!self.configured and !self.close_requested and attempts < 64) : (attempts += 1) {
             if (self.dispatchQueue() != .SUCCESS) return error.WaylandDispatchFailed;
-            if (self.configured) return;
+            if (self.configured or self.close_requested) return;
             self.display_state.flush();
             var fds = [_]c.struct_pollfd{.{
                 .fd = self.display_state.display.?.getFd(),
@@ -715,10 +761,24 @@ pub const Host = struct {
         const next = blk: {
             self.present_mutex.lock(self.io) catch unreachable;
             defer self.present_mutex.unlock(self.io);
+            // Queue double-buffered layer state before publishing the matching geometry.
+            // The next frame commit applies both atomically; no configure-only commit loop.
+            if (self.layer_surface != null) _ = self.syncLayerExclusiveZone(self.width, self.height);
             break :blk self.publishGeometryLocked();
         };
         // Never call Flutter with present_mutex held: callbacks may reenter the host.
         if (self.metrics_callback) |callback| callback(self, self.metrics_context, next);
+    }
+
+    fn syncLayerExclusiveZone(self: *Host, width: i32, height: i32) bool {
+        // Layer .closed does not change Host.state until owner teardown. Suppress
+        // every reservation path immediately, including configure/metrics callbacks.
+        if (self.close_requested or self.state == .shutting_down or self.state == .failed) return false;
+        const zone = self.layer_exclusive_zone.resolve(self.layer_anchors, self.layer_margins, width, height);
+        if (self.layer_last_sent_zone == zone) return false;
+        self.layer_surface.?.setExclusiveZone(zone);
+        self.layer_last_sent_zone = zone;
+        return true;
     }
 
     fn applyPendingConfigure(self: *Host) void {
@@ -733,7 +793,20 @@ pub const Host = struct {
         }
         self.pending_width = 0;
         self.pending_height = 0;
-        if (changed) self.emitMetrics();
+        if (changed) {
+            self.emitMetrics();
+        } else if (self.layer_surface != null and self.state != .shutting_down and self.state != .failed) {
+            // A compositor may clamp a new request to the unchanged actual size.
+            // Reconcile a provisional auto zone even when metrics need no update.
+            self.present_mutex.lock(self.io) catch unreachable;
+            defer self.present_mutex.unlock(self.io);
+            if (self.syncLayerExclusiveZone(self.width, self.height)) {
+                // No metrics changed, so no new frame is guaranteed to commit it.
+                // The last-sent comparison bounds this to a real correction only.
+                self.surface.?.commit();
+                self.display_state.flush();
+            }
+        }
     }
 
     fn emitPointer(self: *Host, event: PointerEvent) void {
@@ -1202,4 +1275,240 @@ test "popup configure is staged and dismissal prevents further presentation" {
     // Late configures cannot publish new backing-store dimensions after dismissal.
     host.applyPendingConfigure();
     try std.testing.expectEqual(original, host.metricsSnapshot());
+}
+
+test "Host auto layer protocol creation configure sparse updates and feedback" {
+    const Probe = @import("layer_protocol_probe.zig").Probe;
+    var probe: Probe = .{};
+    try probe.init();
+    defer probe.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io(), .display_state = &probe.state, .scale = 2 };
+    var namespace = [_]u8{ 't', 'e', 's', 't' };
+    try host.initializeLayerProtocol(.{
+        .namespace = &namespace,
+        .layer = .top,
+        .anchors = .{ .top = true, .left = true, .right = true },
+        .width = 0,
+        .height = 48,
+        .margins = .{ .top = 8 },
+        .exclusive_zone = .auto,
+    });
+    const initial = try probe.drain(&host);
+    try initial.expectZones(&.{48});
+    try std.testing.expectEqual(@as(usize, 1), initial.commits);
+    try std.testing.expectEqual(@as(i32, 0), host.height);
+    try std.testing.expect(!host.configured);
+    try std.testing.expect(!host.hasPresentedBuffer());
+
+    try probe.queueConfigure(&host, 1280, 60);
+    try host.waitForInitialConfigure();
+    const configured = try probe.drain(&host);
+    try configured.expectZones(&.{60});
+    try std.testing.expectEqual(@as(usize, 0), configured.commits);
+    try std.testing.expectEqual(@as(i32, 120), host.metricsSnapshot().height);
+    try std.testing.expectEqual(@as(u32, 48), host.layer_size_request.height);
+    try std.testing.expect(!host.hasPresentedBuffer());
+    host.state = .ready; // Only EGL attachment is omitted in this protocol-level test.
+
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 2, .width = 1280, .height = 60 } }, &host);
+    const duplicate = try probe.drain(&host);
+    try duplicate.expectZones(&.{});
+    try std.testing.expectEqual(@as(usize, 0), duplicate.commits);
+
+    try probe.queueConfigure(&host, 1280, 70);
+    try std.testing.expect(try host.updateLayerRole(.{ .height = 72 }));
+    const resized = try probe.drain(&host);
+    try resized.expectZones(&.{ 72, 70 });
+    try std.testing.expectEqual(@as(i32, 72), resized.committed_zones[0]);
+    try std.testing.expectEqual(@as(u32, 72), host.layer_size_request.height);
+    try std.testing.expectEqual(@as(u32, 0), host.layer_size_request.width);
+    try std.testing.expectEqual(@as(i32, 70), host.height);
+
+    try probe.queueConfigure(&host, 1280, 70);
+    try std.testing.expect(try host.updateLayerRole(.{ .margins = .{ .top = 100, .bottom = 3 } }));
+    try (try probe.drain(&host)).expectZones(&.{73});
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 3, .width = 1300, .height = 70 } }, &host);
+    try (try probe.drain(&host)).expectZones(&.{});
+    try std.testing.expectEqual(@as(?i32, 73), host.layer_last_sent_zone);
+
+    try probe.queueConfigure(&host, 1300, 70);
+    try std.testing.expect(try host.updateLayerRole(.{ .anchors = .{ .bottom = true, .left = true, .right = true } }));
+    try (try probe.drain(&host)).expectZones(&.{170});
+    try std.testing.expectEqual(@as(i32, 100), host.layer_margins.top);
+    try std.testing.expect(host.layer_exclusive_zone == .auto);
+}
+
+test "Host auto orientation and thickness changes commit new request then reconcile clamping" {
+    const Probe = @import("layer_protocol_probe.zig").Probe;
+    var probe: Probe = .{};
+    try probe.init();
+    defer probe.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io(), .display_state = &probe.state };
+    var namespace = [_]u8{'t'};
+    try host.initializeLayerProtocol(.{ .namespace = &namespace, .layer = .top, .anchors = .{ .top = true, .left = true, .right = true }, .width = 0, .height = 48, .exclusive_zone = .auto });
+    try probe.queueConfigure(&host, 2032, 32);
+    try host.waitForInitialConfigure();
+    host.state = .ready;
+    _ = try probe.drain(&host);
+    try probe.queueConfigure(&host, 32, 1000);
+    _ = try host.updateLayerRole(.{ .anchors = .{ .left = true, .top = true, .bottom = true }, .width = 48, .height = 0 });
+    const rotated = try probe.drain(&host);
+    try rotated.expectZones(&.{ 48, 32 });
+    try std.testing.expectEqual(@as(usize, 1), rotated.commits);
+    try std.testing.expectEqual(@as(i32, 48), rotated.committed_zones[0]);
+    // A new thickness clamped to the unchanged actual extent must still reset.
+    try probe.queueConfigure(&host, 32, 1000);
+    _ = try host.updateLayerRole(.{ .width = 64 });
+    const clamped = try probe.drain(&host);
+    try clamped.expectZones(&.{ 64, 32 });
+    try std.testing.expectEqualSlices(i32, &.{ 64, 32 }, clamped.committed_zones[0..clamped.commits]);
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 9, .width = 32, .height = 1000 } }, &host);
+    const repeated = try probe.drain(&host);
+    try repeated.expectZones(&.{});
+    try std.testing.expectEqual(@as(usize, 0), repeated.commits);
+    try probe.queueConfigure(&host, 32, 1000);
+    _ = try host.updateLayerRole(.{ .exclusive_zone = .{ .fixed = 48 } });
+    _ = try probe.drain(&host);
+    try probe.queueConfigure(&host, 32, 1000);
+    _ = try host.updateLayerRole(.{ .exclusive_zone = .auto });
+    try (try probe.drain(&host)).expectZones(&.{32});
+    // Exercise the real bounded wait with no compositor response (no desktop).
+    _ = try host.updateLayerRole(.{ .width = 80 });
+    const timed_out = try probe.drain(&host);
+    try timed_out.expectZones(&.{ 80, 32 });
+    try std.testing.expectEqualSlices(i32, &.{ 80, 32 }, timed_out.committed_zones[0..timed_out.commits]);
+    try std.testing.expect(!host.configured);
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 10, .width = 40, .height = 1000 } }, &host);
+    try (try probe.drain(&host)).expectZones(&.{40});
+    try std.testing.expect(host.configured);
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 11, .width = 40, .height = 1000 } }, &host);
+    const late_repeat = try probe.drain(&host);
+    try late_repeat.expectZones(&.{});
+    try std.testing.expectEqual(@as(usize, 0), late_repeat.commits);
+}
+
+test "Host equal wire values still change modes and fixed none ignore stay configure independent" {
+    const Probe = @import("layer_protocol_probe.zig").Probe;
+    var probe: Probe = .{};
+    try probe.init();
+    defer probe.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io(), .display_state = &probe.state };
+    var namespace = [_]u8{'t'};
+    try host.initializeLayerProtocol(.{ .namespace = &namespace, .layer = .top, .anchors = .{ .top = true, .left = true, .right = true }, .width = 0, .height = 48, .exclusive_zone = .auto });
+    try probe.queueConfigure(&host, 1000, 48);
+    try host.waitForInitialConfigure();
+    host.state = .ready;
+    _ = try probe.drain(&host);
+    try std.testing.expect(!try host.updateLayerRole(.{ .exclusive_zone = .{ .fixed = 48 } }));
+    try (try probe.drain(&host)).expectZones(&.{});
+    try std.testing.expect(host.layer_exclusive_zone == .fixed);
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 2, .width = 1000, .height = 60 } }, &host);
+    try (try probe.drain(&host)).expectZones(&.{});
+    // Restore equal extent, then enable auto without sending a redundant zone.
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 3, .width = 1000, .height = 48 } }, &host);
+    _ = try probe.drain(&host);
+    try std.testing.expect(!try host.updateLayerRole(.{ .exclusive_zone = .auto }));
+    try (try probe.drain(&host)).expectZones(&.{});
+    layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 4, .width = 1000, .height = 60 } }, &host);
+    try (try probe.drain(&host)).expectZones(&.{60});
+    for ([_]surface_channel.LayerExclusiveZone{ .none, .ignore_other_zones, .{ .fixed = 25 } }, [_]i32{ 0, -1, 25 }) |mode, expected| {
+        try probe.queueConfigure(&host, 1000, 60);
+        try std.testing.expect(try host.updateLayerRole(.{ .exclusive_zone = mode }));
+        try (try probe.drain(&host)).expectZones(&.{expected});
+        layerSurfaceListener(host.layer_surface.?, .{ .configure = .{ .serial = 5, .width = 900, .height = 80 } }, &host);
+        try (try probe.drain(&host)).expectZones(&.{});
+    }
+}
+
+test "Host rejects invalid merged auto state before mutating role or protocol" {
+    const Probe = @import("layer_protocol_probe.zig").Probe;
+    var probe: Probe = .{};
+    try probe.init();
+    defer probe.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io(), .display_state = &probe.state };
+    var namespace = [_]u8{'t'};
+    const role: surface_channel.LayerRole = .{ .namespace = &namespace, .layer = .top, .anchors = .{ .top = true, .left = true, .right = true }, .width = 0, .height = 48, .exclusive_zone = .auto };
+    _ = try probe.drain(&host);
+    var invalid = role;
+    invalid.anchors = .{ .top = true, .left = true };
+    try std.testing.expectError(error.InvalidSurfaceField, host.initializeLayerRole(invalid));
+    invalid = role;
+    invalid.height = 0;
+    try std.testing.expectError(error.InvalidSurfaceField, host.initializeLayerRole(invalid));
+    try std.testing.expectEqual(.uninitialized, host.state);
+    try std.testing.expectEqual(@as(usize, 0), (try probe.drain(&host)).total);
+    try host.initializeLayerProtocol(role);
+    try probe.queueConfigure(&host, 1000, 48);
+    try host.waitForInitialConfigure();
+    host.state = .ready;
+    _ = try probe.drain(&host);
+    for ([_]surface_channel.LayerSurfaceUpdate{
+        .{ .anchors = .{ .top = true, .bottom = true }, .height = 99, .margins = .{ .top = 7 } },
+        .{ .height = 0 },
+        .{ .anchors = .{ .top = true }, .width = 0 },
+    }) |update| {
+        try std.testing.expectError(error.InvalidSurfaceField, host.updateLayerRole(update));
+        try std.testing.expectEqualDeep(role.anchors, host.layer_anchors);
+        try std.testing.expectEqualDeep(role.margins, host.layer_margins);
+        try std.testing.expectEqual(@as(u32, 48), host.layer_size_request.height);
+        try std.testing.expectEqual(@as(?i32, 48), host.layer_last_sent_zone);
+        try std.testing.expect(host.layer_exclusive_zone == .auto and host.configured);
+        try std.testing.expectEqual(@as(usize, 0), (try probe.drain(&host)).total);
+    }
+    // Switching out of auto allows ambiguous anchors, and switching back must validate merged anchors.
+    try probe.queueConfigure(&host, 1000, 48);
+    _ = try host.updateLayerRole(.{ .anchors = .{ .top = true, .bottom = true }, .width = 1000, .exclusive_zone = .none });
+    _ = try probe.drain(&host);
+    try std.testing.expectError(error.InvalidSurfaceField, host.updateLayerRole(.{ .exclusive_zone = .auto, .height = 99 }));
+    try std.testing.expect(host.layer_exclusive_zone == .none);
+    try std.testing.expectEqual(@as(u32, 48), host.layer_size_request.height);
+    try std.testing.expectEqual(@as(usize, 0), (try probe.drain(&host)).total);
+}
+
+test "Host layer closed during update wait suppresses reservation and further role updates" {
+    const Probe = @import("layer_protocol_probe.zig").Probe;
+    var probe: Probe = .{};
+    try probe.init();
+    defer probe.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var host: Host = .{ .io = threaded.io(), .display_state = &probe.state };
+    var namespace = [_]u8{'t'};
+    try host.initializeLayerProtocol(.{
+        .namespace = &namespace,
+        .layer = .top,
+        .anchors = .{ .top = true, .left = true, .right = true },
+        .width = 0,
+        .height = 48,
+        .exclusive_zone = .auto,
+    });
+    try probe.queueConfigure(&host, 1000, 32);
+    try host.waitForInitialConfigure();
+    host.state = .ready;
+    _ = try probe.drain(&host);
+    try probe.queueClosed(&host);
+    _ = try host.updateLayerRole(.{ .height = 64 });
+    try std.testing.expect(host.close_requested);
+    try std.testing.expect(!host.configured);
+    const closed = try probe.drain(&host);
+    // The request was committed before dispatching .closed. No 32 correction
+    // may follow after closure, even though the actual extent is still 32.
+    try closed.expectZones(&.{64});
+    try std.testing.expectEqualSlices(i32, &.{64}, closed.committed_zones[0..closed.commits]);
+    host.applyPendingConfigure();
+    host.emitMetrics();
+    const after_closed = try probe.drain(&host);
+    try after_closed.expectZones(&.{});
+    try std.testing.expectEqual(@as(usize, 0), after_closed.commits);
+    try std.testing.expectError(error.SurfaceNotInitialized, host.updateLayerRole(.{ .height = 80 }));
+    try std.testing.expectEqual(@as(u32, 64), host.layer_size_request.height);
+    try std.testing.expectEqual(@as(usize, 0), (try probe.drain(&host)).total);
 }

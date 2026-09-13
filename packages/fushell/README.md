@@ -339,7 +339,7 @@ final int topBarId = await FushellWindow.openWindow(
       LayerSurfaceAnchor.left,
       LayerSurfaceAnchor.right,
     },
-    exclusiveZone: 32,
+    exclusiveZone: LayerExclusiveZone.fixed(32),
     height: 32,
   ),
 );
@@ -350,9 +350,26 @@ Mutable layer-shell properties are updated with `FushellWindow.updateLayer`:
 ```dart
 await FushellWindow.updateLayer(
   topBarId,
-  const LayerSurfaceUpdate(height: 28, exclusiveZone: 28, margins: Margins(top: 4)),
+  const LayerSurfaceUpdate(height: 28, exclusiveZone: LayerExclusiveZone.fixed(28), margins: Margins(top: 4)),
 );
 ```
+
+Exclusive zones intentionally use the immutable `LayerExclusiveZone` API instead
+of integers (a breaking change, with no integer compatibility shim).
+Use `LayerExclusiveZone.none` (the default, protocol 0) to reserve nothing while
+respecting other zones; `LayerExclusiveZone.ignoreOtherZones` (protocol -1) ignores
+other zones and **does not** request automatic calculation. Use
+`const LayerExclusiveZone.fixed(32)` for a positive logical-pixel reservation;
+serialization validates positive signed 32-bit values in release builds too.
+`LayerExclusiveZone.auto` serializes as `"auto"`: native resolves the actual
+logical surface height (top/bottom) or width (left/right) plus the **opposite**
+margin, never painted/transparent bounds or the anchored margin. Auto requires
+an unambiguous anchored edge and a positive requested thickness: height for
+top/bottom, width for left/right. Protocol zero dimensions require opposite
+anchors, so zero thickness cannot be used for the first map; zero cross-axis
+stretch is supported. Unsupported combinations are rejected natively, including
+after merging updates. Auto does not predict other bars' reservations.
+A null update exclusiveZone preserves the current policy.
 
 `width: 0` / `height: 0` asks the compositor to derive that dimension from
 anchors. Compositors without layer-shell support (e.g. older cage) reject the

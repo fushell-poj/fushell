@@ -960,18 +960,60 @@ int _popupInt32(int value, String name, {bool positive = false}) {
   );
 }
 
+/// Reservation policy for a layer-shell surface.
+///
+/// This intentionally replaces integer exclusive zones; there is no int shim.
+/// [auto] uses the resolved logical surface height/width plus the opposite
+/// margin, not painted/transparent bounds or the anchored-edge margin. Native
+/// validation rejects ambiguous anchors (including after merging updates).
+/// It does not predict reservations made by other bars.
+final class LayerExclusiveZone {
+  const LayerExclusiveZone._(this._value) : _isFixed = false;
+
+  /// Reserve the resolved surface extent on its unambiguous anchored edge.
+  static const auto = LayerExclusiveZone._('auto');
+
+  /// Reserve nothing, while respecting other surfaces' zones (protocol 0).
+  static const none = LayerExclusiveZone._(0);
+
+  /// Ignore other surfaces' exclusive zones (protocol -1), not auto-sizing.
+  static const ignoreOtherZones = LayerExclusiveZone._(-1);
+
+  /// Reserve a positive number of logical pixels.
+  ///
+  /// Validation occurs during serialization, including in release builds.
+  const LayerExclusiveZone.fixed(int logicalPixels)
+    : _value = logicalPixels,
+      _isFixed = true;
+
+  final Object _value;
+  final bool _isFixed;
+
+  Object toJson() => _isFixed
+      ? _popupInt32(_value as int, 'exclusiveZone', positive: true)
+      : _value;
+
+  @override
+  bool operator ==(Object other) =>
+      other is LayerExclusiveZone &&
+      other._isFixed == _isFixed &&
+      other._value == _value;
+
+  @override
+  int get hashCode => Object.hash(_isFixed, _value);
+}
+
 /// 创建 layer-shell surface 时分配的不可变 role。
 ///
 /// 同时设置水平方向或垂直方向的相对锚点，并省略对应尺寸，表示请求 compositor
-/// 控制拉伸。[exclusiveZone] 遵循 layer-shell 协议：`-1` 要求 compositor 根据
-/// surface 尺寸推导；`0` 表示不保留工作区。
+/// 控制拉伸。[exclusiveZone] 默认不保留工作区，但仍尊重其他 surface 的保留区。
 final class LayerSurfaceRole {
   const LayerSurfaceRole({
     required this.namespace,
     required this.layer,
     required this.anchors,
     this.margins = Margins.zero,
-    this.exclusiveZone = -1,
+    this.exclusiveZone = LayerExclusiveZone.none,
     this.keyboardInteractivity = LayerKeyboardInteractivity.none,
     this.width,
     this.height,
@@ -981,7 +1023,7 @@ final class LayerSurfaceRole {
   final LayerSurfaceLayer layer;
   final Set<LayerSurfaceAnchor> anchors;
   final Margins margins;
-  final int exclusiveZone;
+  final LayerExclusiveZone exclusiveZone;
   final LayerKeyboardInteractivity keyboardInteractivity;
   final int? width;
   final int? height;
@@ -992,7 +1034,7 @@ final class LayerSurfaceRole {
     'layer': layer.wireName,
     'anchors': _anchorNames(anchors),
     'margins': margins.toJson(),
-    'exclusiveZone': exclusiveZone,
+    'exclusiveZone': exclusiveZone.toJson(),
     'keyboardInteractivity': keyboardInteractivity.wireName,
     if (width != null) 'width': width,
     if (height != null) 'height': height,
@@ -1017,7 +1059,7 @@ final class LayerSurfaceUpdate {
   final int? height;
   final Set<LayerSurfaceAnchor>? anchors;
   final Margins? margins;
-  final int? exclusiveZone;
+  final LayerExclusiveZone? exclusiveZone;
   final LayerKeyboardInteractivity? keyboardInteractivity;
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -1025,7 +1067,7 @@ final class LayerSurfaceUpdate {
     if (height != null) 'height': height,
     if (anchors != null) 'anchors': _anchorNames(anchors!),
     if (margins != null) 'margins': margins!.toJson(),
-    if (exclusiveZone != null) 'exclusiveZone': exclusiveZone,
+    if (exclusiveZone != null) 'exclusiveZone': exclusiveZone!.toJson(),
     if (keyboardInteractivity != null)
       'keyboardInteractivity': keyboardInteractivity!.wireName,
   };

@@ -4,6 +4,7 @@ test {
     _ = @import("window_registry.zig");
     _ = @import("wayland_egl_host.zig");
     _ = @import("window_geometry_test.zig");
+    _ = @import("layer_reservation_test.zig");
     _ = @import("popup_geometry.zig");
     _ = @import("input_provenance.zig");
     _ = @import("pointer_buttons.zig");

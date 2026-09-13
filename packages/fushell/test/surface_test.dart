@@ -52,7 +52,7 @@ void main() {
       expect(requests.last['id'], isNot(requests.first['id']));
       await FushellWindow.updateLayer(
         7,
-        const LayerSurfaceUpdate(exclusiveZone: 0),
+        const LayerSurfaceUpdate(exclusiveZone: LayerExclusiveZone.none),
       );
       expect(requests.last['method'], 'layer.update');
       expect(requests.last['update'], <String, Object?>{'exclusiveZone': 0});

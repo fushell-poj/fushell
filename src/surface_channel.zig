@@ -253,14 +253,83 @@ pub const WindowRole = struct {
 /// surface 首次 commit 前使用的 zwlr_layer_surface_v1 属性。
 ///
 /// 零尺寸是 layer-shell 的拉伸哨兵值，仅当对应轴同时锚定两侧边缘时有效。
-/// `exclusive_zone=-1` 请求 compositor 自行决定策略；非负值表示沿锚定边缘保留
-/// 相应数量的逻辑像素。
+/// -1 ignores other exclusive zones; 0 reserves nothing; positive values are fixed.
+/// Auto is an explicit mode, resolved from logical geometry by the native Host.
+pub const LayerExclusiveZone = union(enum) {
+    none,
+    ignore_other_zones,
+    fixed: i32,
+    auto,
+
+    pub const Edge = enum { top, bottom, left, right };
+
+    pub fn exclusiveEdge(a: AnchorMask) ?Edge {
+        if (a.top != a.bottom and a.left == a.right) return if (a.top) .top else .bottom;
+        if (a.left != a.right and a.top == a.bottom) return if (a.left) .left else .right;
+        return null;
+    }
+
+    pub fn validate(self: LayerExclusiveZone, anchors: AnchorMask) error{InvalidSurfaceField}!void {
+        switch (self) {
+            .auto => if (exclusiveEdge(anchors) == null) return error.InvalidSurfaceField,
+            .fixed => |value| if (value <= 0) return error.InvalidSurfaceField,
+            else => {},
+        }
+    }
+
+    pub fn validateSize(self: LayerExclusiveZone, anchors: AnchorMask, width: u32, height: u32) error{InvalidSurfaceField}!void {
+        try self.validate(anchors);
+        if (width == 0 and !(anchors.left and anchors.right)) return error.InvalidSurfaceField;
+        if (height == 0 and !(anchors.top and anchors.bottom)) return error.InvalidSurfaceField;
+    }
+
+    /// Saturate auto safely: it must never accidentally become the -1 sentinel.
+    /// Only the opposite margin belongs here; the compositor adds the anchored margin.
+    pub fn resolve(self: LayerExclusiveZone, anchors: AnchorMask, margins: Margins, width: i32, height: i32) i32 {
+        return switch (self) {
+            .none => 0,
+            .ignore_other_zones => -1,
+            .fixed => |value| value,
+            .auto => blk: {
+                const edge = exclusiveEdge(anchors) orelse break :blk 0;
+                const size = switch (edge) {
+                    .top, .bottom => height,
+                    .left, .right => width,
+                };
+                // Unknown compositor-assigned extent cannot seed a reservation.
+                if (size <= 0) break :blk 0;
+                const opposite = switch (edge) {
+                    .top => margins.bottom,
+                    .bottom => margins.top,
+                    .left => margins.right,
+                    .right => margins.left,
+                };
+                break :blk @intCast(std.math.clamp(@as(i64, size) + opposite, 0, std.math.maxInt(i32)));
+            },
+        };
+    }
+};
+
+fn optionalExclusiveZone(value: std.json.ObjectMap) ParseError!?LayerExclusiveZone {
+    const field = value.get("exclusiveZone") orelse return null;
+    return switch (field) {
+        .integer => |number| switch (number) {
+            -1 => .ignore_other_zones,
+            0 => .none,
+            1...std.math.maxInt(i32) => .{ .fixed = @intCast(number) },
+            else => error.InvalidSurfaceField,
+        },
+        .string => |text| if (std.mem.eql(u8, text, "auto")) .auto else error.InvalidSurfaceField,
+        else => error.InvalidSurfaceField,
+    };
+}
+
 pub const LayerRole = struct {
     namespace: []u8,
     layer: Layer,
     anchors: AnchorMask,
     margins: Margins = .{},
-    exclusive_zone: i32 = -1,
+    exclusive_zone: LayerExclusiveZone = .none,
     keyboard_interactivity: KeyboardInteractivity = .none,
     width: ?i32 = null,
     height: ?i32 = null,
@@ -271,7 +340,7 @@ pub const LayerSurfaceUpdate = struct {
     height: ?i32 = null,
     anchors: ?AnchorMask = null,
     margins: ?Margins = null,
-    exclusive_zone: ?i32 = null,
+    exclusive_zone: ?LayerExclusiveZone = null,
     keyboard_interactivity: ?KeyboardInteractivity = null,
 
     pub fn isEmpty(self: LayerSurfaceUpdate) bool {
@@ -471,12 +540,14 @@ fn parseWindowRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) Pars
 }
 
 fn parseLayerRole(gpa: std.mem.Allocator, role_object: std.json.ObjectMap) ParseError!LayerRole {
-    const exclusive_zone = (optionalI32(role_object, "exclusiveZone") catch return error.InvalidSurfaceField) orelse -1;
+    const exclusive_zone = (try optionalExclusiveZone(role_object)) orelse .none;
+    const anchors = parseAnchors(role_object.get("anchors") orelse return error.MissingRequiredSurfaceField) catch return error.InvalidSurfaceField;
+    try exclusive_zone.validate(anchors);
     const keyboard = (optionalString(role_object, "keyboardInteractivity") catch return error.InvalidSurfaceField) orelse "none";
     return .{
         .namespace = try duplicateRequiredString(gpa, role_object, "namespace"),
         .layer = parseLayer(requiredString(role_object, "layer") catch return error.MissingRequiredSurfaceField) catch return error.InvalidSurfaceField,
-        .anchors = parseAnchors(role_object.get("anchors") orelse return error.MissingRequiredSurfaceField) catch return error.InvalidSurfaceField,
+        .anchors = anchors,
         .margins = (parseMargins(role_object.get("margins")) catch return error.InvalidSurfaceField) orelse .{},
         .exclusive_zone = exclusive_zone,
         .keyboard_interactivity = parseKeyboardInteractivity(keyboard) catch return error.InvalidSurfaceField,
@@ -495,7 +566,7 @@ fn parseLayerSurfaceUpdate(update_object: std.json.ObjectMap) ParseError!LayerSu
         .height = optionalNonNegativeI32(update_object, "height") catch return error.InvalidSurfaceField,
         .anchors = anchors,
         .margins = parseMargins(update_object.get("margins")) catch return error.InvalidSurfaceField,
-        .exclusive_zone = optionalI32(update_object, "exclusiveZone") catch return error.InvalidSurfaceField,
+        .exclusive_zone = try optionalExclusiveZone(update_object),
         .keyboard_interactivity = optionalKeyboardInteractivity(update_object, "keyboardInteractivity") catch return error.InvalidSurfaceField,
     };
 }
@@ -651,7 +722,7 @@ test "parse layer open request" {
     try std.testing.expectEqual(.top, request.open_window.role.layer.layer);
     try std.testing.expect(request.open_window.role.layer.anchors.top);
     try std.testing.expect(!request.open_window.role.layer.anchors.bottom);
-    try std.testing.expectEqual(@as(i32, 32), request.open_window.role.layer.exclusive_zone);
+    try std.testing.expectEqual(@as(i32, 32), request.open_window.role.layer.exclusive_zone.fixed);
     try std.testing.expectEqual(.on_demand, request.open_window.role.layer.keyboard_interactivity);
 }
 
@@ -674,7 +745,7 @@ test "parse layer update request" {
     try std.testing.expectEqual(@as(?i32, 0), request.update_layer.update.width);
     try std.testing.expectEqual(@as(?i32, 32), request.update_layer.update.height);
     try std.testing.expect(request.update_layer.update.anchors.?.top);
-    try std.testing.expectEqual(@as(?i32, 32), request.update_layer.update.exclusive_zone);
+    try std.testing.expectEqual(@as(i32, 32), request.update_layer.update.exclusive_zone.?.fixed);
     try std.testing.expectEqual(@as(?KeyboardInteractivity, .none), request.update_layer.update.keyboard_interactivity);
 }
 

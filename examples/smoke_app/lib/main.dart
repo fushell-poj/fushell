@@ -42,7 +42,7 @@ Future<void> main() async {
               LayerSurfaceAnchor.left,
               LayerSurfaceAnchor.right,
             },
-            exclusiveZone: 32,
+            exclusiveZone: LayerExclusiveZone.fixed(32),
             height: 32,
           ),
         ),

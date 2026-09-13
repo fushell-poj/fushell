@@ -82,6 +82,11 @@ class _Harness {
   bool disabledAnimations = false;
   bool source = true;
   bool second = false;
+  double? verticalOffset;
+  double? edgeGap;
+  bool? preferBelow;
+  double? themeOffset;
+  bool? themeBelow;
   final focus = FocusNode();
 
   static ByteData? reply(Map<String, Object?> data) =>
@@ -96,6 +101,9 @@ class _Harness {
     waitDuration: const Duration(milliseconds: 100),
     exitDuration: const Duration(milliseconds: 50),
     showDuration: const Duration(milliseconds: 200),
+    verticalOffset: verticalOffset,
+    edgeGap: edgeGap,
+    preferBelow: preferBelow,
     child: SizedBox(
       width: 60,
       height: 48,
@@ -115,9 +123,11 @@ class _Harness {
         view: root,
         child: MaterialApp(
           theme: ThemeData(
-            tooltipTheme: const TooltipThemeData(
-              textStyle: TextStyle(fontSize: 13, color: Colors.orange),
-              decoration: BoxDecoration(color: Colors.purple),
+            tooltipTheme: TooltipThemeData(
+              verticalOffset: themeOffset,
+              preferBelow: themeBelow,
+              textStyle: const TextStyle(fontSize: 13, color: Colors.orange),
+              decoration: const BoxDecoration(color: Colors.purple),
             ),
           ),
           home: MediaQuery(
@@ -218,6 +228,258 @@ class _Harness {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  for (final config in [
+    (
+      name: 'default below',
+      vertical: null,
+      gap: null,
+      theme: null,
+      below: null,
+      themeBelow: null,
+      anchor: 'none',
+      gravity: 'bottom',
+      y: 24,
+    ),
+    (
+      name: 'default above',
+      vertical: null,
+      gap: null,
+      theme: null,
+      below: false,
+      themeBelow: null,
+      anchor: 'none',
+      gravity: 'top',
+      y: -24,
+    ),
+    (
+      name: 'fractional edge gap',
+      vertical: null,
+      gap: 8.6,
+      theme: null,
+      below: true,
+      themeBelow: null,
+      anchor: 'bottom',
+      gravity: 'bottom',
+      y: 9,
+    ),
+    (
+      name: 'legacy explicit below',
+      vertical: 12.0,
+      gap: null,
+      theme: 40.0,
+      below: true,
+      themeBelow: null,
+      anchor: 'none',
+      gravity: 'bottom',
+      y: 12,
+    ),
+    (
+      name: 'legacy explicit above',
+      vertical: 12.0,
+      gap: null,
+      theme: null,
+      below: false,
+      themeBelow: null,
+      anchor: 'none',
+      gravity: 'top',
+      y: -12,
+    ),
+    (
+      name: 'theme above',
+      vertical: null,
+      gap: null,
+      theme: 30.0,
+      below: null,
+      themeBelow: false,
+      anchor: 'none',
+      gravity: 'top',
+      y: -30,
+    ),
+    (
+      name: 'theme below',
+      vertical: null,
+      gap: null,
+      theme: 30.0,
+      below: null,
+      themeBelow: true,
+      anchor: 'none',
+      gravity: 'bottom',
+      y: 30,
+    ),
+    (
+      name: 'edge below overrides theme',
+      vertical: null,
+      gap: 8.0,
+      theme: 40.0,
+      below: true,
+      themeBelow: false,
+      anchor: 'bottom',
+      gravity: 'bottom',
+      y: 8,
+    ),
+    (
+      name: 'edge above',
+      vertical: null,
+      gap: 8.0,
+      theme: 40.0,
+      below: false,
+      themeBelow: true,
+      anchor: 'top',
+      gravity: 'top',
+      y: -8,
+    ),
+    (
+      name: 'zero edge follows theme above',
+      vertical: null,
+      gap: 0.0,
+      theme: 40.0,
+      below: null,
+      themeBelow: false,
+      anchor: 'top',
+      gravity: 'top',
+      y: 0,
+    ),
+  ]) {
+    testWidgets('encoded tooltip positioner: ${config.name}', (tester) async {
+      final h = _Harness(tester)
+        ..verticalOffset = config.vertical
+        ..edgeGap = config.gap
+        ..themeOffset = config.theme
+        ..preferBelow = config.below
+        ..themeBelow = config.themeBelow;
+      await h.mount();
+      await h.show();
+      final role = h.opens.single['role'];
+      final positioner = role['positioner'] as Map<String, dynamic>;
+      expect(positioner['anchorRect'], {
+        'x': 11,
+        'y': 0,
+        'width': 59,
+        'height': 48,
+      });
+      expect(positioner['anchor'], config.anchor);
+      expect(positioner['gravity'], config.gravity);
+      expect(positioner['offset'], {'x': 0, 'y': config.y});
+      expect(positioner['constraintAdjustment'], ['slideX', 'slideY', 'flipY']);
+      expect(role['inputPassthrough'], true);
+      expect(role.containsKey('grab'), false);
+      await h.controller.dismissAll();
+      await h.settle();
+      expect(h.closes, hasLength(1));
+      expect(h.errors, isEmpty);
+      await h.finish();
+    });
+  }
+
+  for (final invalid in [
+    -1.0,
+    double.infinity,
+    double.negativeInfinity,
+    double.nan,
+  ]) {
+    testWidgets('edgeGap rejects $invalid at mount', (tester) async {
+      final h = _Harness(tester)..edgeGap = invalid;
+      await h.mount();
+      expect(tester.takeException(), isArgumentError);
+      expect(h.opens, isEmpty);
+      await h.finish();
+    });
+  }
+
+  testWidgets('explicit edgeGap and verticalOffset conflict at runtime', (
+    tester,
+  ) async {
+    final h = _Harness(tester)
+      ..edgeGap = 8
+      ..verticalOffset = 24;
+    await h.mount();
+    expect(tester.takeException(), isArgumentError);
+    expect(h.opens, isEmpty);
+    await h.finish();
+  });
+
+  testWidgets('edgeGap validates updates as well as initial mount', (
+    tester,
+  ) async {
+    final h = _Harness(tester)..edgeGap = 8;
+    await h.mount();
+    h.edgeGap = -1;
+    await h.mount();
+    expect(tester.takeException(), isArgumentError);
+    expect(h.opens, isEmpty);
+    await h.finish();
+  });
+
+  testWidgets('invalid edgeGap update dismisses an active popup', (
+    tester,
+  ) async {
+    final h = _Harness(tester)..edgeGap = 8;
+    await h.mount();
+    await h.show();
+    expect(h.opens, hasLength(1));
+    expect(find.byType(View), findsNWidgets(2));
+    h.edgeGap = double.infinity;
+    await h.mount();
+    expect(tester.takeException(), isArgumentError);
+    await h.settle();
+    expect(h.closes.single['windowId'], 41);
+    expect(find.byType(View), findsOneWidget);
+    expect(h.errors, isEmpty);
+    await h.finish();
+  });
+
+  testWidgets('invalid edgeGap update cancels a pending hover timer', (
+    tester,
+  ) async {
+    final h = _Harness(tester)..edgeGap = 8;
+    await h.mount();
+    await h.hover();
+    expect(h.opens, isEmpty);
+    h.edgeGap = -1;
+    await h.mount();
+    expect(tester.takeException(), isArgumentError);
+    await tester.pump(const Duration(milliseconds: 200));
+    await h.settle();
+    expect(h.opens, isEmpty);
+    expect(h.closes, isEmpty);
+    expect(h.errors, isEmpty);
+    await h.finish();
+  });
+
+  testWidgets('invalid edgeGap update closes a late native create', (
+    tester,
+  ) async {
+    final h = _Harness(tester)
+      ..edgeGap = 8
+      ..openReply = Completer<ByteData?>();
+    await h.mount();
+    await h.show();
+    expect(h.opens, hasLength(1));
+    expect(h.closes, isEmpty);
+    h.edgeGap = double.nan;
+    await h.mount();
+    expect(tester.takeException(), isArgumentError);
+    await h.settle();
+    expect(h.closes, isEmpty);
+    h.openReply!.complete(_Harness.reply({'ok': true, 'windowId': 41}));
+    await h.settle();
+    expect(h.closes.single['windowId'], 41);
+    expect(find.byType(View), findsOneWidget);
+    expect(h.errors, isEmpty);
+    await h.finish();
+  });
+
+  testWidgets('changing edgeGap dismisses the old popup', (tester) async {
+    final h = _Harness(tester)..edgeGap = 8;
+    await h.mount();
+    await h.show();
+    h.edgeGap = 12;
+    await h.mount();
+    await h.settle();
+    expect(h.closes, hasLength(1));
+    await h.finish();
+  });
 
   testWidgets(
     'real parent coordinates, popup View, theme, scale and semantics',

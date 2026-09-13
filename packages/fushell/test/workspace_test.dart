@@ -226,6 +226,114 @@ Future<void> _publish(
 }
 
 void main() {
+  test('new workspaces re-sort numerically without changing focus', () async {
+    final server = await _Server.start();
+    final workspace = await _connected(server);
+    await _publish(server, workspace, [
+      ..._event(_entry, 1, _string('10')),
+      ..._event(_manager, 1, _uint(_entry + 1)),
+      ..._event(_entry + 1, 1, _string('2')),
+    ]);
+    expect(workspace.workspaces.map((e) => e.name), ['2', '10']);
+    final before = workspace.workspaces;
+    final focused = before.singleWhere((e) => e.isActive);
+
+    await _publish(server, workspace, [
+      ..._event(_manager, 1, _uint(_entry + 2)),
+      ..._event(_entry + 2, 1, _string('1')),
+    ]);
+    expect(workspace.workspaces.map((e) => e.name), ['1', '2', '10']);
+    expect(before.map((e) => e.name), ['2', '10']);
+    final active = workspace.workspaces.singleWhere((e) => e.isActive);
+    expect(active.objectId, focused.objectId);
+    expect(active.isUrgent, isTrue);
+    expect(active.groupId, _group);
+    expect(active.coordinates, [2, 7]);
+    // A retained snapshot still targets the same handle after its index moves.
+    await workspace.activate(focused);
+    expect(await server.next(), [..._uint(_entry), ..._uint(0x00080001)]);
+    expect(await server.next(), [..._uint(_manager), ..._uint(0x00080000)]);
+  });
+
+  test(
+    'renames re-sort atomically and removals preserve focused handle',
+    () async {
+      final server = await _Server.start();
+      final workspace = await _connected(server);
+      await _publish(server, workspace, [
+        ..._event(_entry, 1, _string('10')),
+        ..._event(_manager, 1, _uint(_entry + 1)),
+        ..._event(_entry + 1, 1, _string('2')),
+        ..._event(_manager, 1, _uint(_entry + 2)),
+        ..._event(_entry + 2, 1, _string('Alpha')),
+      ]);
+      final before = workspace.workspaces;
+      await server.send(_event(_entry, 1, _string('1')));
+      await _settle();
+      expect(identical(workspace.workspaces, before), isTrue);
+      await _publish(server, workspace, []);
+      expect(workspace.workspaces.map((e) => e.name), ['1', '2', 'Alpha']);
+      expect(before.map((e) => e.name), ['2', '10', 'Alpha']);
+      await _publish(server, workspace, [
+        ..._event(_entry + 1, 1, _string('Zulu')),
+      ]);
+      expect(workspace.workspaces.map((e) => e.name), ['1', 'Alpha', 'Zulu']);
+      await _publish(server, workspace, [..._event(_entry + 2, 5)]);
+      expect(workspace.workspaces.map((e) => e.name), ['1', 'Zulu']);
+      expect(
+        workspace.workspaces.singleWhere((e) => e.isActive).objectId,
+        _entry,
+      );
+      expect(await server.next(), [..._uint(_entry + 2), ..._uint(0x00080000)]);
+    },
+  );
+
+  test(
+    'numeric named and missing labels have stable display ordering',
+    () async {
+      final server = await _Server.start();
+      final workspace = await _connected(server);
+      await _publish(server, workspace, [
+        ..._event(_entry, 1, _string('Zulu')),
+        for (final (offset, name) in [
+          (8, '2'),
+          (3, '02'),
+          (9, '0x10'),
+          (10, '20'),
+          (7, 'Alpha'),
+          (2, 'Alpha'),
+          (6, null),
+          (1, null),
+        ]) ...[
+          ..._event(_manager, 1, _uint(_entry + offset)),
+          if (name != null) ..._event(_entry + offset, 1, _string(name)),
+        ],
+      ]);
+      final expected = [
+        8,
+        3,
+        10,
+        9,
+        7,
+        2,
+        0,
+        6,
+        1,
+      ].map((i) => _entry + i).toList();
+      expect(workspace.workspaces.map((e) => e.objectId), expected);
+      // Neither opaque IDs nor group-local geometry are display order keys.
+      await _publish(server, workspace, [
+        ..._event(_entry + 8, 0, _string('opaque-z')),
+        ..._event(_entry + 3, 0, _string('opaque-a')),
+        ..._event(_entry + 8, 2, [..._uint(4), ..._uint(99)]),
+        ..._event(_entry + 3, 2, [..._uint(4), ..._uint(1)]),
+      ]);
+      expect(workspace.workspaces.map((e) => e.objectId), expected);
+      await _publish(server, workspace, []);
+      expect(workspace.workspaces.map((e) => e.objectId), expected);
+    },
+  );
+
   test(
     'fragmented/coalesced discovery waits for initial manager done',
     () async {

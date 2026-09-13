@@ -6,6 +6,14 @@ Native [popups](docs/popups.md) provide independently rendered, parent-relative
 surfaces for tooltips and popovers, including children of layer-shell bars.
 The Dart `NativeTooltip` widget in `package:fushell/tooltip.dart` manages native
 popup views, hover timing and theme propagation; see [Tooltip integration](docs/popups.md).
+Its `verticalOffset` uses Material's target-center semantics; `edgeGap` explicitly
+requests spacing from the target edge instead.
+
+Layer surfaces use typed `LayerExclusiveZone` policies: `auto`, `none`,
+`ignoreOtherZones`, or `fixed(logicalPixels)`. Automatic reservation follows the
+native surface's logical size and the opposite-edge margin, without counting the
+anchored margin twice. It does not measure Flutter content or transparent pixels.
+See the [Dart SDK](packages/fushell/README.md) for API and migration details.
 
 ## Build the tools
 

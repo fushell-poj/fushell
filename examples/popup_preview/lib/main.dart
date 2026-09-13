@@ -88,7 +88,7 @@ final class PopupPreview extends ChangeNotifier {
                 },
                 width: o['width'] as int?,
                 height: number(o, 'height', 48),
-                exclusiveZone: 0,
+                exclusiveZone: LayerExclusiveZone.none,
               )
             : null,
       ),

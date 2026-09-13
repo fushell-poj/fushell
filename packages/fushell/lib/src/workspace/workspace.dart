@@ -325,9 +325,32 @@ class Workspace {
     await _request(() => _groupRequests(group.objectId).createWorkspace(name));
   }
 
+  // Names are display labels; IDs are opaque and coordinates describe optional,
+  // group-local geometry. Keep those independent of the flat display order.
+  static int _compareNames(String? a, String? b) {
+    if (a == null) return b == null ? 0 : 1;
+    if (b == null) return -1;
+    final aNumber = int.tryParse(a, radix: 10);
+    final bNumber = int.tryParse(b, radix: 10);
+    if (aNumber != null && bNumber != null) {
+      return aNumber.compareTo(bNumber);
+    }
+    if (aNumber != null) return -1;
+    if (bNumber != null) return 1;
+    return a.compareTo(b);
+  }
+
   void _publish() {
+    // Re-sort every committed snapshot, including additions and renames. The
+    // insertion index makes equal/missing names stable even though List.sort
+    // itself is not stable, without treating protocol object IDs as order keys.
+    final entries = _entries.values.indexed.toList()
+      ..sort((a, b) {
+        final order = _compareNames(a.$2.name, b.$2.name);
+        return order != 0 ? order : a.$1.compareTo(b.$1);
+      });
     _publishedEntries = List.unmodifiable(
-      _entries.values.map(WorkspaceEntry._),
+      entries.map((entry) => WorkspaceEntry._(entry.$2)),
     );
     _publishedGroups = List.unmodifiable(
       _groups.values.map((g) => WorkspaceGroup._(g, _outputs)),
