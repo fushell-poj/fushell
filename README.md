@@ -62,16 +62,25 @@ then downloads the matching `engine-<revision>` release from
 `fushell-poj/fushell-engine-builds`. Set `FUSHELL_ENGINE_REPOSITORY` to a compatible
 repository URL to override it. curl honors the environment's proxy configuration.
 
-The cache is `build/fushell_flutter_engine/<arch>/<revision>/`, with metadata,
-SHA-256 verified shared libraries, an origin record and a persistent lock file.
-Changing repositories invalidates cached metadata. Cooperating processes serialize
-cache publication; failed downloads never become final Engine files.
+The cache is `build/fushell_flutter_engine/fontconfig-v1/<arch>/<revision>/`, with
+metadata, SHA-256 verified shared libraries, an origin record and a persistent lock
+file. The contract namespace also applies to custom cache roots. Changing
+repositories invalidates cached metadata. Cooperating processes serialize cache
+publication; failed downloads never become final Engine files.
 
-A rebuilt Engine at the same revision does not automatically invalidate this cache.
-After upgrading an older build to the Fontconfig-enabled release, stop concurrent
-builds and remove the affected project's cached revision directory before rebuilding.
-Refreshing only the shared library leaves it inconsistent with the cached metadata.
-Existing application bundles also need rebuilding; they retain their own Engine.
+The `fontconfig-v1` consumer contract separates native-font-discovery engines from
+older, same-SDK-revision builds. Old unversioned caches are left untouched but are
+never used as a fallback. The first build after this migration needs network access
+to obtain current metadata and its verified Engine; subsequent builds can reuse
+the compatible cache offline. This avoids silently copying a pre-Fontconfig Engine
+whose checksum still matches an obsolete local catalog. Existing application
+bundles retain their own Engine and must also be rebuilt with the updated CLI.
+
+Within a contract namespace, cached metadata is still revision-pinned rather than
+periodically refreshed. Engine publishers must not treat reusing the Flutter SDK
+revision as a consumer cache invalidation mechanism; capability changes need an
+explicit consumer contract migration. A custom repository must provide Engines
+meeting the native Fontconfig contract, not merely a matching revision string.
 
 Engine acquisition overlaps Dart compilation. A project lock protects Flutter's
 shared intermediate outputs. Bundles are assembled in a private sibling staging

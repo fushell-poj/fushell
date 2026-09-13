@@ -32,7 +32,7 @@ pub fn check(report: *Report, init: std.process.Init, tools: ?native.Flutter, pr
             if (err == error.OutOfMemory or err == error.Canceled) return err;
             return report.add("engine.cache", "Engine cache", .@"error", "cache inspection did not complete", &.{@errorName(err)}, "Check cache permissions or disk health. Doctor did not alter the cache.");
         };
-        const cache_path = try std.fs.path.join(a, &.{ root, store_mod.default_cache_root, arch.name(), info.engine_revision });
+        const cache_path = try std.fs.path.join(a, &.{ root, try store.engineDir(arch) });
         switch (cached.state) {
             .busy => return report.add("engine.cache", "Engine cache", .warning, "another build is publishing this cache; verification skipped", &.{cache_path}, "Retry when the build finishes; doctor does not wait for or replace the lock."),
             .unlocked => try report.add("engine.cache", "Engine cache", .warning, "cache has no usable publication lock; existing binaries were not trusted", &.{cache_path}, "Let a normal Fushell build initialize the cache."),

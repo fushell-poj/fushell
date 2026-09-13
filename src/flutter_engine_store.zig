@@ -9,7 +9,7 @@
 //!   GitHub Release:
 //!   engine-<revision>/metadata.json
 //!             ↓
-//!   build/fushell_flutter_engine/<arch>/<revision>/
+//!   build/fushell_flutter_engine/fontconfig-v1/<arch>/<revision>/
 //!             ↓
 //!   校验 SHA256
 //!             ↓
@@ -418,7 +418,7 @@ pub const Store = struct {
     ///
     /// 缓存目录：
     ///
-    ///   build/fushell_flutter_engine/<arch>/<engine-sha>/
+    ///   build/fushell_flutter_engine/fontconfig-v1/<arch>/<engine-sha>/
     ///
     /// 流程：
     ///
@@ -746,8 +746,13 @@ pub const Store = struct {
         );
     }
 
-    /// 返回指定架构和当前 Engine revision 对应的缓存目录。
-    fn engineDir(
+    /// Consumer feature contract: keep pre-Fontconfig metadata and artifacts isolated.
+    /// This namespace forces a fresh catalog fetch, not an ELF capability proof.
+    /// Legacy caches remain untouched and are never used as a fallback.
+    const cache_contract = "fontconfig-v1";
+
+    /// Owned path relative to root_dir for the current consumer contract, arch and revision.
+    pub fn engineDir(
         self: *const Store,
         arch: Arch,
     ) ![]u8 {
@@ -756,6 +761,7 @@ pub const Store = struct {
             self.allocator,
             &.{
                 self.cache_root,
+                cache_contract,
                 arch.name(),
                 self.flutter.engine_revision,
             },
@@ -1612,6 +1618,7 @@ fn createTestMetadata(allocator: Allocator, revision: []const u8, expected_engin
 const FakeFetcher = struct {
     metadata: []const u8,
     engine: []const u8,
+    offline: bool = false,
 
     metadata_fetches: usize = 0,
     engine_fetches: usize = 0,
@@ -1633,6 +1640,8 @@ const FakeFetcher = struct {
                     context.?,
                 ),
             );
+
+        if (self.offline) return error.NetworkUnavailable;
 
         const data = switch (kind) {
             .metadata => blk: {
@@ -1828,6 +1837,74 @@ test "invalid sha256 is rejected" {
             &digest,
         ),
     );
+}
+
+test "fontconfig contract ignores valid legacy cache and migrates once then works offline" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const legacy_bytes = "legacy engine without Fontconfig";
+    const legacy_metadata = try createTestMetadata(a, test_revision, legacy_bytes);
+    defer a.free(legacy_metadata);
+    const metadata = try createTestMetadata(a, test_revision, test_engine_bytes);
+    defer a.free(metadata);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var flutter = testFlutterInfo();
+
+    // Both the default and caller-supplied roots must obey the same contract.
+    for ([_][]const u8{ default_cache_root, "custom/cache" }) |root| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var fake = FakeFetcher{ .metadata = metadata, .engine = test_engine_bytes, .offline = true };
+        var store = Store.initWith(a, io, &env, tmp.dir, default_repository, root, &flutter, fake.asFetcher());
+        const legacy_path = try Io.Dir.path.join(a, &.{ root, "x86_64", test_revision });
+        defer a.free(legacy_path);
+        try tmp.dir.createDirPath(io, legacy_path);
+        var legacy_dir = try tmp.dir.openDir(io, legacy_path, .{});
+        defer legacy_dir.close(io);
+        try legacy_dir.writeFile(io, .{ .sub_path = "metadata.json", .data = legacy_metadata });
+        try legacy_dir.writeFile(io, .{ .sub_path = ".repository", .data = default_repository });
+        try legacy_dir.writeFile(io, .{ .sub_path = ".lock", .data = "" });
+        for ([_][]const u8{ "debug", "profile", "release" }) |mode| {
+            const filename = try std.fmt.allocPrint(a, "libflutter_engine-linux-x64-{s}.so", .{mode});
+            defer a.free(filename);
+            try legacy_dir.writeFile(io, .{ .sub_path = filename, .data = legacy_bytes });
+        }
+
+        // A complete, internally hash-valid same-revision legacy cache is not green.
+        try std.testing.expectEqual(CacheInspection.State.missing, (try store.inspectCache(.x86_64)).state);
+        const path = try store.engineDir(.x86_64);
+        defer a.free(path);
+        const expected = try Io.Dir.path.join(a, &.{ root, "fontconfig-v1", "x86_64", test_revision });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, path);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openDir(io, path, .{}));
+        try std.testing.expectError(error.NetworkUnavailable, store.ensure(.x86_64, .release, .{}));
+
+        fake.offline = false;
+        var fresh = try store.ensure(.x86_64, .release, .{});
+        defer fresh.deinit(a);
+        try std.testing.expect(!fresh.from_cache);
+        try std.testing.expectEqual(@as(usize, 1), fake.metadata_fetches);
+        try std.testing.expectEqual(@as(usize, 1), fake.engine_fetches);
+        const bytes = try tmp.dir.readFileAlloc(io, fresh.path, a, .limited(1024));
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(test_engine_bytes, bytes);
+
+        fake.offline = true;
+        var cached = try store.ensure(.x86_64, .release, .{});
+        defer cached.deinit(a);
+        try std.testing.expect(cached.from_cache);
+        try std.testing.expectEqualStrings(fresh.path, cached.path);
+        try std.testing.expectEqual(@as(usize, 1), fake.metadata_fetches);
+        try std.testing.expectEqual(@as(usize, 1), fake.engine_fetches);
+        const old_metadata = try legacy_dir.readFileAlloc(io, "metadata.json", a, .limited(16 * 1024));
+        defer a.free(old_metadata);
+        try std.testing.expectEqualStrings(legacy_metadata, old_metadata);
+        const old_engine = try legacy_dir.readFileAlloc(io, "libflutter_engine-linux-x64-release.so", a, .limited(1024));
+        defer a.free(old_engine);
+        try std.testing.expectEqualStrings(legacy_bytes, old_engine);
+    }
 }
 
 test "ensure downloads metadata and engine" {
@@ -2123,7 +2200,7 @@ test "download with wrong hash is rejected" {
     );
 
     const final_path =
-        "build/fushell_flutter_engine/" ++
+        "build/fushell_flutter_engine/fontconfig-v1/" ++
         "x86_64/" ++
         test_revision ++
         "/libflutter_engine-linux-x64-release.so";
