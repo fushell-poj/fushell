@@ -64,30 +64,26 @@ pub fn loadAot(gpa: std.mem.Allocator, bundle_path: []const u8) !Bundle {
     defer gpa.free(gtk_icu);
     const gtk_app = try std.fs.path.join(gpa, &.{ bundle_path, "lib", "libapp.so" });
     defer gpa.free(gtk_app);
-    const gtk_symbols = try std.fs.path.join(gpa, &.{ bundle_path, "lib", "libapp.so.symbols" });
-    defer gpa.free(gtk_symbols);
-    if (try validateAotLayout(gpa, gtk_assets, gtk_icu, gtk_app, gtk_symbols)) return prepareBundle(gpa, gtk_assets, gtk_icu, gtk_app);
+    if (try validateAotLayout(gpa, gtk_assets, gtk_icu, gtk_app)) return prepareBundle(gpa, gtk_assets, gtk_icu, gtk_app);
 
     const raw_assets = try std.fs.path.join(gpa, &.{ bundle_path, "flutter_assets" });
     defer gpa.free(raw_assets);
     const raw_icu = try std.fs.path.join(gpa, &.{ bundle_path, "icudtl.dat" });
     defer gpa.free(raw_icu);
-    if (try validateAotLayout(gpa, raw_assets, raw_icu, gtk_app, gtk_symbols)) return prepareBundle(gpa, raw_assets, raw_icu, gtk_app);
+    if (try validateAotLayout(gpa, raw_assets, raw_icu, gtk_app)) return prepareBundle(gpa, raw_assets, raw_icu, gtk_app);
 
     std.debug.print("Flutter AOT bundle is incomplete. Expected:\n", .{});
     std.debug.print("  {s}/lib/libapp.so\n", .{bundle_path});
-    std.debug.print("  {s}/lib/libapp.so.symbols\n", .{bundle_path});
     std.debug.print("  {s}/data/flutter_assets/\n", .{bundle_path});
     std.debug.print("  {s}/data/icudtl.dat\n", .{bundle_path});
-    std.debug.print("Build it with: flutter build bundle --release (libapp.so via gen_snapshot).\n", .{});
+    std.debug.print("Build it with: fushell build --release.\n", .{});
     return error.InvalidFlutterBundle;
 }
 
-fn validateAotLayout(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8, app_so_path: []const u8, symbols_path: []const u8) !bool {
+fn validateAotLayout(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8, app_so_path: []const u8) !bool {
     return try pathExists(gpa, assets_path) and
         try pathExists(gpa, icu_data_path) and
-        try pathExists(gpa, app_so_path) and
-        try pathExists(gpa, symbols_path);
+        try pathExists(gpa, app_so_path);
 }
 
 fn validateAssetsLayout(gpa: std.mem.Allocator, assets_path: []const u8, icu_data_path: []const u8) !bool {
@@ -153,4 +149,22 @@ fn prepareBundleAllocationFailure(gpa: std.mem.Allocator, app_path: ?[]const u8)
 test "bundle preparation frees partial paths on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, prepareBundleAllocationFailure, .{@as(?[]const u8, null)});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, prepareBundleAllocationFailure, .{@as(?[]const u8, "bundle/lib/libapp.so")});
+}
+
+test "AOT runtime layout does not require diagnostic sidecar" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "data/flutter_assets");
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "data/icudtl.dat", .data = "icu" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/libapp.so", .data = "layout-only fixture" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const bundle = try loadAot(gpa, root);
+    defer bundle.deinit(gpa);
+    try std.testing.expect(bundle.app_so_path != null);
+    try tmp.dir.deleteFile(io, "lib/libapp.so");
+    try std.testing.expectError(error.InvalidFlutterBundle, loadAot(gpa, root));
 }

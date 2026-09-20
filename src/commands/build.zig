@@ -7,6 +7,7 @@ const application_config = @import("../application_config.zig");
 const bundle_transaction = @import("../bundle_transaction.zig");
 const flutter_engine_store = @import("../flutter_engine_store.zig");
 const flutter_toolchain = @import("../flutter_toolchain.zig");
+const aot_artifacts = @import("../aot_artifacts.zig");
 const Mode = cli.Mode;
 const embedded_runner = @embedFile("fushell_runner_bin");
 const Transcript = @import("../command_output.zig").Transcript;
@@ -87,7 +88,7 @@ fn assembleStaged(
     };
     switch (options.mode) {
         .debug => try buildDebugBundle(gpa, io, toolchain, options.entrypoint, transaction.staging_path, app_name, output),
-        .release, .profile => try buildAotBundle(gpa, io, toolchain, options.mode, options.entrypoint, transaction.staging_path, app_name, output),
+        .release, .profile => try buildAotBundle(gpa, io, toolchain, options.mode, options.entrypoint, transaction.staging_path, app_name, options.symbols, output),
     }
     const download = future.await(io);
     awaited = true;
@@ -102,215 +103,86 @@ fn assembleStaged(
     return final_entry;
 }
 
-fn buildDebugBundle(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    toolchain: *const flutter_toolchain.Toolchain,
-    entrypoint: []const u8,
-    bundle_dir: []const u8,
-    app_name: []const u8,
-    output: *Transcript,
-) !void {
-    var app_config =
-        try application_config.loadProject(gpa, io);
-    defer app_config.deinit(gpa);
-
-    const target_platform = targetPlatform();
-
-    const flutter_root = toolchain.root;
-
-    const icu_data = try std.fs.path.join(
-        gpa,
-        &.{
-            flutter_root,
-            "bin",
-            "cache",
-            "artifacts",
-            "engine",
-            target_platform,
-            "icudtl.dat",
-        },
-    );
-    defer gpa.free(icu_data);
-
+fn buildDebugBundle(gpa: std.mem.Allocator, io: std.Io, toolchain: *const flutter_toolchain.Toolchain, entrypoint: []const u8, bundle_dir: []const u8, app_name: []const u8, output: *Transcript) !void {
     try output.run(.inherit, &.{ toolchain.executable, "pub", "get" });
-
-    const platform_arg = try std.fmt.allocPrint(gpa, "--target-platform={s}", .{target_platform});
+    const platform_arg = try std.fmt.allocPrint(gpa, "--target-platform={s}", .{targetPlatform()});
     defer gpa.free(platform_arg);
-
-    try output.run(.inherit, &.{
-        toolchain.executable,
-        "build",
-        "bundle",
-        "--debug",
-        platform_arg,
-        "-t",
-        entrypoint,
-    });
-
-    const data_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "data" });
-    defer gpa.free(data_dir);
-
-    const lib_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "lib" });
-    defer gpa.free(lib_dir);
-
-    const data_icu = try std.fs.path.join(gpa, &.{ data_dir, "icudtl.dat" });
-    defer gpa.free(data_icu);
-
-    const data_assets =
-        try std.fs.path.join(gpa, &.{ data_dir, "flutter_assets" });
-    defer gpa.free(data_assets);
-
-    try output.run(.inherit, &.{ "mkdir", "-p", data_dir, lib_dir });
-
-    try output.run(.inherit, &.{ "cp", icu_data, data_icu });
-
-    try output.run(.inherit, &.{ "cp", "-R", "build/flutter_assets", data_assets });
-
-    try copyNixRuntimeLibraries(gpa, output, lib_dir);
-
-    try writeBundleEntry(gpa, io, bundle_dir, app_name);
-
-    try application_config.writeBundle(gpa, io, bundle_dir, app_config);
+    try output.run(.inherit, &.{ toolchain.executable, "build", "bundle", "--debug", "--no-pub", platform_arg, "-t", entrypoint });
+    try packageBundle(gpa, io, toolchain, bundle_dir, app_name, "build/flutter_assets", null, output);
 }
-/// release/profile 共用：AOT 编译 app + 组装 AOT bundle。
-///
-/// Engine 不再内嵌在 Fushell CLI 中，而是在最终 assemble 阶段根据
-/// 当前 Flutter CLI 的 engineRevision 通过 Flutter Engine Store 获取。
-fn buildAotBundle(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    toolchain: *const flutter_toolchain.Toolchain,
-    mode: Mode,
-    entrypoint: []const u8,
-    bundle_dir: []const u8,
-    app_name: []const u8,
-    output: *Transcript,
-) !void {
+
+fn buildAotBundle(gpa: std.mem.Allocator, io: std.Io, toolchain: *const flutter_toolchain.Toolchain, mode: Mode, entrypoint: []const u8, bundle_dir: []const u8, app_name: []const u8, archive_symbols: bool, output: *Transcript) !void {
+    const platform = targetPlatform();
+    const inputs = [_][]const u8{ @tagName(mode), entrypoint, platform, toolchain.root, toolchain.info.flutter_version, toolchain.info.dart_version, toolchain.info.engine_revision };
+    const key = aot_artifacts.inputKey(&inputs);
+    const output_dir = try std.fmt.allocPrint(gpa, "build/fushell_debug_info/{s}/{s}", .{ @tagName(mode), key });
+    defer gpa.free(output_dir);
+    try std.Io.Dir.cwd().createDirPath(io, output_dir);
+    const split_dir = try std.fs.path.join(gpa, &.{ output_dir, "symbols" });
+    defer gpa.free(split_dir);
+    const debug_info = try std.fmt.allocPrint(gpa, "{s}/app.{s}.symbols", .{ split_dir, platform });
+    defer gpa.free(debug_info);
+    const app_so = try std.fs.path.join(gpa, &.{ output_dir, "lib", "libapp.so" });
+    defer gpa.free(app_so);
+    const assets = try std.fs.path.join(gpa, &.{ output_dir, "flutter_assets" });
+    defer gpa.free(assets);
+    const output_arg = try std.fmt.allocPrint(gpa, "--output={s}", .{output_dir});
+    defer gpa.free(output_arg);
+    const platform_arg = try std.fmt.allocPrint(gpa, "-dTargetPlatform={s}", .{platform});
+    defer gpa.free(platform_arg);
+    const target_arg = try std.fmt.allocPrint(gpa, "-dTargetFile={s}", .{entrypoint});
+    defer gpa.free(target_arg);
+    const mode_arg = try std.fmt.allocPrint(gpa, "-dBuildMode={s}", .{@tagName(mode)});
+    defer gpa.free(mode_arg);
+    const split_arg = try std.fmt.allocPrint(gpa, "-dSplitDebugInfo={s}", .{split_dir});
+    defer gpa.free(split_arg);
+    const target = try std.fmt.allocPrint(gpa, "{s}_bundle_{s}_assets", .{ @tagName(mode), platform });
+    defer gpa.free(target);
+    const argv: []const []const u8 = &.{ toolchain.executable, "assemble", "--no-version-check", output_arg, platform_arg, mode_arg, target_arg, split_arg, target };
+    try output.run(.inherit, &.{ toolchain.executable, "pub", "get" });
+    try output.run(.inherit, argv);
+    if (!try pathExists(gpa, debug_info)) {
+        try output.note("Recovering missing AOT symbols by invalidating only the matching cached app.so.\n", .{});
+        try aot_artifacts.invalidateAot(gpa, io, output_dir);
+        try output.run(.inherit, argv);
+    }
+    if (!try pathExists(gpa, app_so)) return error.MissingLibAppSo;
+    if (!try pathExists(gpa, debug_info)) return error.MissingAotDebugInfo;
+    try packageBundle(gpa, io, toolchain, bundle_dir, app_name, assets, app_so, output);
+    if (archive_symbols) {
+        const staged_app = try std.fs.path.join(gpa, &.{ bundle_dir, "lib", "libapp.so" });
+        defer gpa.free(staged_app);
+        const archive = try aot_artifacts.archive(gpa, io, staged_app, debug_info, &inputs);
+        defer gpa.free(archive);
+        try output.note("AOT symbols archive (paired by app SHA-256): {s}\n", .{archive});
+    }
+}
+
+/// Shared runtime-only tail. Keep cp -R semantics for assets and Nix libraries.
+fn packageBundle(gpa: std.mem.Allocator, io: std.Io, toolchain: *const flutter_toolchain.Toolchain, bundle_dir: []const u8, app_name: []const u8, assets: []const u8, app_so: ?[]const u8, output: *Transcript) !void {
     var app_config = try application_config.loadProject(gpa, io);
     defer app_config.deinit(gpa);
-
-    const target_platform = targetPlatform();
-
-    const flutter_root = toolchain.root;
-
-    const icu_data = try std.fs.path.join(gpa, &.{
-        flutter_root,
-        "bin",
-        "cache",
-        "artifacts",
-        "engine",
-        target_platform,
-        "icudtl.dat",
-    });
-    defer gpa.free(icu_data);
-
-    try output.run(.inherit, &.{ toolchain.executable, "pub", "get" });
-
-    const platform_arg = try std.fmt.allocPrint(gpa, "-dTargetPlatform={s}", .{target_platform});
-    defer gpa.free(platform_arg);
-
-    const target_file_arg = try std.fmt.allocPrint(gpa, "-dTargetFile={s}", .{entrypoint});
-    defer gpa.free(target_file_arg);
-
-    const assemble_target = try std.fmt.allocPrint(
-        gpa,
-        "{s}_bundle_{s}_assets",
-        .{ @tagName(mode), target_platform },
-    );
-    defer gpa.free(assemble_target);
-
-    const build_mode_arg = try std.fmt.allocPrint(
-        gpa,
-        "-dBuildMode={s}",
-        .{@tagName(mode)},
-    );
-    defer gpa.free(build_mode_arg);
-
-    const split_debug_dir = "build/fushell_debug_info";
-
-    const split_debug_arg = "-dSplitDebugInfo=" ++ split_debug_dir;
-
-    const debug_info_name = try std.fmt.allocPrint(gpa, "app.{s}.symbols", .{target_platform});
-    defer gpa.free(debug_info_name);
-
-    const debug_info = try std.fs.path.join(gpa, &.{
-        split_debug_dir,
-        debug_info_name,
-    });
-    defer gpa.free(debug_info);
-
-    // Preserve incremental AOT artifacts. Invalidate only when an external
-    // deletion removed the symbols Flutter's cache does not track.
-    if (!try pathExists(gpa, debug_info)) {
-        try output.run(.inherit, &.{ "rm", "-rf", ".dart_tool/flutter_build" });
-    }
-
-    try output.run(.inherit, &.{
-        toolchain.executable,
-        "assemble",
-        "--no-version-check",
-        "--output=build",
-
-        platform_arg,
-        build_mode_arg,
-        target_file_arg,
-        split_debug_arg,
-
-        assemble_target,
-    });
-
-    const app_so = try std.fs.path.join(gpa, &.{
-        "build",
-        "lib",
-        "libapp.so",
-    });
-    defer gpa.free(app_so);
-
-    if (!try pathExists(gpa, app_so)) {
-        try output.note("libapp.so not found at {s}; flutter assemble target {s} should have produced it.\n", .{ app_so, assemble_target });
-
-        return error.MissingLibAppSo;
-    }
-
-    if (!try pathExists(gpa, debug_info)) {
-        try output.note("AOT debug info not found at {s}\n", .{debug_info});
-
-        return error.MissingAotDebugInfo;
-    }
-
+    const icu = try std.fs.path.join(gpa, &.{ toolchain.root, "bin", "cache", "artifacts", "engine", targetPlatform(), "icudtl.dat" });
+    defer gpa.free(icu);
     const data_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "data" });
     defer gpa.free(data_dir);
-
     const lib_dir = try std.fs.path.join(gpa, &.{ bundle_dir, "lib" });
     defer gpa.free(lib_dir);
-
+    try std.Io.Dir.cwd().createDirPath(io, data_dir);
+    try std.Io.Dir.cwd().createDirPath(io, lib_dir);
     const data_icu = try std.fs.path.join(gpa, &.{ data_dir, "icudtl.dat" });
     defer gpa.free(data_icu);
-
+    try std.Io.Dir.cwd().copyFile(icu, .cwd(), data_icu, io, .{});
     const data_assets = try std.fs.path.join(gpa, &.{ data_dir, "flutter_assets" });
     defer gpa.free(data_assets);
-
-    const app_so_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so" });
-    defer gpa.free(app_so_dest);
-
-    const debug_info_dest = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so.symbols" });
-    defer gpa.free(debug_info_dest);
-
-    try output.run(.inherit, &.{ "mkdir", "-p", data_dir, lib_dir });
-
-    try output.run(.inherit, &.{ "cp", icu_data, data_icu });
-
-    try output.run(.inherit, &.{ "cp", "-R", "build/flutter_assets", data_assets });
-
-    try output.run(.inherit, &.{ "cp", app_so, app_so_dest });
-
-    try output.run(.inherit, &.{ "cp", debug_info, debug_info_dest });
-
+    try output.run(.inherit, &.{ "cp", "-R", assets, data_assets });
+    if (app_so) |source| {
+        const destination = try std.fs.path.join(gpa, &.{ lib_dir, "libapp.so" });
+        defer gpa.free(destination);
+        try std.Io.Dir.cwd().copyFile(source, .cwd(), destination, io, .{});
+    }
     try copyNixRuntimeLibraries(gpa, output, lib_dir);
-
     try writeBundleEntry(gpa, io, bundle_dir, app_name);
-
     try application_config.writeBundle(gpa, io, bundle_dir, app_config);
 }
 

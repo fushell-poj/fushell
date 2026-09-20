@@ -1,5 +1,6 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
+const sdk_manifest = @import("src/sdk_manifest.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -21,14 +22,13 @@ pub fn build(b: *std.Build) void {
 
     const c_header = b.path("src/fushell_c_bindings.h");
 
-    const flutter_embedder = b.dependency("flutter-embedder", .{});
+    // Exact upstream header; provenance and license live alongside it.
     const translate_c = b.addTranslateC(.{
         .root_source_file = c_header,
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
-    translate_c.addIncludePath(flutter_embedder.path("."));
+    translate_c.addIncludePath(b.path("vendor/flutter_embedder"));
     // Zig 0.16 的 translate-c 会把 glibc fortify 包装器里的比较表达式翻译成
     // bool，但 std 的 object_size builtin 仍要求 c_int；显式关闭仅影响头文件翻译，
     // 不改变 Zig 代码的 ReleaseSafe 检查或最终链接器加固。
@@ -37,15 +37,14 @@ pub fn build(b: *std.Build) void {
     linkTranslateCLibraries(translate_c, dynamic_link_opts);
     const c_mod = translate_c.createModule();
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    const runner_mod = b.createModule(.{
+        .root_source_file = b.path("src/runner.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
         .strip = strip,
     });
-    exe_mod.addImport("c", c_mod);
-    exe_mod.linkSystemLibrary("dbus-1", dynamic_link_opts);
+    runner_mod.addImport("c", c_mod);
+    runner_mod.linkSystemLibrary("dbus-1", dynamic_link_opts);
 
     const scanner = Scanner.create(b, .{
         // Custom protocols are added explicitly below, so this only satisfies
@@ -83,24 +82,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe_mod.addImport("wayland", wayland_mod);
-    linkRuntimeLibraries(exe_mod, dynamic_link_opts);
+    runner_mod.addImport("wayland", wayland_mod);
+    linkRuntimeLibraries(runner_mod, dynamic_link_opts);
     // Packaged app runners resolve bundled runtime libraries before system paths.
-    exe_mod.addRPathSpecial("$ORIGIN/lib");
+    runner_mod.addRPathSpecial("$ORIGIN/lib");
 
-    const exe = b.addExecutable(.{
+    const runner_exe = b.addExecutable(.{
         .name = "fushell-runner",
-        .root_module = exe_mod,
-        .use_llvm = true,
+        .root_module = runner_mod,
     });
     // Embed the emitted runner; system library/loader policy belongs to packaging.
-    const runner_bin = exe.getEmittedBin();
+    const runner_bin = runner_exe.getEmittedBin();
 
     const build_tool_mod = b.createModule(.{
         .root_source_file = b.path("src/fushell.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
         .strip = strip,
     });
 
@@ -132,29 +129,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = runner_bin,
     });
     // fushell SDK 包文件内嵌: `fushell sdk` 释放给外部项目
-    build_tool_mod.addAnonymousImport("fushell_sdk_pubspec", .{
-        .root_source_file = b.path("packages/fushell/pubspec.yaml"),
-    });
-    build_tool_mod.addAnonymousImport("fushell_sdk_lib", .{
-        .root_source_file = b.path("packages/fushell/lib/fushell.dart"),
-    });
-    inline for (.{ "icons", "windows", "tooltip", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" }) |file| {
+    inline for (sdk_manifest.files) |file| {
         build_tool_mod.addAnonymousImport("fushell_sdk_" ++ file, .{
-            .root_source_file = b.path("packages/fushell/lib/" ++ file ++ ".dart"),
-        });
-    }
-    inline for (.{ "protocols/wayland.xml", "protocols/ext-workspace-v1.xml", "protocols/README.md", "tool/workspace/generate.dart", "tool/workspace/generate_test.dart", "tool/workspace/README.md" }) |file| {
-        build_tool_mod.addAnonymousImport("fushell_sdk_support_" ++ file, .{
             .root_source_file = b.path("packages/fushell/" ++ file),
         });
     }
-    build_tool_mod.addAnonymousImport("fushell_sdk_readme", .{
-        .root_source_file = b.path("packages/fushell/README.md"),
-    });
     const build_tool = b.addExecutable(.{
         .name = "fushell",
         .root_module = build_tool_mod,
-        .use_llvm = true,
     });
 
     b.installArtifact(build_tool);
@@ -174,7 +156,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/rendering_test.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     rendering_test_mod.addImport("c", c_mod);
     rendering_test_mod.addImport("wayland", wayland_mod);
@@ -189,7 +170,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/compositor_render_test.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     compositor_test_mod.addImport("c", c_mod);
     compositor_test_mod.linkSystemLibrary("EGL", dynamic_link_opts);
@@ -206,7 +186,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/platform_channels.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     text_input_mod.addImport("c", c_mod);
     text_input_mod.addImport("wayland", wayland_mod);
@@ -223,17 +202,17 @@ pub fn build(b: *std.Build) void {
     const cli_test_step = b.step("cli-test", "Test command parsing and help without Flutter or a display");
     cli_test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(cli_test_step);
-    for ([_][]const u8{ "flutter_engine_store", "owned_arguments", "process_exit", "bundle_transaction", "flutter_toolchain", "source_snapshot" }) |name| {
+    for ([_][]const u8{ "flutter_engine_store", "owned_arguments", "process_exit", "bundle_transaction", "flutter_toolchain", "source_snapshot", "aot_artifacts", "bundle_loader" }) |name| {
         const module = b.createModule(.{
             .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
+            .link_libc = std.mem.eql(u8, name, "bundle_loader"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
         });
         const tests = b.addTest(.{ .root_module = module });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
-    const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
+    const exe_unit_tests = b.addTest(.{ .root_module = runner_mod });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
 
@@ -245,7 +224,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/application_output.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     const output_transport_tests = b.addTest(.{ .root_module = output_transport_mod });
     const run_output_transport_tests = b.addRunArtifact(output_transport_tests);
@@ -253,9 +231,9 @@ pub fn build(b: *std.Build) void {
 
     const output_sink_mod = b.createModule(.{
         .root_source_file = b.path("src/output_sink_helper.zig"),
+        .link_libc = true, // The sink helper directly calls std.c.
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     const output_sink_tests = b.addTest(.{ .root_module = output_sink_mod });
     const run_output_sink_tests = b.addRunArtifact(output_sink_tests);
@@ -265,7 +243,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/retained_signal.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     const retained_signal_tests = b.addTest(.{ .root_module = retained_signal_mod });
     const run_retained_signal_tests = b.addRunArtifact(retained_signal_tests);
@@ -275,7 +252,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/application_broker.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     broker_test_mod.addImport("c", c_mod);
     broker_test_mod.linkSystemLibrary("dbus-1", dynamic_link_opts);

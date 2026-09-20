@@ -115,8 +115,17 @@ test "probe captures output and exit status" {
 test "probe deadlines cover silence, output dribbling, and closed pipes" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
-    for ([_][]const u8{ "/bin/sleep 10", "exec 1>&- 2>&-; /bin/sleep 10", "while true; do printf x; /bin/sleep 0.01; done" }) |script| {
-        try std.testing.expectError(error.Timeout, run(std.testing.allocator, std.testing.io, .{ .environ = &env, .argv = &.{ "/bin/sh", "-c", script }, .timeout_ms = 120 }));
+    // Resolve the fixture from the test runner, but keep the child environment
+    // empty. /bin/sleep is not available on NixOS. Pass it as an argument, not
+    // interpolated shell source, so spaces and metacharacters remain harmless.
+    var host_env = try std.testing.environ.createMap(std.testing.allocator);
+    defer host_env.deinit();
+    const sleep = try executable(std.testing.allocator, std.testing.io, &host_env, "sleep");
+    defer std.testing.allocator.free(sleep);
+    for ([_][]const u8{ "exec \"$1\" 10", "exec 1>&- 2>&-; exec \"$1\" 10", "while true; do printf x; \"$1\" 0.01 || exit; done" }) |script| {
+        const result = run(std.testing.allocator, std.testing.io, .{ .environ = &env, .argv = &.{ "/bin/sh", "-c", script, "probe-test", sleep }, .timeout_ms = 120 });
+        defer if (result) |value| deinit(std.testing.allocator, value) else |_| {};
+        try std.testing.expectError(error.Timeout, result);
     }
 }
 

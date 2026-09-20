@@ -242,17 +242,62 @@ fn allocationFailureScenario(a: Allocator) !void {
     defer env.deinit();
     var output = Transcript.init(a, std.testing.io, &env);
     defer output.deinit();
-    // An unread stderr pipe fills up while stdout remains open. Failure to
-    // allocate either reader or diagnostic tail must return, not wait for EOF.
-    output.run(.inherit, &.{ "/bin/sh", "-c", "printf '%0200000d' 0 >&2; exit 7" }) catch |err| switch (err) {
-        error.CommandFailed => return,
-        else => return err,
-    };
-    return error.ExpectedCommandFailure;
+    // Fixed chunks make every allocation reproducible; live pipe read sizes and
+    // EOF ordering depend on scheduling and cannot drive checkAllAllocationFailures.
+    try output.steps.append(a, .{ .stdout = 0, .stderr = 0 });
+    const chunk = [_]u8{'x'} ** 4096;
+    for (0..260) |_| {
+        try output.stdout.append(a, &chunk);
+        try output.stderr.append(a, &chunk);
+    }
+    try output.stdout.append(a, "last stdout\n");
+    try output.note("last diagnostic {d}\n", .{7});
+    try std.testing.expect(output.stdout.truncated and output.stderr.truncated);
+    try std.testing.expectEqual(tail_limit, output.stdout.bytes.items.len);
+    try std.testing.expectEqual(tail_limit, output.stderr.bytes.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, output.stdout.bytes.items, "last stdout\n"));
+    try std.testing.expect(std.mem.endsWith(u8, output.stderr.bytes.items, "\nlast diagnostic 7\n"));
 }
 
-test "every capture allocation failure unwinds without blocking on the other stream" {
+// Keep exhaustive failure injection on deterministic in-memory operations.
+test "every deterministic transcript allocation failure is leak-free" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureScenario, .{});
+}
+
+test "capture allocation failures unwind without blocking on the other stream" {
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // These first five allocations are required before a large single-stream
+    // write can finish: step, both initial readers, reader growth, and tail.
+    // Disable in-place growth so its failure is exercised too. Check both pipe
+    // directions without assuming the total allocation count of a live process.
+    for ([_][]const u8{
+        "printf '%0200000d' 0; exit 7",
+        "printf '%0200000d' 0 >&2; exit 7",
+    }) |script| {
+        for (0..5) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                .fail_index = fail_index,
+                .resize_fail_index = 0,
+            });
+            const start = Io.Timestamp.now(io, .awake);
+            {
+                var output = Transcript.init(failing.allocator(), io, &env);
+                defer output.deinit();
+                try std.testing.expectError(error.OutOfMemory, output.run(.inherit, &.{ "/bin/sh", "-c", script }));
+            }
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            try std.testing.expect(start.untilNow(io, .awake).toMilliseconds() < 2_000);
+        }
+    }
+}
+
+fn testSleepExecutable() ![]u8 {
+    var host_env = try std.testing.environ.createMap(std.testing.allocator);
+    defer host_env.deinit();
+    return @import("doctor/process.zig").executable(std.testing.allocator, std.testing.io, &host_env, "sleep");
 }
 
 test "direct child exit bounds drain even when a descendant holds the pipes" {
@@ -267,7 +312,9 @@ test "direct child exit bounds drain even when a descendant holds the pipes" {
     var output = Transcript.init(std.testing.allocator, io, &env);
     defer output.deinit();
     const start = Io.Timestamp.now(io, .awake);
-    try std.testing.expectError(error.CommandFailed, output.run(.inherit, &.{ "/bin/sh", "-c", "/bin/sleep 30 & printf '%s' $!; exit 23" }));
+    const sleep = try testSleepExecutable();
+    defer std.testing.allocator.free(sleep);
+    try std.testing.expectError(error.CommandFailed, output.run(.inherit, &.{ "/bin/sh", "-c", "\"$1\" 30 & printf '%s' $!; exit 23", "capture-test", sleep }));
     const pid = try std.fmt.parseInt(i32, output.stdout.bytes.items, 10);
     defer {
         // Test owns the adopted descendant. The production wrapper deliberately
@@ -299,7 +346,12 @@ test "normal running command is not subject to the post-exit drain deadline" {
     defer env.deinit();
     var output = Transcript.init(std.testing.allocator, std.testing.io, &env);
     defer output.deinit();
-    try output.run(.inherit, &.{ "/bin/sh", "-c", "/bin/sleep 0.35; printf complete" });
+    const sleep = try testSleepExecutable();
+    defer std.testing.allocator.free(sleep);
+    const start = Io.Timestamp.now(std.testing.io, .awake);
+    try output.run(.inherit, &.{ "/bin/sh", "-c", "\"$1\" 0.35 && printf complete", "capture-test", sleep });
+    try std.testing.expect(start.untilNow(std.testing.io, .awake).toMilliseconds() >= 350);
+    try std.testing.expectEqualStrings("", output.stderr.bytes.items);
     try std.testing.expectEqualStrings("complete", output.stdout.bytes.items);
     try std.testing.expect(std.mem.indexOf(u8, output.stderr.bytes.items, "omitted") == null);
 }

@@ -16,19 +16,8 @@
   fontconfig,
   freetype,
   dbus,
-  fetchzip,
 }: let
-  deps = callPackage ../deps.nix {
-    fetchzip = args:
-      fetchzip (
-        args
-        // lib.optionalAttrs
-        (lib.hasSuffix "/linux-x64-embedder.zip" args.url)
-        {
-          stripRoot = false;
-        }
-      );
-  };
+  deps = callPackage ../deps.nix {};
 
   glibcVersion =
     lib.versions.majorMinor stdenv.cc.libc.version;

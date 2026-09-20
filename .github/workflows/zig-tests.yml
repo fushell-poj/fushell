@@ -29,7 +29,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libwayland-dev wayland-protocols libegl-dev libgles-dev \
             libxkbcommon-dev libfontconfig-dev libdbus-1-dev curl xz-utils
+      # cache v5 uses Node 24, like the existing checkout v6; hosted runners support it.
+      # Cache only the verified toolchain, never the download index or credentials.
+      - name: Restore Zig 0.16.0 toolchain
+        id: zig-toolchain
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/zig
+          key: zig-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0
       - name: Install Zig 0.16.0
+        if: steps.zig-toolchain.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -48,9 +57,34 @@ jobs:
           if hashlib.sha256(archive.read_bytes()).hexdigest() != release['shasum']:
               raise SystemExit('Zig archive checksum mismatch')
           PY
-          # Zig's ZIP fetcher needs this directory on a fresh cache.
-          mkdir -p "$RUNNER_TEMP/zig" "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+      - name: Fingerprint native build environment
+        id: native-deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Include transitive libraries, headers and compiler/tool updates from apt.
+          digest=$(dpkg-query -W -f='${binary:Package}=${Version}\n' | LC_ALL=C sort | sha256sum)
+          echo "hash=${digest%% *}" >> "$GITHUB_OUTPUT"
+      # Keep dependencies and compiler artifacts, not zig-out, Flutter, or the checkout.
+      # Restore older source/dependency snapshots only within the same native environment;
+      # Zig's own content hashes decide which artifacts can actually be reused.
+      - name: Restore Zig dependency and compiler caches
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+            .zig-cache
+          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-0.16.0-${{ steps.native-deps.outputs.hash }}-${{ hashFiles('build.zig.zon') }}-${{ hashFiles('build.zig', 'src/**', 'vendor/**', 'packages/**', 'tests/**', '.github/workflows/zig-tests.yml') }}
+          restore-keys: |
+            zig-build-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-0.16.0-${{ steps.native-deps.outputs.hash }}-${{ hashFiles('build.zig.zon') }}-
+            zig-build-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-0.16.0-${{ steps.native-deps.outputs.hash }}-
+      - name: Configure Zig environment
+        shell: bash
+        run: |
+          # Run on cache hits too: ZIP dependency fetches require this directory.
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
       - name: Debug build
         run: |

@@ -1,11 +1,7 @@
 //! Export the canonical embedded Dart SDK without discovering Flutter.
 const std = @import("std");
 const cli = @import("cli");
-const embedded_sdk_pubspec = @embedFile("fushell_sdk_pubspec");
-const embedded_sdk_lib = @embedFile("fushell_sdk_lib");
-const embedded_sdk_readme = @embedFile("fushell_sdk_readme");
-const library_files = .{ "icons", "windows", "tooltip", "tray", "src/tray/host", "src/tray/item", "src/tray/menu", "src/tray/watcher", "workspace", "src/workspace/workspace", "src/workspace/transport", "src/workspace/protocol" };
-const support_files = .{ "protocols/wayland.xml", "protocols/ext-workspace-v1.xml", "protocols/README.md", "tool/workspace/generate.dart", "tool/workspace/generate_test.dart", "tool/workspace/README.md" };
+const sdk_manifest = @import("../sdk_manifest.zig");
 
 pub fn execute(init: std.process.Init, options: cli.sdk.Options) !void {
     const target = try exportPackage(init.gpa, init.io, options.output);
@@ -23,50 +19,16 @@ pub fn execute(init: std.process.Init, options: cli.sdk.Options) !void {
 pub fn exportPackage(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 {
     const target = try std.fs.path.join(gpa, &.{ dir, "fushell" });
     errdefer gpa.free(target);
-    const lib_dir = try std.fs.path.join(gpa, &.{ target, "lib" });
-    defer gpa.free(lib_dir);
+    std.Io.Dir.cwd().createDirPath(io, target) catch return error.SdkReleaseDirCreateFailed;
 
-    // 创建目录 (幂等: createDirPath 会递归创建不存在的路径)
-    std.Io.Dir.cwd().createDirPath(io, lib_dir) catch return error.SdkReleaseDirCreateFailed;
-
-    // 写 pubspec.yaml
-    const pubspec_path = try std.fs.path.join(gpa, &.{ target, "pubspec.yaml" });
-    defer gpa.free(pubspec_path);
-    var pubspec_file = try std.Io.Dir.cwd().createFile(io, pubspec_path, .{});
-    defer pubspec_file.close(io);
-    try pubspec_file.writeStreamingAll(io, embedded_sdk_pubspec);
-
-    // 写 lib/fushell.dart
-    const lib_path = try std.fs.path.join(gpa, &.{ lib_dir, "fushell.dart" });
-    defer gpa.free(lib_path);
-    var lib_file = try std.Io.Dir.cwd().createFile(io, lib_path, .{});
-    defer lib_file.close(io);
-    try lib_file.writeStreamingAll(io, embedded_sdk_lib);
-
-    inline for (library_files) |file| {
-        const path = try std.fs.path.join(gpa, &.{ lib_dir, file ++ ".dart" });
+    inline for (sdk_manifest.files) |file| {
+        const path = try std.fs.path.join(gpa, &.{ target, file });
         defer gpa.free(path);
         try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
         var output = try std.Io.Dir.cwd().createFile(io, path, .{});
         defer output.close(io);
         try output.writeStreamingAll(io, @embedFile("fushell_sdk_" ++ file));
     }
-
-    inline for (support_files) |file| {
-        const path = try std.fs.path.join(gpa, &.{ target, file });
-        defer gpa.free(path);
-        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
-        var output = try std.Io.Dir.cwd().createFile(io, path, .{});
-        defer output.close(io);
-        try output.writeStreamingAll(io, @embedFile("fushell_sdk_support_" ++ file));
-    }
-
-    // 写 README.md
-    const readme_path = try std.fs.path.join(gpa, &.{ target, "README.md" });
-    defer gpa.free(readme_path);
-    var readme_file = try std.Io.Dir.cwd().createFile(io, readme_path, .{});
-    defer readme_file.close(io);
-    try readme_file.writeStreamingAll(io, embedded_sdk_readme);
 
     return target;
 }
@@ -85,42 +47,7 @@ test "released SDK matches the canonical embedded package byte-for-byte" {
     const exported = try exportPackage(std.testing.allocator, std.testing.io, output_root);
     defer std.testing.allocator.free(exported);
 
-    const pubspec = try tmp.dir.readFileAlloc(
-        std.testing.io,
-        "fushell/pubspec.yaml",
-        std.testing.allocator,
-        .limited(1024 * 1024),
-    );
-    defer std.testing.allocator.free(pubspec);
-    const library = try tmp.dir.readFileAlloc(
-        std.testing.io,
-        "fushell/lib/fushell.dart",
-        std.testing.allocator,
-        .limited(1024 * 1024),
-    );
-    defer std.testing.allocator.free(library);
-    const readme = try tmp.dir.readFileAlloc(
-        std.testing.io,
-        "fushell/README.md",
-        std.testing.allocator,
-        .limited(1024 * 1024),
-    );
-    defer std.testing.allocator.free(readme);
-
-    try std.testing.expectEqualSlices(u8, embedded_sdk_pubspec, pubspec);
-    try std.testing.expectEqualSlices(u8, embedded_sdk_lib, library);
-    try std.testing.expectEqualSlices(u8, embedded_sdk_readme, readme);
-    inline for (library_files) |file| {
-        const content = try tmp.dir.readFileAlloc(
-            std.testing.io,
-            "fushell/lib/" ++ file ++ ".dart",
-            std.testing.allocator,
-            .limited(1024 * 1024),
-        );
-        defer std.testing.allocator.free(content);
-        try std.testing.expectEqualSlices(u8, @embedFile("fushell_sdk_" ++ file), content);
-    }
-    inline for (support_files) |file| {
+    inline for (sdk_manifest.files) |file| {
         const content = try tmp.dir.readFileAlloc(
             std.testing.io,
             "fushell/" ++ file,
@@ -128,6 +55,6 @@ test "released SDK matches the canonical embedded package byte-for-byte" {
             .limited(1024 * 1024),
         );
         defer std.testing.allocator.free(content);
-        try std.testing.expectEqualSlices(u8, @embedFile("fushell_sdk_support_" ++ file), content);
+        try std.testing.expectEqualSlices(u8, @embedFile("fushell_sdk_" ++ file), content);
     }
 }

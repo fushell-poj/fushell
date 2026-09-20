@@ -26,29 +26,21 @@
   # Zig's Clang driver rejects some flags emitted by distro .pc files.
   custom-pkg-config = writeScriptBin "pkg-config" ''
     #!/usr/bin/env bash
-    exec ${pkg-config}/bin/pkg-config "$@" | sed 's/-mfpmath=sse//g'
+    set -o pipefail
+    ${pkg-config}/bin/pkg-config "$@" | sed 's/-mfpmath=sse//g'
   '';
 
-  # Match the local mika-shell ergonomics: keep useful colors while hiding noisy
-  # "failed command" lines from common Zig build invocations.
+  # Keep the usual build colors without filtering diagnostics or exit status.
   wrap-zig = writeScriptBin "zig" ''
     #!/usr/bin/env bash
-
-    if [ "$#" -eq 0 ]; then
-      exec ${zig}/bin/zig
-    fi
-
-    cmd="$1"
-    shift
-
-    case "$cmd" in
+    case "''${1:-}" in
       build|build-exe|build-lib|build-obj|test|run|translate-c)
-        exec ${zig}/bin/zig "$cmd" --color on "$@" \
-          2> >(sed '/failed command:/d' >&2)
+        cmd="$1"
+        shift
+        exec ${zig}/bin/zig "$cmd" --color on "$@"
         ;;
       *)
-        exec ${zig}/bin/zig "$cmd" "$@" \
-          2> >(sed '/failed command:/d' >&2)
+        exec ${zig}/bin/zig "$@"
         ;;
     esac
   '';

@@ -196,7 +196,10 @@ test "defaults use final directory and reject self-dependency and invalid IDs" {
     const a = arena.allocator();
     const dot = try resolve(a, "/tmp/my_app", .{ .output = "." });
     try std.testing.expectEqualStrings("my_app", dot.project_name);
-    try std.testing.expectError(error.InvalidProjectName, resolve(a, "/tmp", .{ .output = "fushell" }));
+    try std.testing.expectError(error.ProjectNameEqFushell, resolve(a, "/tmp", .{ .output = "fushell" }));
+    try std.testing.expectError(error.EmptyProjectName, resolve(a, "/tmp", .{ .output = "app", .project_name = "" }));
+    try std.testing.expectError(error.ProjectNameMustStartWithLowercase, resolve(a, "/tmp", .{ .output = "App" }));
+    try std.testing.expectError(error.ProjectNameContainsInvalidCharacter, resolve(a, "/tmp", .{ .output = "my-app" }));
     try std.testing.expectError(error.InvalidApplicationId, resolve(a, "/tmp", .{ .output = "app", .application_id = "a-b.app" }));
     try std.testing.expectError(error.InvalidOrganization, resolve(a, "/tmp", .{ .output = "app", .organization = "bad org" }));
 }

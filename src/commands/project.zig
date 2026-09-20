@@ -8,6 +8,7 @@ pub const Plan = struct {
     mode: cli.Mode,
     entrypoint: []const u8,
     bundle_dir: []const u8,
+    symbols: bool = false,
 };
 
 /// Keep the established path semantics: a directory selects cwd, otherwise the
@@ -28,6 +29,7 @@ pub fn prepare(init: std.process.Init, options: cli.build.Options) !Plan {
     }
     return .{
         .mode = options.mode,
+        .symbols = options.symbols,
         .entrypoint = if (is_directory) "lib/main.dart" else options.input,
         .bundle_dir = options.output orelse try std.fmt.allocPrint(
             init.arena.allocator(),

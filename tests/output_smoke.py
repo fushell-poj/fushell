@@ -71,14 +71,27 @@ elif args[0] in ['build', 'assemble']:
     (state/'compiled').write_text('done')
     if failure == 'compile':
         print('Useful compiler failure', file=sys.stderr); sys.exit(23)
-    assets = Path('build/flutter_assets'); assets.mkdir(parents=True, exist_ok=True)
+    out = Path(next(a.split('=',1)[1] for a in args if a.startswith('--output='))) if args[0] == 'assemble' else Path('build')
+    if args[0] == 'build': assert '--no-pub' in args
+    assets = out/'flutter_assets'; assets.mkdir(parents=True, exist_ok=True)
     (assets/'AssetManifest.bin').write_bytes(b'assets')
     if args[0] == 'assemble':
-        Path('build/lib').mkdir(exist_ok=True)
-        Path('build/lib/libapp.so').write_bytes(b'fixture AOT')
-        Path('build/fushell_debug_info').mkdir(exist_ok=True)
+        import hashlib
+        split = Path(next(a.split('=',1)[1] for a in args if a.startswith('-dSplitDebugInfo=')))
         target = next(a.split('=',1)[1] for a in args if a.startswith('-dTargetPlatform='))
-        Path('build/fushell_debug_info/app.'+target+'.symbols').write_bytes(b'symbols')
+        cache = Path('.dart_tool/flutter_build')/hashlib.md5(str(out).encode()).hexdigest()
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache/'app.dill').write_bytes(b'preserve kernel')
+        if not (cache/'app.so').exists():
+            (cache/'app.so').write_bytes(b'fixture AOT '+str(out).encode())
+            split.mkdir(parents=True, exist_ok=True)
+            (split/('app.'+target+'.symbols')).write_bytes(b'symbols '+str(out).encode())
+        (out/'lib').mkdir(exist_ok=True)
+        (out/'lib/libapp.so').write_bytes((cache/'app.so').read_bytes())
+        # Real Flutter omits all .dart_tool intermediates from build-outputs.
+        # The selected cache id and its outputs.json are the recovery authority.
+        (out/'.last_build_id').write_text(cache.name)
+        (cache/'outputs.json').write_text(json.dumps([str((out/'lib/libapp.so').resolve())]))
     blocked = os.environ.get('OUTPUT_TEST_BLOCK_PUBLICATION')
     if blocked:
         target = Path(blocked); target.mkdir(exist_ok=True)
@@ -192,12 +205,34 @@ else:
         assert log.index(b'Compiler warning') < log.index(b'bundle entry:'), log
         assert (state/'finished').exists()
         assert not list(entry.parent.parent.glob('.*.fushell-stage-*'))
+        assert not (entry.parent/'lib/libapp.so.symbols').exists()
+    import hashlib
+    archive_root = project/'build/fushell_debug_info/archives'
+    assert not archive_root.exists()  # Default runtime builds do not archive diagnostics.
+    result, _ = invoke(['build','--release','--symbols',str(project)])
+    archives = list(archive_root.iterdir()); assert len(archives) == 1
+    metadata = json.loads((archives[0]/'pair.json').read_text())
+    app = project/f'build/linux/{flutter_arch}/release/lib/libapp.so'
+    assert metadata['app_sha256'] == hashlib.sha256(app.read_bytes()).hexdigest()
+    assert metadata['symbols_sha256'] == hashlib.sha256((archives[0]/'libapp.so.symbols').read_bytes()).hexdigest()
+    assert metadata['inputs'][0] == 'release' and metadata['inputs'][-1] == revision
+    symbols = list((project/'build/fushell_debug_info/release').glob('*/symbols/*.symbols'))
+    assert len(symbols) == 1
+    symbols[0].unlink()
+    kernels = {p: p.read_bytes() for p in (project/'.dart_tool/flutter_build').glob('*/app.dill')}
+    result, _ = invoke(['build','--release','--symbols',str(project)])
+    assert b'Recovering missing AOT symbols' in result.stderr
+    assert symbols[0].is_file() and list(archive_root.iterdir()) == archives
+    assert all(p.read_bytes() == data for p, data in kernels.items())
+    assert not (app.parent/'libapp.so.symbols').exists()
+    result, _ = invoke(['build','--symbols',str(project)], expected=2)
+    assert b'--symbols requires --profile or --release' in result.stderr
     # A cached build and a quoted custom destination still report the final file.
     result, _ = invoke(['build',str(project),'dist with spaces'])
     assert b'bundle entry: '+os.fsencode(project/'dist with spaces/bar')+b'\n' in result.stderr
     assert b'0.7%' not in result.stderr
 
-    cache = project/f'build/fushell_flutter_engine/{arch}/{revision}/engine-debug.so'
+    cache = project/f'build/fushell_flutter_engine/fontconfig-v1/{arch}/{revision}/engine-debug.so'
     old_entry = project/f'build/linux/{flutter_arch}/debug/bar'
     old_bytes = old_entry.read_bytes()
     for failure, diagnostic in [('compile', b'Useful compiler failure'), ('hash', b'EngineHashMismatch')]:

@@ -17,7 +17,7 @@ Command cleanup completes before the entry point maps failures to process status
 run). Normal application exit status is preserved.
 
 Development runs call `player.runPlayer` in-process. A shipped bundle starts at
-`src/main.zig`, locates resources relative to its executable, and calls the same
+`src/runner.zig`, locates resources relative to its executable, and calls the same
 player. A shipped app does not need Flutter SDK or network access.
 
 The runner is embedded in the CLI. Flutter Engine is downloaded at bundle-build

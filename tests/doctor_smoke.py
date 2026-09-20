@@ -133,7 +133,8 @@ sys.stdout.write(body+'\n'+str(status))
     c = run(str(project)); assert c['dbus']['status'] == 'warning'
     c = run('missing-project', expected=1); assert c['project']['status'] == 'error'
 
-    cache = project/'build/fushell_flutter_engine'/arch/revision; cache.mkdir(parents=True)
+    # Keep this fixture aligned with Store.engineDir's versioned cache layout.
+    cache = project/'build/fushell_flutter_engine/fontconfig-v1'/arch/revision; cache.mkdir(parents=True)
     (cache/'.lock').touch(); (cache/'.repository').write_text(env['FUSHELL_ENGINE_REPOSITORY'])
     (cache/'metadata.json').write_text(json.dumps(metadata))
     for mode in ['debug','profile','release']: (cache/(mode+'.so')).write_bytes(engine_bytes)

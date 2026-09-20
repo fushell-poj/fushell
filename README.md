@@ -38,8 +38,17 @@ zig build test
 
 The installed command is `zig-out/bin/fushell`. Its native bundle runner and the
 Dart SDK files are embedded at build time; Flutter Engine binaries are **not**.
-The `flutter-embedder` Zig dependency supplies the C ABI header for compilation,
-not the runtime Engine selected for an application.
+Native optimization and Flutter application mode are separate: use
+`zig build -Doptimize=ReleaseFast` for an optimized CLI and embedded runner;
+`fushell build --release` selects the Flutter application/Engine mode, not the
+native optimization level. Rebuild the CLI after changing the embedded runner or
+SDK before exporting or packaging those changes.
+
+The compile-time C ABI header is pinned under `vendor/flutter_embedder/`, with
+its upstream license and provenance; building Fushell does not download a full
+Engine archive just to obtain that header. This is separate from the runtime
+Engine selected when packaging an application. `src/sdk_manifest.zig` is the
+shared inventory for embedding and exporting the Dart SDK.
 
 ## NixOS package
 
@@ -105,6 +114,9 @@ Bare `fushell` prints help and does not build implicitly.
 # Build a bundle
 fushell build [--debug|--profile|--release] ./app
 
+# Release bundle plus separately archived, matching AOT debug symbols
+fushell build --release --symbols ./app
+
 # Build and run it
 fushell run --debug ./app
 
@@ -114,6 +126,13 @@ fushell sdk ./vendor
 
 Debug is the default mode. Build output is written to
 `build/linux/<arch>/<mode>` unless an output directory is supplied.
+
+Profile/Release runtime bundles do not require or ship `libapp.so.symbols`.
+Use `build --symbols` with either AOT mode to retain matching symbols separately
+under the project's `build/fushell_debug_info/archives` tree. Keep the archive
+associated with the exact shipped `libapp.so` for later symbolication; symbols
+from another build are not interchangeable. Debug/JIT builds reject `--symbols`.
+Temporary AOT outputs remain build-cache data, not a durable symbol archive.
 
 Use `fushell <command> -h` or `fushell <command> --help` for command-specific
 usage. Option values accept both `--vm-service-port=8181` and

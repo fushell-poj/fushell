@@ -1,0 +1,25 @@
+//! Canonical package-relative paths used by SDK embedding, export, and tests.
+//! Add SDK files here once; build.zig resolves them under packages/fushell.
+pub const files = .{
+    "pubspec.yaml",
+    "lib/fushell.dart",
+    "lib/icons.dart",
+    "lib/windows.dart",
+    "lib/tooltip.dart",
+    "lib/tray.dart",
+    "lib/src/tray/host.dart",
+    "lib/src/tray/item.dart",
+    "lib/src/tray/menu.dart",
+    "lib/src/tray/watcher.dart",
+    "lib/workspace.dart",
+    "lib/src/workspace/workspace.dart",
+    "lib/src/workspace/transport.dart",
+    "lib/src/workspace/protocol.dart",
+    "protocols/wayland.xml",
+    "protocols/ext-workspace-v1.xml",
+    "protocols/README.md",
+    "tool/workspace/generate.dart",
+    "tool/workspace/generate_test.dart",
+    "tool/workspace/README.md",
+    "README.md",
+};
